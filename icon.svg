@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="oh-my-clm">
+  <rect width="128" height="128" rx="28" fill="#18212f"/>
+  <path d="M30 35h68v12H30zM30 58h49v12H30zM30 81h35v12H30z" fill="#8ee6c7"/>
+  <path d="m86 64 12 12-12 12" fill="none" stroke="#ffd166" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

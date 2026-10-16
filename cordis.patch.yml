@@ -1,0 +1,4 @@
+- insert:
+    - id: oh-my-clm-live-context
+      name: oh-my-clm
+      config: {}

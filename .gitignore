@@ -1,0 +1,5 @@
+node_modules/
+.pi/clm/LIVE_CTX_MAIN.md
+.pi/clm/*.patch.json
+.pi/clm/*.tmp
+npm-debug.log*

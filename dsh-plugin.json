@@ -1,0 +1,46 @@
+{
+  "$schema": "https://raw.githubusercontent.com/T-Auto/dsh-std/8a15541117cb3c13ddb8f2468308691b6051d162/packages/manifest/schema/dsh-plugin-0.15.schema.json",
+  "manifestVersion": "0.15",
+  "id": "oh-my-clm.live-context",
+  "name": "oh-my-clm",
+  "version": "0.1.0",
+  "license": "MIT",
+  "facets": {
+    "host": {
+      "entry": "dist/dsh/index.js",
+      "apiVersion": "v1alpha1"
+    }
+  },
+  "permissions": [
+    {
+      "name": "oh-my-clm.fs.read",
+      "scope": "workspace",
+      "reason": "Read the DSH workspace live-context mirror before validating an explicit patch proposal."
+    },
+    {
+      "name": "oh-my-clm.fs.write",
+      "scope": "workspace",
+      "reason": "Write the live-context mirror and its auditable patch proposal in the workspace."
+    }
+  ],
+  "contributes": {
+    "x-display": [
+      {
+        "icon": "./icon.svg",
+        "title": "oh-my-clm",
+        "description": "Mirrors editable DSH session context and emits auditable shrink-only patch proposals.",
+        "locales": [
+          "locale/en.json",
+          "locale/zh.json"
+        ]
+      }
+    ],
+    "x-prompt-sections": [
+      {
+        "name": "oh-my-clm:live-context",
+        "order": 3240,
+        "summary": "Describe the live mirror and the explicit DSH patch boundary."
+      }
+    ]
+  }
+}

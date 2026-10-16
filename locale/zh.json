@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "oh-my-clm",
+    "description": "将可编辑的 DSH 会话上下文镜像到文件，并输出可审计的收缩式 patch 提案。"
+  }
+}
