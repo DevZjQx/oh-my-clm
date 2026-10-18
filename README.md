@@ -100,22 +100,7 @@ token 计数使用共享格式层的 provider-independent `estimateMessageTokens
 
 安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现现在另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()`/surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。
 
-> **0.1.4 调整：block index 改为头部 40 + 尾部 40。**
-> 当可编辑 block 超过 80 个时，runtime context 只列出前 40 个和后 40 个，中间的 ID 区间用一行摘要表示；这样长会话仍能看到最新 block 的 ID，同时避免索引无限增长。`cleanup` 的结果仍然返回清理后的完整 head/tail 索引。
->
-> **0.1.3 新增：block ID 进入聊天上下文。**
-> DSH bridge 现在通过 `systemPrompt.context()` 注册一个 `oh-my-clm:block-index` runtime context，列出当前可编辑 block 的 1-based ID、role 和短 preview；`cleanup` 的结果也会带上刷新后的 index。模型可以直接按 index 里的 ID 清理 stale block，不需要先读 `LIVE_CTX_MAIN.md` 找内容或 ID。runtime-context snapshot 本身不是用户 block，会从 mirror records 中排除，因此不会成为 cleanup 目标，也不会让 index 递归列出自身。只有需要完整正文做 rewrite 时才需要打开 mirror。
->
-> **0.1.2 修复：`developer/message` 的 turn/step 必须取 append 时真正打开的 step。**
-> 0.1.0/0.1.1 在批量 cleanup 时为每个目标 assistant/tool-result 事件复制它自己的 `turn`/`step`，或对没有 turn/step envelope 的 `user/message` 回退为 `0`。DSH 把 `developer/message` 当作 step-scoped 事件：重放要求 `turn`/`step` 为正数，并且必须等于日志当前打开的 turn/step。被清理的目标通常来自更早的 step，而 cleanup 本身运行在最新的 step 中，于是追加了坐标过期的事件：轻则加载/重放时报 `developer/message turn must be positive`，重则把不匹配的事件持久化，下一次加载报 `developer/message does not match an open turn and step`，整个 session 无法恢复。0.1.2 从 session log 推导 append 时真正打开的 turn/step，omission 和 assistant 改写都使用这一对坐标；`tool/result` 改写仍严格保持原 event envelope，只改 `content`（DSH 只允许 content-only rewrite）。此外，`agent/pre-step` 运行在 `step/start` 之前，此时没有打开的 step，bridge 不再在那里执行 mutation，而是把待处理编辑留到 `step/start` 事件之后应用；没有打开的 step 时 mutation 会安全拒绝，不再写入损坏事件。已经由旧版本写入的损坏 session 不会自动恢复，需要用 session repair 脚本或备份修复。
->
-> **0.1.1 修复：不要把 DSH host 包放进 `dependencies`。**
-> 0.1.0 在 `dependencies` 中声明了 `@deepseek-ai/dsh-tools`。pnpm 会把这份 host 包安装/提升到 profile 的 `node_modules`，于是 profile 内的 `@deepseek-ai/dsh-tools` 副本会遮蔽 dsh 安装自带的同一模块。`dsh-agent-loop` 用模块级 `Symbol("@deepseek-ai/dsh-tools.scheduler")` 访问工具调度器，两份模块各有一个 Symbol 实例，结果 `ctx.tools[TOOL_RUNTIME_SCHEDULER]` 为 `undefined`。症状是每个工具调用都已经写入 `tool/call`，但紧接着整步失败并补写一条 `TOOL_OUTCOME_UNKNOWN`/`interrupted` 结果：
-> `The tool call was interrupted after it was recorded, but no result was durably recorded. ...`
-> 0.1.1 不再在运行时的任何位置导入 `@deepseek-ai/dsh-tools`（cleanup 工具直接返回纯 JSON tool definition，并复用 `parseCleanupArgs` 做参数校验），`@deepseek-ai/dsh-tools` 只作为可选 `peerDependencies` 保留给 DSH 的兼容性检查，因此安装插件不会再向 profile 注入 host 包副本。若旧版本已经安装，先移除 profile 里的残留副本再重启（例如重新执行 `dsh plugin --profile <name> remove oh-my-clm` 后安装新包，或删除 profile 的 `node_modules/@deepseek-ai` 中由该插件带入的副本）；仅禁用 bundle 不足以恢复。
->
-> **0.1.1 同时修复了普通 mirror 改写被 DSH 拒绝的问题。**
-> 0.1.0 把 assistant block 的缩短结果写回 `assistant/message`。DSH 要求每个 surface replacement 用 `sourceEventSeqs` 覆盖所有被遮蔽节点，却又禁止 `assistant/message` 携带 `sourceEventSeqs`（它内嵌 provider stream），因此这类改写必然失败：缺少引用时报 `sourceEventSeqs must include every shadowed surface node`，补上引用后又报 `assistant/message ... cannot carry sourceEventSeqs`。0.1.1 改用可携带引用的 `developer/message` 承载 shorter assistant text（omission 仍是空 `developer/message`），`tool/result` 仍按 DSH 的 content-only 规则改写；assistant tool-call 被改写时配对的 tool result 仍会一起 omit，避免孤立 tool message。由于 `developer/message` 不属于 mirror 的可编辑区域，被改写的 assistant block 在后续 mirror 中不再出现，这是 DSH surface 语义的直接结果。
+版本更新说明（0.1.0–0.1.4）已移至 [changelog.md](./changelog.md)。
 
 本地检查 DSH bridge：
 
@@ -137,7 +122,7 @@ node scripts/build-dsh-plugin.mjs ./artifacts
 node scripts/build-dsh-plugin.mjs --output ./artifacts/oh-my-clm.tgz
 ```
 
-这个脚本会先编译并检查 host entry，再生成只包含 DSH host、运行时 `dist`、manifest、bundle patch、locale、icon 的 npm tgz；Pi extension、TypeScript 源码、测试文件和开发依赖不会进入该专用包。`@deepseek-ai/dsh-tools` 仅作为可选 peer 声明用于兼容性检查，不产生运行时依赖，也不得改回 `dependencies`（原因见上）。普通 `npm pack` 仍用于构建同时包含 Pi 与 DSH 内容的完整包。
+这个脚本会先编译并检查 host entry，再生成只包含 DSH host、运行时 `dist`、manifest、bundle patch、locale、icon 的 npm tgz；Pi extension、TypeScript 源码、测试文件和开发依赖不会进入该专用包。`@deepseek-ai/dsh-tools` 仅作为可选 peer 声明用于兼容性检查，不产生运行时依赖，也不得改回 `dependencies`（原因见 [changelog.md](./changelog.md) 的 0.1.1 说明）。普通 `npm pack` 仍用于构建同时包含 Pi 与 DSH 内容的完整包。
 
 `npm run build:dsh` 会从 `src/dsh-bridge.ts` 和共享格式层生成 `dist/`；`npm pack` 的 `prepack` 也会执行这一步。仓库测试主要是 mock host 和契约/包检查；外部 DSH 验证报告另外覆盖了真实 CLI 安装、bundle activation、system prompt 和 mirror/file-tool 生成。DSH 文件工具运行在宿主侧时可以访问 `/tmp/clm-*`；sandbox 内的 bash 不一定共享同一个 `/tmp`，应按提示使用文件工具编辑 mirror。`Session.append()` 的 replacement 会走正常 `session/event` 发布路径；需要立即验证后端崩溃持久性的部署应由宿主使用官方 `session/flush` 检查点，而插件不猜测或注册额外 flush API。
 
@@ -151,6 +136,7 @@ DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 
 
 - [工作原理](./docs/how-it-works.md)：说明 live context mirror、生命周期、编辑校验和限制。
 - [CLM 技术分析表](./docs/CLM技术分析表.md)：整理 Context Language Models 论文、官方实现和工程取舍。
+- [更新日志](./changelog.md)：0.1.0–0.1.4 各版本的修复与调整说明。
 
 ## 开发检查
 
