@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { sessionMirrorPath } from "../src/clm-paths.ts";
 import extension from "../extensions/clm.ts";
 
 test("extension mirrors a projection and emits persistent context edits at turn_end", async () => {
@@ -41,6 +42,7 @@ test("extension mirrors a projection and emits persistent context edits at turn_
 	};
 	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
 	const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+	const tools = new Map<string, any>();
 	const api = {
 		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
 			handlers.set(name, handler);
@@ -49,32 +51,44 @@ test("extension mirrors a projection and emits persistent context edits at turn_
 		registerCommand(name: string, options: { handler: (args: string, ctx: any) => Promise<void> }) {
 			commands.set(name, options);
 		},
+		registerTool(tool: any) {
+			tools.set(tool.name, tool);
+		},
 	};
 	extension(api as any);
 
 	const contextEntries = [
 		...projection.entries.map((entry) => entry.sourceEntry),
 	];
+	const sessionId = "test-session";
+	let status = "";
 	const ctx = {
 		cwd,
-		hasUI: false,
+		hasUI: true,
 		mode: "print",
 		model: undefined,
 		getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
 		ui: {
 			theme: { fg: (_name: string, value: string) => value },
-			setStatus: () => undefined,
+			setStatus: (_key: string, value: string | undefined) => { status = value ?? ""; },
 			notify: () => undefined,
 		},
 		sessionManager: {
 			buildSessionProjection: () => projection,
 			getBranch: () => contextEntries,
-			getSessionId: () => "test-session",
+			getSessionId: () => sessionId,
 		},
 	};
 
+	const beforeStart = { systemPromptOptions: {} as Record<string, string> };
+	await handlers.get("before_agent_start")?.(beforeStart, ctx);
+	const prompt = beforeStart.systemPromptOptions.appendSystemPrompt ?? "";
+	assert.ok(prompt.includes(sessionMirrorPath(sessionId)));
+	assert.match(prompt, /cleanup\(\{ blockIds:/);
+
 	await handlers.get("context")?.({}, ctx);
-	const mirrorPath = path.join(cwd, ".pi", "clm", "LIVE_CTX_MAIN.md");
+	const mirrorPath = sessionMirrorPath(sessionId);
+	assert.equal(fs.existsSync(path.join(cwd, ".pi", "clm", "LIVE_CTX_MAIN.md")), false);
 	const mirror = fs.readFileSync(mirrorPath, "utf8");
 	assert.match(mirror, /CLM_ENTRY id=1 role=assistant/);
 	assert.match(mirror, /CLM_ENTRY id=2 role=toolResult/);
@@ -91,11 +105,68 @@ test("extension mirrors a projection and emits persistent context edits at turn_
 	assert.ok(result.entries.some((entry) => entry.type === "context_edit" && entry.targetId === "tool-1" && entry.replacement === null));
 
 	assert.ok(commands.has("clm"));
+	assert.ok(tools.has("cleanup"));
+	assert.equal(tools.get("cleanup")?.executionMode, "sequential");
 	await commands.get("clm")?.handler("status", ctx);
+	assert.ok(status.includes(mirrorPath));
+});
+
+test("Pi cleanup removes selected mirror spans in one tool execution", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-cleanup-tool-"));
+	const sessionId = "cleanup-tool-session";
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "anchor", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "Anchor block." }] }] },
+			{ sourceEntry: { id: "noise", type: "message" }, messages: [{ role: "user", content: "Self-referential noise." }] },
+			{ sourceEntry: { id: "fact", type: "message" }, messages: [{ role: "user", content: "Retain this fact." }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const tools = new Map<string, any>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerTool(tool: any) { tools.set(tool.name, tool); },
+		registerCommand: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: false,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { theme: { fg: (_name: string, value: string) => value }, setStatus: () => undefined, notify: () => undefined },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => sessionId,
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+	const tool = tools.get("cleanup");
+	const result = await tool.execute("cleanup-1", { blockIds: [2] }, undefined, undefined, ctx);
+	assert.equal(result.isError, false);
+	assert.deepEqual(result.structuredContent?.removedBlockIds, [2]);
+	const mirrorPath = sessionMirrorPath(sessionId);
+	const mirror = fs.readFileSync(mirrorPath, "utf8");
+	assert.match(mirror, /CLM_ENTRY id=1 role=assistant/);
+	assert.doesNotMatch(mirror, /Self-referential noise/);
+	assert.match(mirror, /Retain this fact/);
+
+	const turnEnd = await handlers.get("turn_end")?.({ entries: [] }, ctx) as { entries: Array<Record<string, unknown>> };
+	assert.ok(turnEnd.entries.some((entry) => entry.type === "context_edit" && entry.targetId === "noise" && entry.replacement === null));
 });
 
 test("session resume rebuilds the live mirror before the next model request", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-resume-"));
+	let sessionId = "resume-session-old";
 	let projection = {
 		entries: [
 			{
@@ -116,6 +187,7 @@ test("session resume rebuilds the live mirror before the next model request", as
 			return () => undefined;
 		},
 		registerCommand: () => undefined,
+		registerTool: () => undefined,
 	};
 	extension(api as any);
 	const ctx = {
@@ -128,14 +200,15 @@ test("session resume rebuilds the live mirror before the next model request", as
 		sessionManager: {
 			buildSessionProjection: () => projection,
 			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
-			getSessionId: () => "resume-session",
+			getSessionId: () => sessionId,
 		},
 	};
-	const mirrorPath = path.join(cwd, ".pi", "clm", "LIVE_CTX_MAIN.md");
+	const oldMirrorPath = sessionMirrorPath(sessionId);
 
 	await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
-	assert.match(fs.readFileSync(mirrorPath, "utf8"), /Old session answer\./);
+	assert.match(fs.readFileSync(oldMirrorPath, "utf8"), /Old session answer\./);
 
+	sessionId = "resume-session-new";
 	projection = {
 		entries: [
 			{
@@ -151,13 +224,17 @@ test("session resume rebuilds the live mirror before the next model request", as
 	};
 	await handlers.get("session_start")?.({ type: "session_start", reason: "resume", previousSessionFile: "old.jsonl" }, ctx);
 
+	const mirrorPath = sessionMirrorPath(sessionId);
 	const mirror = fs.readFileSync(mirrorPath, "utf8");
 	assert.match(mirror, /Resumed session answer\./);
 	assert.doesNotMatch(mirror, /Old session answer\./);
+	assert.match(fs.readFileSync(oldMirrorPath, "utf8"), /Old session answer\./);
 });
 
 test("turn_end replaces a tool result that read the live mirror", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-self-read-"));
+	const sessionId = "self-read-session";
+	const mirrorPath = sessionMirrorPath(sessionId);
 	const projection = {
 		entries: [
 			{
@@ -174,6 +251,7 @@ test("turn_end replaces a tool result that read the live mirror", async () => {
 			return () => undefined;
 		},
 		registerCommand: () => undefined,
+		registerTool: () => undefined,
 	};
 	extension(api as any);
 	const ctx = {
@@ -186,7 +264,7 @@ test("turn_end replaces a tool result that read the live mirror", async () => {
 		sessionManager: {
 			buildSessionProjection: () => projection,
 			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
-			getSessionId: () => "self-read-session",
+			getSessionId: () => sessionId,
 		},
 	};
 
@@ -196,7 +274,7 @@ test("turn_end replaces a tool result that read the live mirror", async () => {
 			entries: [],
 			message: {
 				role: "assistant",
-				content: [{ type: "toolCall", id: "self-read", name: "read", arguments: { path: ".pi/clm/LIVE_CTX_MAIN.md" } }],
+				content: [{ type: "toolCall", id: "self-read", name: "read", arguments: { path: mirrorPath } }],
 			},
 			toolResults: [
 				{
@@ -214,7 +292,7 @@ test("turn_end replaces a tool result that read the live mirror", async () => {
 
 	assert.ok(result.entries.some((entry) => entry.type === "context_edit" && entry.targetId === "tool-self-read"));
 	const edit = result.entries.find((entry) => entry.type === "context_edit" && entry.targetId === "tool-self-read");
-	assert.deepEqual(edit?.replacement, { content: [{ type: "text", text: "[oh-my-clm] Live mirror read omitted from future context; the mirror is already available at .pi/clm/LIVE_CTX_MAIN.md." }] });
+	assert.deepEqual(edit?.replacement, { content: [{ type: "text", text: `[oh-my-clm] Live mirror read omitted from future context; the mirror is already available at ${mirrorPath}.` }] });
 });
 
 test("budget pressure uses an ephemeral nudge instead of a compact command", async () => {
@@ -222,6 +300,7 @@ test("budget pressure uses an ephemeral nudge instead of a compact command", asy
 	process.env.CLM_CONTEXT_BUDGET = "100";
 	try {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-budget-nudge-"));
+		const sessionId = "budget-nudge-session";
 		const projection = {
 			entries: [
 				{
@@ -245,6 +324,7 @@ test("budget pressure uses an ephemeral nudge instead of a compact command", asy
 			registerCommand(name: string, options: { handler: (args: string, ctx: any) => Promise<void> }) {
 				commands.set(name, options);
 			},
+			registerTool: () => undefined,
 		};
 		extension(api as any);
 
@@ -258,7 +338,7 @@ test("budget pressure uses an ephemeral nudge instead of a compact command", asy
 			sessionManager: {
 				buildSessionProjection: () => projection,
 				getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
-				getSessionId: () => "budget-nudge-session",
+				getSessionId: () => sessionId,
 			},
 		};
 
@@ -270,6 +350,7 @@ test("budget pressure uses an ephemeral nudge instead of a compact command", asy
 		) as { messages?: Array<{ role: string; content: string }> } | undefined;
 		assert.equal(result?.messages?.length, 2);
 		assert.match(result?.messages?.at(-1)?.content ?? "", /<pi-clm-budget-nudge>/);
+		assert.ok(result?.messages?.at(-1)?.content.includes(sessionMirrorPath(sessionId)));
 	} finally {
 		if (previousBudget === undefined) delete process.env.CLM_CONTEXT_BUDGET;
 		else process.env.CLM_CONTEXT_BUDGET = previousBudget;

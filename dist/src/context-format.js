@@ -184,6 +184,59 @@ function editableDisplayIds(records) {
     }
     return ids;
 }
+function blockPreview(text, maxChars) {
+    const collapsed = normalizeText(text).replace(/\s+/g, " ");
+    if (!collapsed)
+        return "(empty)";
+    if (collapsed.length <= maxChars)
+        return collapsed;
+    return collapsed.slice(0, maxChars).trimEnd() + "…";
+}
+/**
+ * Render the compact model-facing index of editable blocks.
+ *
+ * The chat context needs the same 1-based ordinals that `cleanup` accepts, so
+ * the model can choose a cleanup target without opening LIVE_CTX_MAIN.md. The
+ * preview intentionally stays short: it identifies a block, while an actual
+ * rewrite still has to read the full body from the mirror. Protected blocks are
+ * excluded because they have no cleanup ID and are never editable.
+ */
+export function renderBlockIndex(records, options = {}) {
+    const editable = records.filter((record) => !record.protected);
+    if (editable.length === 0)
+        return "";
+    const displayIds = editableDisplayIds(records);
+    const maxPreviewChars = Math.max(24, Math.floor(options.maxPreviewChars ?? 96));
+    const headCount = Math.max(0, Math.floor(options.headBlocks ?? 40));
+    const tailCount = Math.max(0, Math.floor(options.tailBlocks ?? 40));
+    const lineFor = (record) => {
+        const blockId = displayIds.get(record.id) ?? record.id;
+        return `${blockId}. ${record.role}: ${blockPreview(record.text, maxPreviewChars)}`;
+    };
+    const total = editable.length;
+    const lines = [];
+    if (total <= headCount + tailCount) {
+        lines.push(...editable.map(lineFor));
+    }
+    else {
+        const head = editable.slice(0, headCount);
+        const tail = editable.slice(total - tailCount);
+        lines.push(...head.map(lineFor));
+        const omitted = total - head.length - tail.length;
+        lines.push(`... ${omitted} editable block(s) omitted from this index (IDs ${head.length + 1}-${total - tail.length}).`);
+        lines.push(...tail.map(lineFor));
+    }
+    return [
+        "<oh-my-clm-block-index>",
+        "Editable context blocks, in cleanup ID order.",
+        `When the list is longer, this index shows the first ${headCount} and last ${tailCount} blocks and summarizes the omitted ID range.`,
+        ...lines,
+        "Call cleanup({ blockIds: [...] }) with these 1-based IDs to omit stale blocks.",
+        "Block 1 is load-bearing and is always preserved. IDs renumber after a cleanup or another block removal, so use the latest index.",
+        "The protected initial task has no block ID and is not listed.",
+        "</oh-my-clm-block-index>",
+    ].join("\n");
+}
 export function renderMirror(records, options = {}) {
     const header = [
         "<!-- " + MIRROR_VERSION + " -->",

@@ -6,13 +6,15 @@
 
 ## 核心体验
 
-Pi 为下一次请求构建当前 branch 的 projection 时，扩展会把可编辑部分镜像到：
+Pi 为下一次请求构建当前 branch 的 projection 时，扩展会把可编辑部分镜像到当前 session 的临时目录：
 
 ```text
-.pi/clm/LIVE_CTX_MAIN.md
+/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md
 ```
 
-模型可以使用普通的 `edit`、`write` 或一次短脚本修改已有 block：
+`${sessionId}` 是运行时 session ID；即使多个 session 使用同一个工作目录，它们也不会共享或覆盖 mirror。旧版本生成的 `.pi/clm` 文件不会被自动迁移或删除。
+
+模型可以调用 Pi/DSH 都提供的 `cleanup({ blockIds: [...] })` 工具，按 editable block ID 删除 stale、重复或自指噪声；cleanup 在一次工具调用内完成 host-side 变更，不依赖完整 block body 或 `old_string`。需要缩短已有 block 时，rewrite 脚本应在同一个 host-side 工具调用内完成 read+write；普通 edit 只适用于完整且未截断的 body。DSH 会等触发文件编辑的 session event 发布完成后再应用 native replacement，因此脚本必须在工具返回前完成写入，不要在后台持续重写 mirror：
 
 ```text
 <!-- pi-clm-v2 -->
@@ -28,6 +30,9 @@ Pi 为下一次请求构建当前 branch 的 projection 时，扩展会把可编
 - 删除一个可编辑 block 会从后续 projection 中省略该消息；删除最后一个 block 时保留 `<!-- CLM_EMPTY -->`。
 - 初始用户任务受到保护，不会出现在可编辑区域中；user-authored block 可以被省略，但不能被模型改写。
 - mirror preview 有固定的单 block 和总大小上限；截断只影响显示，不改变 canonical source。
+- `cleanup({ blockIds: [...] })` 按当前 1-based editable ID 删除 block；load-bearing block 1 始终保留，assistant/tool-result 配对也会整体处理。未知、重复、过期或协议损坏的 ID 会整体拒绝。
+- DSH 的 runtime context 会包含当前可编辑 block 的 `<oh-my-clm-block-index>`：每条记录给出 cleanup 使用的 1-based ID、role 和短 preview；列表较长时只显示头部 40 个和尾部 40 个，中间省略并给出 ID 区间。`cleanup` 的 tool result 也会返回刷新后的 index。因此清理时不需要为了确认 ID 或内容去读 `LIVE_CTX_MAIN.md`；只有需要完整、未截断的正文做 rewrite 时才读 mirror。
+- cleanup 后需要改写时，rewrite 脚本必须在同一个 host-side 工具调用内完成 read+write；edit 只适用于完整、未截断的 old body。
 - 如果工具结果读取了 `LIVE_CTX_MAIN.md`，该结果会在未来 projection 中替换成短指针，避免 mirror 自我复制。
 - 改写或删除 assistant tool turn 时，配对的 tool result 也会一起处理，避免孤立的 tool message。
 - 合法修改在 `turn_end` 通过 Pi 原生 `context_edit` 持久化；原始 session JSONL 不会被改写。
@@ -48,8 +53,8 @@ pi --extension ./extensions/clm.ts
 pi -e .
 ```
 
-开始一项会产生几轮工具输出的任务。需要整理历史时，模型会按照系统提示编辑
-`.pi/clm/LIVE_CTX_MAIN.md`；也可以直接使用 Pi 原生 `/compact` 完成手动压缩。扩展不会再发送一个额外的“compact LLM turn”。
+开始一项会产生几轮工具输出的任务。需要整理历史时，模型可以按 block ID 调用 `cleanup({ blockIds: [...] })`，也可以按照系统提示对
+`/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md` 做同 call 的 rewrite/edit。也可以直接使用 Pi 原生 `/compact` 完成手动压缩。扩展不会再发送一个额外的“compact LLM turn”。
 
 ## 命令
 
@@ -77,7 +82,7 @@ mirror 的显示上限是固定的：单 block 约 `12000` 字符，总 mirror �
 
 token 计数使用共享格式层的 provider-independent `estimateMessageTokens(message)`，按消息分别估算。对当前 Pi 支持的 text、thinking、tool call、图片、system sections 和 tool declarations，它采用与 Pi host 一致的 `3.5 chars/token` 近似及 rounding；共享层不导入 Pi runtime，因此仍保留 DSH 的 `reasoning`、`tool-call`、`tool` 和其他自有消息形状的 fallback 估算。当前 Pi extension 的公开 `ExtensionContext` 只提供 effective system prompt，`fixedRequestTokens` 因此只计该 prompt；tool declaration overhead 只有在 host 传入结构化 system message 时才会被计入，否则必须视为 incomplete approximation。它不是 provider 的精确 tokenizer；Pi/DSH 自身的 context window 仍是最终约束。
 
-生成的 `.pi/clm/LIVE_CTX_MAIN.md` 不属于发布包，也不应提交到 Git。
+生成的 `/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md` 位于系统临时目录，不属于发布包，也不应提交到 Git。目录默认使用 `0700`，mirror 文件默认使用 `0600`；宿主仍负责临时文件清理和内容审计。
 
 ## DeepSeek Harness（DSH）适配
 
@@ -86,13 +91,31 @@ token 计数使用共享格式层的 provider-independent `estimateMessageTokens
 [`dsh-ops`](https://github.com/T-Auto/dsh-ops) 的 Community v0.15 manifest 形态；它保留同一份
 `src/context-format.ts` 镜像、解析、snapshot 和编辑规划实现：
 
-- 社区插件发现入口是 [`dsh-plugin.json`](./dsh-plugin.json)，host entry 为构建后的 `dist/dsh/index.js`；官方 bundle 安装元数据位于 `package.json` 的 `dsh.bundle.patch` 和 [`cordis.patch.yml`](./cordis.patch.yml)。
-- DSH 生命周期使用官方 Harness 的 Cordis `agent/created`、`agent/pre-step`、`session/event` 和 `systemPrompt.section()` 扩展点；session projection 仍由 DSH 提供，session log 仍是事实来源。
-- DSH 会生成同一路径的 `.pi/clm/LIVE_CTX_MAIN.md`。合法的 shrink-only 编辑会写入 `.pi/clm/LIVE_CTX_MAIN.patch.json`，其中包含 snapshot、changed IDs、tool-call/result 配对处理和 replacement/omit 明细。
-- 当前 bridge **不会**把 patch 静默写回 DSH session，也不宣称 DSH 已支持 Pi 的 branch-local `context_edit`。DSH 原生 context-edit API 尚未在本仓库的真实 runtime 中验证；需要另一个经过批准的 host policy 消费 patch，才能改变活动上下文。
+- 社区插件发现入口是 [`dsh-plugin.json`](./dsh-plugin.json)，host entry 为构建后的 `dist/dsh/index.js`；官方 bundle 安装元数据位于 `package.json` 的 `dsh.bundle.patch` 和 [`cordis.patch.yml`](./cordis.patch.yml)。在 DSH 0.2.0-rc.2 中，实际生效的是 bundle 元数据；`dsh-plugin.json` 的 Community permissions 目前不应被描述为运行时强制隔离。
+- DSH 生命周期使用官方 Harness 的 Cordis `agent/created`、`agent/pre-step`、`session/event`、`systemPrompt.section()`、`systemPrompt.context()` 和 `tools.register()` 扩展点；cleanup 直接对当前 session surface 执行按 ID 的 native replacement，不读取 mirror 文件。`systemPrompt.context()` 负责把 block index 放进模型可见的 runtime context；DSH 自己的 runtime-context snapshot 也会从 mirror records 中排除，避免 index 递归列出自身。普通 mirror 编辑的 `session/event` 只排队 reconcile，实际 mutation 延迟到 `Session.append()` 发布完成、且 `step/start` 打开新 step 之后执行；`agent/pre-step` 只等待已排队的收敛，不执行 mutation。session projection 仍由 DSH 提供，session log 仍是事实来源。
+- DSH 会按当前 session ID 生成 `/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md`。DSH 文件工具可以直接编辑这个 host-side mirror；sandboxed bash 可能拥有不同的 `/tmp`，除非宿主显式共享该 session 目录。
+- bridge 会对 mirror 编辑执行与 Pi 侧相同的 snapshot、结构安全和 shrink-only 校验；合法编辑通过 DSH 原生 `Session.append()` 的 `surfaceOp: { op: "replace" }` seam 写入当前 session，处理后再把 mirror 重写为新的 canonical DSH projection。
+- 当前 bridge **会**改变 DSH active surface，但不把它描述成 Pi 的 branch-local `context_edit`：cleanup 和普通编辑会追加 `tool/result` content replacement 或 `developer/message` replacement（omission 用空 content，assistant 改写用缩短后的文本），原始事件仍保留在 append-only session log 中，`deriveMessages()` 使用新的 surface。DSH 明确禁止 `assistant/message` 携带 `sourceEventSeqs`，而每个 replacement 又必须引用所有被遮蔽的节点，所以 assistant block 不能原地替换成另一个 assistant message；改写后的文本以 developer 身份进入模型可见历史，不再归属原模型回复。它不生成 proposal/receipt 文件，也不注册自定义 session event；reconcile 在事件回调之外串行执行，避免 `Session.append()` reentrant failure。所有 omission 和 assistant 改写都使用 append 时真正打开的 `turn`/`step`（正数），`tool/result` replacement 保持原 event envelope、只改 `content`，并带 `sourceEventSeqs: [targetSeq]`。
 - host entry 不复制 `dsh-ops` 的 Rust 工具、shell、PTC 或 TUI 矩阵，只做 live-context 适配。DSH 仅依赖 host 提供的 Cordis 生命周期，运行时不导入 Pi 的 coding-agent 包。
 
-安装 DSH bundle 时，按官方 Harness 的 `plugin_manager install_bundle` 流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。本仓库没有在真实 DSH profile 中执行安装，因此这里不提供“已安装/已激活”的 runtime 声明。
+安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现现在另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()`/surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。
+
+> **0.1.4 调整：block index 改为头部 40 + 尾部 40。**
+> 当可编辑 block 超过 80 个时，runtime context 只列出前 40 个和后 40 个，中间的 ID 区间用一行摘要表示；这样长会话仍能看到最新 block 的 ID，同时避免索引无限增长。`cleanup` 的结果仍然返回清理后的完整 head/tail 索引。
+>
+> **0.1.3 新增：block ID 进入聊天上下文。**
+> DSH bridge 现在通过 `systemPrompt.context()` 注册一个 `oh-my-clm:block-index` runtime context，列出当前可编辑 block 的 1-based ID、role 和短 preview；`cleanup` 的结果也会带上刷新后的 index。模型可以直接按 index 里的 ID 清理 stale block，不需要先读 `LIVE_CTX_MAIN.md` 找内容或 ID。runtime-context snapshot 本身不是用户 block，会从 mirror records 中排除，因此不会成为 cleanup 目标，也不会让 index 递归列出自身。只有需要完整正文做 rewrite 时才需要打开 mirror。
+>
+> **0.1.2 修复：`developer/message` 的 turn/step 必须取 append 时真正打开的 step。**
+> 0.1.0/0.1.1 在批量 cleanup 时为每个目标 assistant/tool-result 事件复制它自己的 `turn`/`step`，或对没有 turn/step envelope 的 `user/message` 回退为 `0`。DSH 把 `developer/message` 当作 step-scoped 事件：重放要求 `turn`/`step` 为正数，并且必须等于日志当前打开的 turn/step。被清理的目标通常来自更早的 step，而 cleanup 本身运行在最新的 step 中，于是追加了坐标过期的事件：轻则加载/重放时报 `developer/message turn must be positive`，重则把不匹配的事件持久化，下一次加载报 `developer/message does not match an open turn and step`，整个 session 无法恢复。0.1.2 从 session log 推导 append 时真正打开的 turn/step，omission 和 assistant 改写都使用这一对坐标；`tool/result` 改写仍严格保持原 event envelope，只改 `content`（DSH 只允许 content-only rewrite）。此外，`agent/pre-step` 运行在 `step/start` 之前，此时没有打开的 step，bridge 不再在那里执行 mutation，而是把待处理编辑留到 `step/start` 事件之后应用；没有打开的 step 时 mutation 会安全拒绝，不再写入损坏事件。已经由旧版本写入的损坏 session 不会自动恢复，需要用 session repair 脚本或备份修复。
+>
+> **0.1.1 修复：不要把 DSH host 包放进 `dependencies`。**
+> 0.1.0 在 `dependencies` 中声明了 `@deepseek-ai/dsh-tools`。pnpm 会把这份 host 包安装/提升到 profile 的 `node_modules`，于是 profile 内的 `@deepseek-ai/dsh-tools` 副本会遮蔽 dsh 安装自带的同一模块。`dsh-agent-loop` 用模块级 `Symbol("@deepseek-ai/dsh-tools.scheduler")` 访问工具调度器，两份模块各有一个 Symbol 实例，结果 `ctx.tools[TOOL_RUNTIME_SCHEDULER]` 为 `undefined`。症状是每个工具调用都已经写入 `tool/call`，但紧接着整步失败并补写一条 `TOOL_OUTCOME_UNKNOWN`/`interrupted` 结果：
+> `The tool call was interrupted after it was recorded, but no result was durably recorded. ...`
+> 0.1.1 不再在运行时的任何位置导入 `@deepseek-ai/dsh-tools`（cleanup 工具直接返回纯 JSON tool definition，并复用 `parseCleanupArgs` 做参数校验），`@deepseek-ai/dsh-tools` 只作为可选 `peerDependencies` 保留给 DSH 的兼容性检查，因此安装插件不会再向 profile 注入 host 包副本。若旧版本已经安装，先移除 profile 里的残留副本再重启（例如重新执行 `dsh plugin --profile <name> remove oh-my-clm` 后安装新包，或删除 profile 的 `node_modules/@deepseek-ai` 中由该插件带入的副本）；仅禁用 bundle 不足以恢复。
+>
+> **0.1.1 同时修复了普通 mirror 改写被 DSH 拒绝的问题。**
+> 0.1.0 把 assistant block 的缩短结果写回 `assistant/message`。DSH 要求每个 surface replacement 用 `sourceEventSeqs` 覆盖所有被遮蔽节点，却又禁止 `assistant/message` 携带 `sourceEventSeqs`（它内嵌 provider stream），因此这类改写必然失败：缺少引用时报 `sourceEventSeqs must include every shadowed surface node`，补上引用后又报 `assistant/message ... cannot carry sourceEventSeqs`。0.1.1 改用可携带引用的 `developer/message` 承载 shorter assistant text（omission 仍是空 `developer/message`），`tool/result` 仍按 DSH 的 content-only 规则改写；assistant tool-call 被改写时配对的 tool result 仍会一起 omit，避免孤立 tool message。由于 `developer/message` 不属于 mirror 的可编辑区域，被改写的 assistant block 在后续 mirror 中不再出现，这是 DSH surface 语义的直接结果。
 
 本地检查 DSH bridge：
 
@@ -103,13 +126,26 @@ npm run typecheck
 npm pack --dry-run
 ```
 
-`npm run build:dsh` 会从 `src/dsh-bridge.ts` 和共享格式层生成 `dist/`；`npm pack` 的 `prepack` 也会执行这一步。当前测试是 mock host 和契约/包检查，不等于真实 DSH CLI 的安装、HMR、bundle activation 或 provider 请求端到端验证。
+如果要交给 DSH 插件管理器安装，使用专门的 DSH 打包脚本：
 
-DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 `CLM_CONTEXT_FIXED_TOKENS`；它们只影响 mirror preview 或 patch gate 的近似估算，不改变 DSH 的 context window。
+```bash
+npm run build:dsh:plugin
+# 默认输出：dsh-clm/oh-my-clm-<version>.tgz
+
+# 也可以指定输出目录或具体文件
+node scripts/build-dsh-plugin.mjs ./artifacts
+node scripts/build-dsh-plugin.mjs --output ./artifacts/oh-my-clm.tgz
+```
+
+这个脚本会先编译并检查 host entry，再生成只包含 DSH host、运行时 `dist`、manifest、bundle patch、locale、icon 的 npm tgz；Pi extension、TypeScript 源码、测试文件和开发依赖不会进入该专用包。`@deepseek-ai/dsh-tools` 仅作为可选 peer 声明用于兼容性检查，不产生运行时依赖，也不得改回 `dependencies`（原因见上）。普通 `npm pack` 仍用于构建同时包含 Pi 与 DSH 内容的完整包。
+
+`npm run build:dsh` 会从 `src/dsh-bridge.ts` 和共享格式层生成 `dist/`；`npm pack` 的 `prepack` 也会执行这一步。仓库测试主要是 mock host 和契约/包检查；外部 DSH 验证报告另外覆盖了真实 CLI 安装、bundle activation、system prompt 和 mirror/file-tool 生成。DSH 文件工具运行在宿主侧时可以访问 `/tmp/clm-*`；sandbox 内的 bash 不一定共享同一个 `/tmp`，应按提示使用文件工具编辑 mirror。`Session.append()` 的 replacement 会走正常 `session/event` 发布路径；需要立即验证后端崩溃持久性的部署应由宿主使用官方 `session/flush` 检查点，而插件不猜测或注册额外 flush API。
+
+DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 `CLM_CONTEXT_FIXED_TOKENS`；它们只影响 mirror preview 或 shrink-only safety gate 的近似估算，不改变 DSH 的 context window。
 
 ## 设计边界
 
-本项目刻意保留 Pi-native 的最小核心：projection → live mirror → `context_edit`；DSH 侧对应为 projection → live mirror → explicit patch proposal。它不实现独立的 agent runtime、rollback/retry harness、trajectory export、独立 receipt store 或 dsh-ops 的 Rust/Bash/PowerShell/PTC/TUI 工具矩阵；DSH 的 patch 文件只是明确的 host-policy 输入。Pi session JSONL 和 DSH session log 都仍是各自主机的事实来源；只有 Pi 侧的 context edit 当前具备已验证的 branch-local 持久化语义。
+本项目刻意保留 Pi-native 的最小核心：projection → live mirror → `context_edit`；DSH 侧对应为 projection → live mirror → snapshot/safety/shrink validation → `Session.append()` surface replacement。它不实现独立的 agent runtime、rollback/retry harness、trajectory export、receipt store 或 dsh-ops 的 Rust/Bash/PowerShell/PTC/TUI 工具矩阵；DSH bridge 只使用宿主已拥有的 session mutation owner，不猜测 Cordis Service/Event，也不声称 Pi 的 branch-local 语义。Pi session JSONL 和 DSH session log 都仍是各自主机的事实来源；两条路径的原始日志都保留，只有当前 surface/projection 被替换。
 
 ## 文档
 
@@ -125,4 +161,4 @@ npm run typecheck
 npm pack --dry-run
 ```
 
-Pi 入口只依赖 Pi 在运行时提供的 host packages；DSH host entry 只依赖 DSH/Cordis 提供的公开生命周期对象。开发依赖用于类型检查和生成 `dist/`。发布白名单同时包含 `dsh-plugin.json`、`cordis.patch.yml`、`dsh/`、`dist/`、`locale/` 和 `icon.svg`，不包含本地 session 生成物或 `.pi/clm` patch/mirror 文件。
+Pi 入口只依赖 Pi 在运行时提供的 host packages；DSH host entry 只依赖 DSH/Cordis 提供的公开生命周期对象。开发依赖用于类型检查和生成 `dist/`。发布白名单同时包含 `dsh-plugin.json`、`cordis.patch.yml`、`dsh/`、`dist/`、`locale/` 和 `icon.svg`，不包含本地 session 生成物或 `/tmp/clm-*` mirror 文件。

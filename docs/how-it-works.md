@@ -7,7 +7,7 @@ Pi session projection
         │
         │ context
         ▼
-.pi/clm/LIVE_CTX_MAIN.md  ◄── 模型用普通 edit/write 修改
+/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md  ◄── 模型用普通 edit/write 修改
         │
         │ turn_end
         ▼
@@ -40,15 +40,18 @@ Pi context_edit entry
 
 - mirror 路径和 block 格式；
 - `CLM_SNAPSHOT`、起止 marker、序号 ID 不能改；
+- 可以使用 `cleanup({ blockIds: [...] })` 按 ID 删除过时/冗余/自指 block；它不读取 block body，且始终保留 load-bearing block 1；
 - 可以缩短已有 block，也可以删除过时 block；
 - 初始任务受保护，user-authored block 只能省略不能改写；
-- 使用一次普通 edit/write 操作完成整理，不读取或打印整个 mirror；
+- rewrite/edit 都必须在一个 host-side 工具调用内完成，不读取或打印整个 mirror；
 - `pi-clm-budget-nudge` 出现时，这是只整理上下文的 turn，不要做任务工作。
 
 ### 2.2 `context`：生成 mirror 和临时预算提醒
 
 扩展调用 `ctx.sessionManager.buildSessionProjection()`，用
-`buildMirrorRecords()` 和 `renderMirror()` 生成 `.pi/clm/LIVE_CTX_MAIN.md`。
+`buildMirrorRecords()` 和 `renderMirror()` 生成 `/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md`。
+
+路径由当前 session ID 决定，而不是由 `ctx.cwd` 决定；因此同一工作目录中的不同 session 具有隔离的 mirror。旧版本的 `.pi/clm` 文件不会被自动迁移或删除。
 
 如果 agent turn 外有进程直接修改 mirror，下一次同步会恢复 canonical projection；未经 `turn_end` 校验的文件内容不会静默进入 session。
 
@@ -62,17 +65,31 @@ Pi context_edit entry
 
 它只存在于这一次 provider request，不写入 session，也不会触发额外的模型 turn。若 Pi 的原生 context window 已没有足够空间，扩展不再追加 nudge，交给 Pi 的 native auto-compaction 处理。
 
-### 2.3 agent turn：模型编辑文件
+### 2.3 agent turn：模型整理文件或调用 cleanup
 
-模型可以像编辑普通文件一样缩短历史：
+删除 stale/self-referential block 时可以调用：
 
-```markdown
-[[CLM_ENTRY id=1 role=assistant]]
-已经检查仓库：这是一个小型 TypeScript Pi 插件，测试位于 test/。
-[[/CLM_ENTRY id=1]]
+```text
+cleanup({ "blockIds": [2, 3, 4] })
 ```
 
-模型只能修改已有 block 的 body 或删除已有 block，不能通过添加 block 注入新的上下文消息。ID 是当前 mirror 中从 `1` 开始的可读编辑序号；扩展内部仍映射到 Pi 的 opaque entry ID。
+该工具在一次调用内读取当前 host 状态、按 block ID 完成删除并在返回前写完结果；它不依赖正文，也不会因为 preview 截断而构造错误的 `old_string`。load-bearing block 1、协议头和 `CLM_SNAPSHOT` 保留；assistant/tool-result 配对会一起处理。
+
+DSH bridge 还会把当前可编辑 block 的索引放进模型可见的 runtime context：
+
+```text
+<oh-my-clm-block-index>
+Editable context blocks, in cleanup ID order.
+When the list is longer, this index shows the first 40 and last 40 blocks and summarizes the omitted ID range.
+1. assistant: I inspected the repository and found a small TypeScript project.
+2. toolResult: A very large command output that is no longer useful.
+...
+</oh-my-clm-block-index>
+```
+
+索引使用与 `cleanup` 完全相同的 1-based ordinal，并附带 role 和单行短 preview，因此模型不需要为了确认“哪个 ID 对应哪段内容”而读取 mirror。列表超过 80 个 block 时，只显示头部 40 个和尾部 40 个，中间用一行 `... N editable block(s) omitted ... (IDs A-B)` 标出区间；这样长会话仍能看到最新 block 的 ID，同时避免索引无限增长。`cleanup` 的 tool result 也会返回执行后的新索引，避免同一步内连续清理时继续使用已经移位的旧 ID。只有需要完整、未截断的正文做 rewrite 时，才需要打开 mirror。
+
+需要改写时，模型可以使用一次短 rewrite 脚本完成 read+write；普通 edit 只适用于完整、未截断的 body。模型只能修改已有 block 的 body 或删除已有 block，不能通过添加 block 注入新的上下文消息。ID 是当前 mirror 中从 `1` 开始的可读编辑序号；扩展内部仍映射到 Pi 的 opaque entry ID。
 
 ### 2.4 `turn_end`：计划并提交编辑
 
@@ -101,21 +118,18 @@ DSH session.surface + session.snapshotEvents()
 同一份 buildMirrorRecords/renderMirror/parseMirror/planContextEdits
                  │
                  ▼
-LIVE_CTX_MAIN.md ──合法编辑──> LIVE_CTX_MAIN.patch.json
+/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md ──编辑──> snapshot/安全/shrink 校验
                                       │
-                                      └─ host policy（当前未提供）
+                                      ├─ Session.append(surfaceOp=replace)
+                                      │       └─ current surface / deriveMessages
+                                      └─ canonical mirror（原始 log 保留）
 ```
 
-DSH 的 `Session` surface 是由官方框架从已提交事件增量投影出来的；bridge 只读取 `surface.nodes` 和事件快照来适配 `ProjectionEntryLike`。它在 `agent/pre-step` 前刷新 mirror，并在 `session/event` 后尽早检查模型的文件编辑。
+DSH 的 `Session` surface 是由官方框架从已提交事件增量投影出来的；bridge 只读取 `surface.nodes` 和事件快照来适配 `ProjectionEntryLike`。它通过 `systemPrompt.context()` 注册 `oh-my-clm:block-index`，DSH 会把该 contribution 作为 sourced user-role runtime-context snapshot 追加到模型历史；bridge 同时把 `source.kind === "runtime-context"` 的 snapshot 从 mirror records 中排除，因此它们既不会出现在可编辑 block 里，也不会让 index 列出自身。cleanup 工具通过官方 `ctx.tools.register(defineTool(...))` 注册，schema 会在 `execute` 前验证基础参数；共享 parser 再执行正整数、唯一性和 active-surface 约束。cleanup 直接基于当前 surface 的 canonical records 按 ID 执行，不经过 mirror 文件，并在工具返回前写完新的 canonical mirror。`session/event` 是 DSH 的 append-event 观察入口，但回调仍处于当前 `Session.append()` 的发布栈内，所以 bridge 只排队 reconcile，等事件发布完成后再串行检查文件。`agent/pre-step` 运行在 `step/start` 之前，此时 DSH 还没有打开新 step，因此它只等待已排队的收敛，不执行 mutation；真正的 mutation 由 `step/start`（或 `tool/result`、`user/message`）触发，确保下一次模型请求看到已经收敛的 projection。编辑通过 snapshot、结构安全和 shrink-only 校验后，bridge 使用官方 `Session.append()` 的 surface replacement seam：内容编辑追加 `assistant/message` 或 `tool/result` replacement，删除追加使用 append 时打开的 `turn`/`step`（正数）的空 `developer/message` replacement；assistant 改写同样使用这一对坐标，`tool/result` 则严格保持原事件 envelope、只改 `content`。若当前没有打开的 turn/step，bridge 拒绝 mutation 而不是写入坐标过期的事件。所有 replacement 都用 `{ op: "replace", startSeq, endSeq }`，非 assistant replacement 同时提供覆盖目标的 `sourceEventSeqs`。DSH 的 surface fold 会立即遮蔽旧节点，`deriveMessages()` 因而使用新内容；原始事件仍留在 append-only session log 中，mirror 随后重写为新的 canonical projection。DSH 文件工具可访问宿主侧的 `/tmp`，sandbox 内 bash 不应被假定能访问同一目录。
 
-DSH 当前没有在本项目中验证到可映射 Pi `context_edit` 的 branch-local 原生 API。因此 patch 是**明确的提案/receipt**，不是 session mutation：
+这不是 Pi 的 branch-local `context_edit`：DSH 采用当前 `Session` 的 append-only surface replacement 和它自己的 fork/persistence 语义。它也不需要 proposal、receipt 或自定义 session event。若运行时对象没有已验证的 `Session.append()` owner，bridge 会拒绝编辑并恢复 canonical mirror，而不是退回“看似应用”的 mirror-only 状态。DSH 文件工具运行在宿主侧；sandboxed bash 可能看见隔离的 `/tmp`，因此脚本只有在实际写到了 host-side mirror、且在工具返回前完成写入时才会被 bridge 采纳。
 
-- `status: applied` 表示共享格式层接受了编辑计划，不表示 DSH 活动上下文已改变；
-- patch 保留 `baseSnapshot`、target IDs、replacement/omit、token gate、warnings 和 paired tool-call/result 结果；
-- `status: rejected` 也会写入 patch 文件，便于 mock host 或未来 host policy 审计；
-- 只有一个明确消费 patch 的 DSH host policy 才能把它转成 DSH 认可的 session/surface 操作。当前 bridge 不假设这种 policy 存在，也不写自定义 session event。
-
-这部分依据官方 `deepseek-harness` 的 session projection、agent-loop、system-prompt 和 Cordis plugin development 资料实现；`dsh-ops` 只作为 manifest/host-entry 形态的参考，不作为需要复制的工具矩阵。
+这部分依据官方 `deepseek-harness` commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `dsh-session`、surface fold、compaction replacement 和 session persistence 契约实现；`dsh-ops` 只作为 manifest/host-entry 形态的参考，不作为需要复制的工具矩阵。
 
 ## 3. Mirror 文件格式
 
@@ -146,7 +160,7 @@ DSH 当前没有在本项目中验证到可映射 Pi `context_edit` 的 branch-l
 
 ### Block 和 ID
 
-每个 block 对应一个 Pi projection entry。文件中使用从 `1` 开始的 editable ordinal，避免模型必须先读取 session entry 的 opaque ID；解析器同时保留内部 ID 映射。`role` 只能是 `user`、`assistant`、`toolResult` 或 `custom`，改变 role 会被拒绝。
+每个 block 对应一个 Pi projection entry。文件中使用从 `1` 开始的 editable ordinal，避免模型必须先读取 session entry 的 opaque ID；解析器同时保留内部 ID 映射。DSH 的同一组 ordinal 也会由 runtime context 的 `<oh-my-clm-block-index>` 直接呈现，因此 cleanup 的 ID 目标可以只来自聊天上下文；mirror 只负责完整正文和 rewrite。`role` 只能是 `user`、`assistant`、`toolResult` 或 `custom`，改变 role 会被拒绝。
 
 只有 block body 可编辑。删除所有可编辑 block 时必须保留：
 
@@ -207,10 +221,10 @@ DSH 当前没有在本项目中验证到可映射 Pi `context_edit` 的 branch-l
 
 ## 6. Mirror 自读保护
 
-如果模型用 Pi `read` 工具读取 `.pi/clm/LIVE_CTX_MAIN.md`，扩展会在 `turn_end` 将成功的 tool result 替换为短指针：
+如果模型用 Pi `read` 工具读取 `/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md`，扩展会在 `turn_end` 将成功的 tool result 替换为短指针：
 
 ```text
-[oh-my-clm] Live mirror read omitted from future context; the mirror is already available at .pi/clm/LIVE_CTX_MAIN.md.
+[oh-my-clm] Live mirror read omitted from future context; the mirror is already available at /tmp/clm-${sessionId}/LIVE_CTX_MAIN.md.
 ```
 
 否则完整 mirror 会作为 tool result 回到下一轮，又被重新镜像，造成自我复制。该保护只针对识别到的 Pi `read` 调用；原始 session 历史仍保留完整 tool result，未来 projection 才使用短替换。
@@ -255,10 +269,13 @@ pi --extension ./extensions/clm.ts
 | --- | --- |
 | [`extensions/clm.ts`](../extensions/clm.ts) | Pi lifecycle handlers、mirror 同步、临时预算 nudge、`/clm status`、self-read guard |
 | [`src/context-format.ts`](../src/context-format.ts) | Pi/DSH 共用的 record 构建、文本投影、序号 ID、mirror 渲染/解析、snapshot、编辑规划和 token/gate 校验 |
-| [`src/dsh-bridge.ts`](../src/dsh-bridge.ts) | DSH surface 适配、mirror 生命周期和显式 patch 提案输出（不自动改写 session） |
+| [`src/context-cleanup.ts`](../src/context-cleanup.ts) | 双宿主共用的 block-ID cleanup 参数、配对/保护校验和完整 span 删除；不依赖截断 preview |
+| [`src/dsh-bridge.ts`](../src/dsh-bridge.ts) | DSH surface 适配、mirror 生命周期、安全校验和 `Session.append()` replacement mutation；cleanup 直接走 active surface |
 | [`dsh/index.ts`](../dsh/index.ts) | Cordis host entry：system prompt、agent/session 生命周期和文件 I/O |
+| [`src/clm-files.ts`](../src/clm-files.ts) | session mirror 的原子写入和私有文件权限（目录 0700、文件 0600） |
 | [`dsh-plugin.json`](../dsh-plugin.json) | DSH Community v0.15 host manifest；`cordis.patch.yml` 是官方 bundle 安装层 |
 | [`test/context-format.test.ts`](../test/context-format.test.ts) | 协议、截断、gate、stale snapshot、tool 配对和安全边界测试 |
+| [`test/context-cleanup.test.ts`](../test/context-cleanup.test.ts) | cleanup ID 校验、block 1 保留、截断 preview、完整 span 删除和配对失败测试 |
 | [`test/extension.test.ts`](../test/extension.test.ts) | Pi extension 生命周期、持久化 edit、预算 nudge 和 self-read guard 测试 |
 | [`test/session-integration.test.ts`](../test/session-integration.test.ts) | Pi `SessionManager` 对 context edit、原始历史和 branch 隔离的集成测试 |
 
@@ -283,7 +300,10 @@ npm pack --dry-run
 6. Pi context edit 不会修改原始消息；
 7. branch 切换不会泄漏另一个 branch 的编辑；
 8. 读取 live mirror 的 tool result 不会被再次复制进未来 context；
-9. budget nudge 是临时请求内容，不会生成持久化 compact/receipt entry。
+9. cleanup 按 block ID 在一次工具调用内完成 host-side mutation，preview 截断和 `old_string` 不会影响删除；block 1、协议头和安全配对得到保留；
+10. budget nudge 是临时请求内容，不会生成持久化 compact/receipt entry；DSH mirror edit 处理后会恢复新的 canonical projection。
+11. DSH legal edit 会追加标准 surface replacement，原始 session event 不被删除，当前 `surface.nodes` 和 `deriveMessages()` 会改变；没有 append owner 时编辑会被拒绝。
+12. session mirror 写入使用私有权限，避免 reasoning 和 tool output 被同机其他用户直接读取。
 
 ## 10. 当前取舍与限制
 
@@ -295,4 +315,4 @@ npm pack --dry-run
 - Pi 的近似 token estimator，而不是 provider tokenizer；
 - 原始 session JSONL 作为审计和重放来源。
 
-它没有实现独立 Bash agent loop、rollback/retry harness、trajectory export、持久化 receipt、可调 mirror limit 或 user rewrite 开关。模型生成的摘要仍可能误删事实、引入错误或携带 prompt injection；保护 header、初始任务和 shrink gate 不能替代内容审计。
+它没有实现独立 Bash agent loop、rollback/retry harness、trajectory export、持久化 receipt、可调 mirror limit 或 user rewrite 开关。DSH 使用宿主 `Session.append()` 的 surface replacement，而不是 Pi 的 branch-local `context_edit`；append-only 原始日志仍是事实来源，session persistence 的即时 flush 由宿主负责。临时 mirror 可能包含 reasoning 和 tool output，虽然写入使用私有权限，仍应由宿主负责生命周期清理。模型生成的摘要仍可能误删事实、引入错误或携带 prompt injection；保护 header、初始任务和 shrink gate 不能替代内容审计。

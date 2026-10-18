@@ -1,0 +1,127 @@
+oh-my-clm host harness
+entry: /home/deepseek-agent/oh-my-clm/dist/dsh/index.js
+node:  v26.11.1
+
+== 1. module contract ==
+  PASS  exports name = oh-my-clm
+  PASS  exports apply()
+  PASS  injects systemPrompt service
+  PASS  injects tools service
+
+== 2. system prompt section ==
+  PASS  section registered exactly once
+  PASS  section name matches manifest contribution
+  PASS  section order falls back to 3240
+  PASS  section names the mirror template
+  PASS  section describes the Session.append replacement seam
+  PASS  cleanup tool is registered
+  PASS  section says no proposal or receipt file is written
+  PASS  runtime block index context registered exactly once
+  PASS  runtime block index context name
+  PASS  runtime block index context sorts after host policy
+  PASS  block index lists editable 1-based IDs
+  PASS  block index excludes the protected initial task
+  PASS  section tells the model to use the runtime block index
+  PASS  section order follows host TOOL_EDIT order
+
+== 3. agent lifecycle wiring ==
+  PASS  agent/pre-step listener registered on the agent ctx
+  PASS  host registers session/event listener
+  PASS  pre-step still calls next()
+  PASS  re-read of the same projection is a no-op with no extra artifact
+  PASS  empty session id does not throw out of the hook
+  PASS  empty session id is reported through ctx.logger.warn
+  PASS  session-less agent is warned about, not crashed
+
+== 4. mirror generation ==
+  PASS  mirror file written to /tmp/clm-<sessionId>/LIVE_CTX_MAIN.md
+  PASS  mirror carries the protocol header
+  PASS  mirror carries a 16-hex snapshot fingerprint
+  PASS  protected initial user task is absent
+  PASS  assistant reasoning/tool-call block is editable
+  PASS  tool result block is editable
+  PASS  last assistant block is editable
+  PASS  unchanged projection leaves the mirror byte-identical
+
+== 5. native Session.append surface replacement ==
+  PASS  no proposal or receipt artifact is written
+  PASS  append-only log retains originals and adds a replacement
+  PASS  replacement event is a developer/message
+  PASS  replacement uses the open turn/step
+  PASS  surface replaces the edited event
+  PASS  replacement carries the shortened text
+  PASS  canonical mirror drops the rewritten assistant block
+  PASS  info log reports native surface replacement
+  PASS  the applied edit is not repeated on the next pre-step
+
+== 5b. direct cleanup tool ==
+  PASS  defineTool rejects malformed numeric IDs before execute
+  PASS  cleanup returns an applied canonical result
+  PASS  cleanup removes the selected active-surface block
+  PASS  cleanup writes the canonical mirror before tool return
+  PASS  cleanup result returns the refreshed block index
+  PASS  cleanup omission uses the open turn
+  PASS  cleanup omission uses the open step
+  PASS  cleanup does not write a second artifact
+  PASS  next pre-step does not repeat native cleanup
+
+== 5c. step/start opens the mutation window ==
+  PASS  pre-step does not mutate while the step is closed
+  PASS  pre-step preserves the pending mirror edit
+  PASS  step/start applies the pending edit
+  PASS  pending replacement uses the newly opened step
+  PASS  canonical mirror drops the pending text after apply
+
+== 6. shrink-only gate ==
+  PASS  growing edit is rejected
+  PASS  rejection reason mentions the SHRINK rule
+  PASS  rejected edit writes no extra artifact
+  PASS  rejected edit does not append a replacement
+  PASS  rejected mirror is restored to the canonical projection
+  PASS  a later projection change remains canonical
+
+== 7. rejection matrix ==
+  PASS  stale snapshot: rejected
+  PASS  stale snapshot: reason matches
+  PASS  stale snapshot: no proposal or receipt artifact
+  PASS  malformed document: rejected
+  PASS  malformed document: reason matches
+  PASS  malformed document: no proposal or receipt artifact
+  PASS  unknown id: rejected
+  PASS  unknown id: reason matches
+  PASS  unknown id: no proposal or receipt artifact
+  PASS  duplicate id: rejected
+  PASS  duplicate id: reason matches
+  PASS  duplicate id: no proposal or receipt artifact
+  PASS  role change: rejected
+  PASS  role change: reason matches
+  PASS  role change: no proposal or receipt artifact
+  PASS  user-authored rewrite: rejected
+  PASS  user-authored rewrite: reason matches
+  PASS  user-authored rewrite: no proposal or receipt artifact
+
+== 8. native omission and tool pairing ==
+  PASS  rewriting an assistant tool turn is applied
+  PASS  paired tool result is omitted through a developer replacement
+  PASS  surface replaces both the assistant and paired result
+  PASS  canonical mirror has no orphaned old tool output
+  PASS  no proposal or receipt artifact is written
+  PASS  deleting a block appends a developer omission replacement
+  PASS  surface no longer contains the omitted block
+  PASS  no proposal or receipt artifact is written
+
+== 9. session/event driven sync ==
+  PASS  tool/result event refreshes the mirror
+  PASS  non-surface events are ignored
+  NOTE  agent.id/session.id mismatch — session/event sync is silently skipped when agent.id !== session.id; DSH enforces equality so this is unreachable in-product
+
+== 10. disposal ==
+  PASS  disposed agent is dropped from the state map (session/event does not reconcile)
+  PASS  effect disposers remove the agent listeners
+  PASS  host listeners are removed on dispose
+  PASS  tool registration is removed on dispose
+
+94 passed, 0 failed, 1 observation(s)
+
+observations (measured behaviour, not asserted contract):
+  - agent.id/session.id mismatch: session/event sync is silently skipped when agent.id !== session.id; DSH enforces equality so this is unreachable in-product

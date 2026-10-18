@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { Type } from "typebox";
 import type {
 	ContextEditableContent,
 	ContextEvent,
@@ -24,8 +25,18 @@ import {
 	type MirrorRecord,
 	type ProjectionEntryLike,
 } from "../src/context-format.ts";
+import { writePrivateText } from "../src/clm-files.ts";
+import {
+	cleanupToolResult,
+	formatCleanupToolResult,
+	parseCleanupArgs,
+	parseCleanupMirror,
+	planCleanup,
+	removeMirrorBlocks,
+	type CleanupToolResult,
+} from "../src/context-cleanup.ts";
+import { sessionMirrorPath } from "../src/clm-paths.ts";
 const STATUS_KEY = "oh-my-clm";
-const MIRROR_RELATIVE_PATH = path.join(".pi", "clm", "LIVE_CTX_MAIN.md");
 const PROMPT_MARKER = "<pi-clm-live-context>";
 const CONTEXT_NUDGE_MARKER = "<pi-clm-budget-nudge>";
 const CONTEXT_RESERVE_TOKENS = 2_048;
@@ -57,13 +68,8 @@ function config(): Config {
 	};
 }
 
-function mirrorPath(cwd: string): string {
-	return path.join(cwd, MIRROR_RELATIVE_PATH);
-}
-
-function relativePath(cwd: string, target: string): string {
-	const relative = path.relative(cwd, target);
-	return relative || ".";
+function mirrorPath(ctx: ExtensionContext): string {
+	return sessionMirrorPath(ctx.sessionManager.getSessionId());
 }
 
 function readText(filePath: string): string | undefined {
@@ -74,20 +80,6 @@ function readText(filePath: string): string | undefined {
 	}
 }
 
-function writeText(filePath: string, content: string): void {
-	fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-	try {
-		fs.writeFileSync(temporaryPath, content, "utf8");
-		fs.renameSync(temporaryPath, filePath);
-	} finally {
-		try {
-			if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath);
-		} catch {
-			// Best-effort cleanup; the next refresh will replace the canonical file.
-		}
-	}
-}
 
 function getProjection(ctx: ExtensionContext): { entries: ProjectionEntryLike[] } {
 	const projection = ctx.sessionManager.buildSessionProjection();
@@ -115,11 +107,10 @@ function updateStatus(ctx: ExtensionContext, records: readonly MirrorRecord[], f
 		? ` · target ${settings.budgetTokens} ${current > settings.budgetTokens ? "OVER" : "FIT"}`
 		: "";
 	const context = window > 0 ? `ctx ~${current}/${window}` : `ctx ~${current}`;
-	const rel = relativePath(ctx.cwd, filePath);
 	const suffix = note ? ` · ${note}` : "";
 	ctx.ui.setStatus(
 		STATUS_KEY,
-		ctx.ui.theme.fg("accent", `CLM ${context}${budget} · ${records.length} blocks · ${rel}${suffix}`),
+		ctx.ui.theme.fg("accent", `CLM ${context}${budget} · ${records.length} blocks · ${filePath}${suffix}`),
 	);
 }
 
@@ -132,11 +123,11 @@ function projectionSignature(records: readonly MirrorRecord[]): string {
 }
 
 function syncMirror(ctx: ExtensionContext, force = false): MirrorSnapshot {
-	const filePath = mirrorPath(ctx.cwd);
+	const filePath = mirrorPath(ctx);
 	const projection = getProjection(ctx);
 	const settings = config();
 	const records = buildMirrorRecords(projection.entries, {
-		mirrorPath: relativePath(ctx.cwd, filePath),
+		mirrorPath: filePath,
 		maxBlockChars: settings.maxBlockChars,
 		maxMirrorChars: settings.maxMirrorChars,
 	});
@@ -146,7 +137,7 @@ function syncMirror(ctx: ExtensionContext, force = false): MirrorSnapshot {
 	const previous = state.snapshot;
 
 	if (force || !previous || previous.filePath !== filePath || current === undefined || previous.signature !== signature) {
-		writeText(filePath, rendered);
+		writePrivateText(filePath, rendered);
 	} else if (current !== rendered) {
 		// A direct edit outside a model turn has no safe append-only boundary. Do
 		// not silently apply it or leave the model looking at stale, untracked data.
@@ -155,10 +146,10 @@ function syncMirror(ctx: ExtensionContext, force = false): MirrorSnapshot {
 		const parsed = parseMirror(current);
 		const pending = planContextEdits(previous.records, parsed, editPlanOptions(ctx));
 		if (pending.status !== "noop") {
-			writeText(filePath, rendered);
+			writePrivateText(filePath, rendered);
 			state.lastNotice = "mirror edit restored; edit it during an agent turn";
 		} else {
-			writeText(filePath, rendered);
+			writePrivateText(filePath, rendered);
 		}
 	}
 
@@ -170,17 +161,18 @@ function syncMirror(ctx: ExtensionContext, force = false): MirrorSnapshot {
 }
 
 function promptAppendix(ctx: ExtensionContext): string {
-	const filePath = mirrorPath(ctx.cwd);
-	const relative = relativePath(ctx.cwd, filePath);
+	const filePath = mirrorPath(ctx);
 	return `${PROMPT_MARKER}
-When old conversation turns become noise, manage your own Pi context through \`${relative}\`.
+When old conversation turns become noise, manage your own Pi context through \`${filePath}\`.
 - The file uses blocks like \`[[CLM_ENTRY id=1 role=assistant]]\` followed by a matching \`[[/CLM_ENTRY id=1]]\`; the id is an editable ordinal. Keep both markers exactly as written and do not reorder blocks.
 - Keep the \`CLM_SNAPSHOT\` line and protocol comments intact. It prevents stale edits from changing a newer projection.
-- Rewrite the body of an existing block with a short, faithful summary; do not append a duplicate summary.
+- Use the registered \`cleanup({ blockIds: [...] })\` tool for stale, redundant, or self-referential blocks; it works by ID, preserves load-bearing block 1, and does not read truncated bodies.
+- For a \`rewrite\`, use one host-side script that completes its read and write before returning; preserve the protocol header, \`CLM_SNAPSHOT\`, and block 1.
+- For an \`edit\`, change the smallest necessary existing block body to a short, faithful summary only when the complete old body is available; never use a truncated preview as \`old_string\`.
 - Delete an editable block to omit stale history. To delete the last editable block, leave the \`<!-- CLM_EMPTY -->\` marker.
 - The initial task is protected and is intentionally not shown in the file.
 - User-authored blocks may be omitted when stale, but cannot be rewritten.
-- Use one ordinary bash/edit/write operation to change the file during an agent turn. Do not read or cat the mirror: use a script and short anchors, and print no mirror contents. The extension persists an accepted edit as a branch-local context edit after the turn.
+- For a broader context change, use one ordinary host-side bash/edit/write operation during an agent turn. Do not read or cat the mirror as a separate step, and print no mirror contents. The extension persists an accepted edit as a branch-local context edit after the turn.
 - Tool-call assistant turns are kept structurally safe: rewriting or deleting one also removes its paired tool results.
 - A tool result that reads this live mirror is automatically replaced in future context with a short pointer; avoid reading it unless absolutely necessary.
 - When a ${CONTEXT_NUDGE_MARKER} appears, this is a context-only turn: edit the mirror now, do no task work, and stop after the one edit operation.
@@ -200,7 +192,7 @@ function statusText(ctx: ExtensionContext, snapshot: MirrorSnapshot | undefined)
 	const edits = branch.filter((entry) => entry.type === "context_edit").length;
 	return [
 		"oh-my-clm status",
-		`mirror: ${relativePath(ctx.cwd, current.filePath)}`,
+		`mirror: ${current.filePath}`,
 		`mirror bytes: ${Buffer.byteLength(current.rendered, "utf8")}`,
 		`editable blocks: ${editableRecords.length}`,
 		`protected blocks: ${current.records.filter((record) => record.protected).length}`,
@@ -248,7 +240,7 @@ function mirrorReadContextEdits(event: TurnEndEvent, ctx: ExtensionContext, file
 			replacement: {
 				content: [{
 					type: "text",
-					text: "[oh-my-clm] Live mirror read omitted from future context; the mirror is already available at " + relativePath(ctx.cwd, filePath) + ".",
+					text: "[oh-my-clm] Live mirror read omitted from future context; the mirror is already available at " + filePath + ".",
 				}],
 			},
 		});
@@ -261,6 +253,65 @@ const state: {
 	lastNotice?: string;
 } = {};
 
+const cleanupParameters = Type.Object({
+	blockIds: Type.Array(
+		Type.Integer({ minimum: 1 }),
+		{ minItems: 1, uniqueItems: true, description: "1-based editable block IDs; block 1 is always preserved." },
+	),
+}, { additionalProperties: false });
+
+const cleanupOutputSchema = Type.Object({
+	status: Type.Union([Type.Literal("applied"), Type.Literal("rejected")]),
+	requestedBlockIds: Type.Array(Type.Integer({ minimum: 1 })),
+	removedBlockIds: Type.Array(Type.Integer({ minimum: 1 })),
+	reason: Type.String(),
+}, { additionalProperties: false });
+
+function rejectedCleanupResult(requestedBlockIds: readonly number[], reason: string): CleanupToolResult {
+	return {
+		status: "rejected",
+		requestedBlockIds: [...requestedBlockIds],
+		removedBlockIds: [],
+		reason,
+	};
+}
+
+function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolResult {
+	const parsedArgs = parseCleanupArgs(params);
+	if (!parsedArgs.ok) return rejectedCleanupResult([], parsedArgs.reason);
+
+	const filePath = mirrorPath(ctx);
+	const text = readText(filePath);
+	if (text === undefined) return rejectedCleanupResult(parsedArgs.args.blockIds, `The live mirror is unavailable at ${filePath}.`);
+
+	const settings = config();
+	const records = buildMirrorRecords(getProjection(ctx).entries, {
+		mirrorPath: filePath,
+		maxBlockChars: settings.maxBlockChars,
+		maxMirrorChars: settings.maxMirrorChars,
+	});
+	const plan = planCleanup(
+		records,
+		parseCleanupMirror(text),
+		parsedArgs.args.blockIds,
+		{ fixedTokens: fixedRequestTokens(ctx) },
+	);
+	if (plan.status !== "applied") return cleanupToolResult(plan);
+
+	try {
+		// All filesystem work is synchronous and completes before this tool
+		// returns. The bridge therefore cannot observe a half-finished cleanup.
+		const cleaned = removeMirrorBlocks(text, plan.removedBlockIds);
+		writePrivateText(filePath, cleaned);
+	} catch (error) {
+		return rejectedCleanupResult(
+			plan.requestedBlockIds,
+			`Cleanup could not write the live mirror: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	return cleanupToolResult(plan);
+}
+
 function contextBudgetNudge(ctx: ExtensionContext, messages: readonly unknown[]): string | undefined {
 	const budget = config().budgetTokens;
 	if (budget <= 0) return undefined;
@@ -269,9 +320,10 @@ function contextBudgetNudge(ctx: ExtensionContext, messages: readonly unknown[])
 	const tokens = fixedRequestTokens(ctx) + messages.reduce<number>((total, message) => total + estimateMessageTokens(message), 0);
 	if (tokens < Math.floor(target * CONTEXT_NUDGE_FRACTION)) return undefined;
 
+	const filePath = mirrorPath(ctx);
 	const nudge = `${CONTEXT_NUDGE_MARKER}
 You are at approximately ${tokens}/${budget} context tokens. This is a context-only turn.
-Use exactly one bash/edit/write operation to shorten ${MIRROR_RELATIVE_PATH}; do not read or print the mirror, do no task work, and stop after the edit.
+Use \`cleanup({ blockIds: [...] })\` to remove stale blocks by ID; it completes the host-side mutation without a separate mirror read. For a broader change, use exactly one host-side rewrite/edit operation to shorten ${filePath}; do not read or print the mirror, do no task work, and stop after that operation.
 Preserve the CLM protocol and keep the facts needed for the current task.
 ${CONTEXT_NUDGE_MARKER}`;
 	const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow ?? 0;
@@ -356,6 +408,49 @@ export default function (pi: ExtensionAPI) {
 				: "edit rejected";
 		if (newEntries.length === 0) return;
 		return { entries: [...event.entries, ...newEntries] };
+	});
+
+	pi.registerTool({
+		name: "cleanup",
+		label: "Cleanup context",
+		description: "Remove stale CLM context blocks by ID without reading or reconstructing their bodies.",
+		promptSnippet: "Remove stale context blocks by ID",
+		promptGuidelines: [
+			"Use cleanup({ blockIds: [...] }) to remove stale blocks by ID.",
+			"Block 1 is load-bearing and is always preserved.",
+			"Cleanup is sequential and completes its host-side mirror write before returning.",
+		],
+		parameters: cleanupParameters,
+		outputSchema: cleanupOutputSchema,
+		executionMode: "sequential",
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (signal?.aborted) {
+				const result = rejectedCleanupResult([], "cleanup was cancelled before the mirror was changed.");
+				return {
+					content: [{ type: "text", text: formatCleanupToolResult(result) }],
+					details: result,
+					structuredContent: {
+						status: result.status,
+						requestedBlockIds: result.requestedBlockIds,
+						removedBlockIds: result.removedBlockIds,
+						reason: result.reason,
+					},
+					isError: true,
+				};
+			}
+			const result = executePiCleanup(params, ctx);
+			return {
+				content: [{ type: "text", text: formatCleanupToolResult(result) }],
+				details: result,
+				structuredContent: {
+					status: result.status,
+					requestedBlockIds: result.requestedBlockIds,
+					removedBlockIds: result.removedBlockIds,
+					reason: result.reason,
+				},
+				isError: result.status === "rejected",
+			};
+		},
 	});
 
 	pi.registerCommand("clm", {

@@ -9,6 +9,7 @@ import {
 	mirrorSignature,
 	parseMirror,
 	planContextEdits,
+	renderBlockIndex,
 	renderMirror,
 	type MirrorRecord,
 } from "../src/context-format.ts";
@@ -284,7 +285,55 @@ test("a self-referential tool result gets a compact mirror preview", () => {
 			sourceEntry: { id: "self", type: "message" },
 			messages: [{ role: "toolResult", content: [{ type: "text", text: "<!-- pi-clm-v2 -->\\n[[CLM_ENTRY id=old role=assistant]]" }] }],
 		},
-	], { mirrorPath: ".pi/clm/LIVE_CTX_MAIN.md" });
+	], { mirrorPath: "/tmp/clm-test-session/LIVE_CTX_MAIN.md" });
 	assert.match(projected[1]?.renderText ?? "", /Self-referential/);
 	assert.equal(projected[1]?.text.includes("CLM_ENTRY"), true);
+});
+
+test("block index exposes the same 1-based IDs as the mirror without protected blocks", () => {
+	const index = renderBlockIndex(records);
+	assert.match(index, /^<oh-my-clm-block-index>/);
+	assert.match(index, /\n1\. assistant: I inspected the repository/);
+	assert.match(index, /\n2\. toolResult: A very large command output/);
+	assert.match(index, /\n3\. user: Keep the important repository fact\./);
+	assert.doesNotMatch(index, /Build a context editor\./);
+	assert.match(index, /cleanup\(\{ blockIds:/);
+	assert.match(index, /Block 1 is load-bearing/);
+});
+
+test("block index previews are single-line and bounded", () => {
+	const record: MirrorRecord = {
+		id: "long",
+		role: "toolResult",
+		text: "line one\nline two\t" + "x".repeat(400),
+		protected: false,
+		toolCallIds: [],
+	};
+	const index = renderBlockIndex([record], { maxPreviewChars: 32 });
+	assert.match(index, /\n1\. toolResult: line one line two/);
+	const previewLine = index.split("\n").find((line) => line.startsWith("1. ")) ?? "";
+	assert.ok(previewLine.length <= "1. toolResult: ".length + 33);
+	assert.match(previewLine, /…$/);
+});
+
+test("the block index keeps the first and last 40 blocks and summarizes the middle", () => {
+	const many: MirrorRecord[] = Array.from({ length: 120 }, (_, index) => ({
+		id: `block-${index + 1}`,
+		role: "assistant",
+		text: `content ${index + 1}`,
+		protected: false,
+		toolCallIds: [],
+	}));
+	const index = renderBlockIndex(many, { maxPreviewChars: 32 });
+	assert.match(index, /\n1\. assistant: content 1\n/);
+	assert.match(index, /\n40\. assistant: content 40\n/);
+	assert.doesNotMatch(index, /\n41\. assistant:/);
+	assert.doesNotMatch(index, /\n80\. assistant:/);
+	assert.match(index, /\.\.\. 40 editable block\(s\) omitted from this index \(IDs 41-80\)\./);
+	assert.match(index, /\n81\. assistant: content 81\n/);
+	assert.match(index, /\n120\. assistant: content 120\n/);
+});
+
+test("the block index is empty when every block is protected", () => {
+	assert.equal(renderBlockIndex([records[0]!]), "");
 });

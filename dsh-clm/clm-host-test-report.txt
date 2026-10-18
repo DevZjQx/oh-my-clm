@@ -1,0 +1,94 @@
+oh-my-clm host harness
+entry: /home/deepseek-agent/.dsh/profiles/clmtest/node_modules/oh-my-clm/dist/dsh/index.js
+node:  v26.11.1
+
+== 1. module contract ==
+  PASS  exports name = oh-my-clm
+  PASS  exports apply()
+  PASS  injects systemPrompt service
+
+== 2. system prompt section ==
+  PASS  section registered exactly once
+  PASS  section name matches manifest contribution
+  PASS  section order falls back to 3240
+  PASS  section names the mirror template
+  PASS  section names the patch template
+  PASS  section states the patch is not auto-applied
+  PASS  section order follows host TOOL_EDIT order
+
+== 3. agent lifecycle wiring ==
+  PASS  agent/pre-step listener registered on the agent ctx
+  PASS  host registers session/event listener
+  PASS  pre-step still calls next()
+  PASS  re-read of the same projection is a no-op (no patch file)
+  PASS  empty session id does not throw out of the hook
+  PASS  empty session id is reported through ctx.logger.warn
+  PASS  session-less agent is warned about, not crashed
+
+== 4. mirror generation ==
+  PASS  mirror file written to /tmp/clm-<sessionId>/LIVE_CTX_MAIN.md
+  PASS  mirror carries the protocol header
+  PASS  mirror carries a 16-hex snapshot fingerprint
+  PASS  protected initial user task is absent
+  PASS  assistant reasoning/tool-call block is editable
+  PASS  tool result block is editable
+  PASS  last assistant block is editable
+  PASS  unchanged projection leaves the mirror byte-identical
+
+== 5. patch proposal: accepted shrink edit ==
+  PASS  patch file written next to the mirror
+  PASS  patch protocol is oh-my-clm-dsh-patch-v1
+  PASS  patch host is dsh
+  PASS  patch status applied
+  PASS  patch records one changed id
+  PASS  patch action is replace
+  PASS  patch body holds the shortened text
+  PASS  patch shrinks the estimate
+  PASS  patch is not applied to the session log
+  PASS  info log reports the written patch
+  NOTE  mirror drift after a processed edit — after an accepted patch the mirror file still shows the model's edited body (state.snapshot already holds canonical); it is re-synced only when the projection changes
+
+== 6. shrink-only gate ==
+  PASS  growing edit is rejected
+  PASS  rejection reason mentions the SHRINK rule
+  PASS  rejected patch carries no edits
+  PASS  warn log reports the rejection
+  NOTE  mirror drift after a rejected edit — a rejected edit is marked processed and left in the mirror file; the canonical projection is restored only once the projection itself changes
+  PASS  mirror is restored to canonical once the projection changes
+
+== 7. rejection matrix ==
+  PASS  stale snapshot: rejected
+  PASS  stale snapshot: reason matches
+  PASS  malformed document: rejected
+  PASS  malformed document: reason matches
+  PASS  unknown id: rejected
+  PASS  unknown id: reason matches
+  PASS  duplicate id: rejected
+  PASS  duplicate id: reason matches
+  PASS  role change: rejected
+  PASS  role change: reason matches
+  PASS  user-authored rewrite: rejected
+  PASS  user-authored rewrite: reason matches
+
+== 8. omission and tool pairing ==
+  PASS  rewriting an assistant tool turn is applied
+  PASS  patch keeps the paired tool result structurally safe (omits it)
+  PASS  no orphan tool result survives in the edits
+  PASS  deleting a block proposes omission
+
+== 9. session/event driven sync ==
+  PASS  tool/result event refreshes the mirror
+  PASS  non-surface events are ignored
+  NOTE  agent.id/session.id mismatch — session/event sync is silently skipped when agent.id !== session.id; DSH enforces equality so this is unreachable in-product
+
+== 10. disposal ==
+  PASS  disposed agent is dropped from the state map (session/event no longer patches)
+  PASS  effect disposers remove the agent listeners
+  PASS  host listeners are removed on dispose
+
+61 passed, 0 failed, 3 observation(s)
+
+observations (measured behaviour, not asserted contract):
+  - mirror drift after a processed edit: after an accepted patch the mirror file still shows the model's edited body (state.snapshot already holds canonical); it is re-synced only when the projection changes
+  - mirror drift after a rejected edit: a rejected edit is marked processed and left in the mirror file; the canonical projection is restored only once the projection itself changes
+  - agent.id/session.id mismatch: session/event sync is silently skipped when agent.id !== session.id; DSH enforces equality so this is unreachable in-product

@@ -1,5 +1,6 @@
 node_modules/
-.pi/clm/LIVE_CTX_MAIN.md
-.pi/clm/*.patch.json
-.pi/clm/*.tmp
-npm-debug.log*
+.env
+docs/reckless
+dsh-clm/*.zip
+dsh-clm/*.tgz
+dsh-clm/*.bak

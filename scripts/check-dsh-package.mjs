@@ -18,6 +18,7 @@ const entry = manifest.facets?.host?.entry;
 if (typeof entry !== "string" || entry.startsWith("/") || entry.includes("..")) throw new Error("invalid DSH host entry");
 if (!fs.existsSync(path.join(root, entry))) throw new Error(`DSH host entry is missing: ${entry}`);
 if (packageJson.dsh?.bundle?.patch !== "./cordis.patch.yml") throw new Error("package.json must expose the official DSH bundle patch");
+if (packageJson.devDependencies?.["@deepseek-ai/dsh-tools"] !== "0.2.0-rc.2") throw new Error("package.json must pin the DSH tool schema runtime for builds");
 if (!fs.existsSync(path.join(root, "cordis.patch.yml"))) throw new Error("cordis.patch.yml is missing");
 for (const resource of ["icon.svg", "locale/en.json", "locale/zh.json"]) {
   if (!fs.existsSync(path.join(root, resource))) throw new Error(`DSH display resource is missing: ${resource}`);

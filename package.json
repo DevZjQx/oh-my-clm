@@ -1,6 +1,6 @@
 {
   "name": "oh-my-clm",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "description": "A Pi extension and minimal DSH bridge for self-editable live context inspired by the Facebook Research CLM harness.",
   "icon": "./icon.svg",
   "private": true,
@@ -9,6 +9,9 @@
     "README.md",
     "docs",
     "extensions/clm.ts",
+    "src/clm-files.ts",
+    "src/clm-paths.ts",
+    "src/context-cleanup.ts",
     "src/context-format.ts",
     "src/dsh-bridge.ts",
     "dsh",
@@ -43,25 +46,42 @@
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "build:dsh": "tsc -p tsconfig.dsh.json",
-    "check": "npm run build:dsh && node --experimental-strip-types --check extensions/clm.ts && node --experimental-strip-types --check src/context-format.ts && node --experimental-strip-types --check src/dsh-bridge.ts && node --check dist/dsh/index.js && node scripts/check-dsh-package.mjs",
+    "build:dsh:plugin": "node scripts/build-dsh-plugin.mjs",
+    "check": "npm run build:dsh && node --experimental-strip-types --check extensions/clm.ts && node --experimental-strip-types --check src/context-format.ts && node --experimental-strip-types --check src/dsh-bridge.ts && node --check dist/dsh/index.js && node --check scripts/build-dsh-plugin.mjs && node scripts/check-dsh-package.mjs",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.dsh.json --noEmit",
     "prepack": "npm run build:dsh"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
     "@deepseek-ai/dsh": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": { "optional": true },
-    "@deepseek-ai/dsh": { "optional": true },
-    "@earendil-works/pi-ai": { "optional": true },
-    "@earendil-works/pi-coding-agent": { "optional": true },
-    "@earendil-works/pi-tui": { "optional": true },
-    "typebox": { "optional": true }
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
   },
   "license": "MIT",
   "devDependencies": {
@@ -69,6 +89,7 @@
     "@earendil-works/pi-coding-agent": "^1.3.0",
     "@earendil-works/pi-tui": "^1.3.0",
     "@types/node": "^22.19.19",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
     "typebox": "^1.3.27",
     "typescript": "^5.9.3"
   }

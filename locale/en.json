@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "oh-my-clm",
-    "description": "Mirrors editable DSH session context and emits auditable shrink-only patch proposals."
+    "description": "Mirrors editable DSH session context and applies safe shrink-only edits through Session.append surface replacement."
   }
 }

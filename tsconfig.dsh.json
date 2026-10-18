@@ -9,6 +9,7 @@
     "rewriteRelativeImportExtensions": true
   },
   "include": [
+    "src/context-cleanup.ts",
     "src/context-format.ts",
     "src/dsh-bridge.ts",
     "dsh/index.ts"
