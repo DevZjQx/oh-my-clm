@@ -2,7 +2,13 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/how-it-works.md`](./docs/how-it-works.md)。
 
-## 0.1.5（当前版本）
+## 0.1.6（当前版本）
+
+### 新增
+
+- **DSH 插件新增 `/clm` 命令。** 与 Pi 扩展的 `/clm status` 对齐，`/clm` 和 `/clm status` 等价。命令从当前 session surface 实时计算状态，显示 mirror 路径、artifact 是否与 canonical projection 一致、字节数、可编辑/保护 block 数、preview/canonical token 估算、DSH surface 节点数、shrink-only 策略和 mirror 限制；未知参数返回 `Usage: /clm [status]`。它是纯只读命令：不写 mirror、不追加 session event、不依赖缓存，因此在第一次 bridge pass 之前也能工作。新增 host mock 测试覆盖注册、状态文本、`in sync`/`missing` 判定和参数校验。
+
+## 0.1.5
 
 ### 新增
 

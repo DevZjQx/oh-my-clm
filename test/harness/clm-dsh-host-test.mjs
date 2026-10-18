@@ -54,11 +54,20 @@ function createCtx({ sectionOrder } = {}) {
 	const contexts = [];
 	const effects = [];
 	const tools = new Map();
+	const commands = new Map();
 	const ctx = {
 		tools: {
 			register(definition) {
 				tools.set(definition.name, definition);
 				const dispose = () => tools.delete(definition.name);
+				ownedDisposers.push(dispose);
+				return dispose;
+			},
+		},
+		commands: {
+			register(definition) {
+				commands.set(definition.name, definition);
+				const dispose = () => commands.delete(definition.name);
 				ownedDisposers.push(dispose);
 				return dispose;
 			},
@@ -105,6 +114,7 @@ function createCtx({ sectionOrder } = {}) {
 		contexts,
 		effects,
 		tools,
+		commands,
 		listenerCount: (event) => (handlers.get(event) ?? []).length,
 		emit: async (event, ...args) => {
 			const list = [...(handlers.get(event) ?? [])];
@@ -256,6 +266,19 @@ section("2. system prompt section");
 	check("section names the mirror template", typeof sectionValue.text === "string" && sectionValue.text.includes("/tmp/clm-<session-id>/LIVE_CTX_MAIN.md"));
 	check("section describes the Session.append replacement seam", typeof sectionValue.text === "string" && sectionValue.text.includes("Session.append()") && sectionValue.text.includes("surface-replacement"));
 	check("cleanup tool is registered", host.tools.has("cleanup"));
+	check("/clm command is registered", host.commands.has("clm"));
+	const clmStatus = await host.commands.get("clm").handler({
+		agent,
+		rawInput: "",
+		commandId: "harness-command",
+		attachments: [],
+		signal: new AbortController().signal,
+	});
+	check(
+		"/clm reports the DSH live-context status",
+		clmStatus.kind === "success" && /^oh-my-clm status \(DSH\)/.test(clmStatus.text) && clmStatus.text.includes("editable blocks: 3"),
+		clmStatus.text,
+	);
 	check("section says no proposal or receipt file is written", typeof sectionValue.text === "string" && /writes no proposal or receipt file/i.test(sectionValue.text));
 	check("runtime block index context registered exactly once", host.contexts.length === 1, `got ${host.contexts.length}`);
 	check("runtime block index context name", host.contexts[0]?.name === "oh-my-clm:block-index", String(host.contexts[0]?.name));

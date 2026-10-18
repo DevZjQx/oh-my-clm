@@ -58,10 +58,11 @@ pi -e .
 ## 命令
 
 ```text
+/clm
 /clm status
 ```
 
-`/clm status` 显示 mirror 路径、字节数、可编辑/保护 block 数、preview/canonical 估算 token、Pi context usage、目标预算、shrink-only 策略和 branch 上已持久化的 context edit 数量。
+`/clm` 与 `/clm status` 等价，Pi 扩展和 DSH 插件都提供。Pi 侧显示 mirror 路径、字节数、可编辑/保护 block 数、preview/canonical 估算 token、Pi context usage、目标预算、shrink-only 策略和 branch 上已持久化的 context edit 数量。DSH 侧显示当前 session 的 mirror 路径、mirror 与 canonical projection 是否一致、字节数、可编辑/保护 block 数、preview/canonical token 估算、DSH surface 节点数、shrink-only 策略和 mirror 限制；命令只读，不修改 session 或 mirror。两个宿主都不提供 `/clm refresh`。
 
 扩展会在 session start、branch 切换和请求前自动刷新 mirror；没有 `/clm refresh` 命令。在 agent turn 之外直接修改 mirror，会在下一次同步时被恢复为 canonical projection，避免未经校验的内容进入 session。
 
@@ -93,13 +94,14 @@ token 计数使用共享格式层的 provider-independent `estimateMessageTokens
 - 社区插件发现入口是 [`dsh-plugin.json`](./dsh-plugin.json)，host entry 为构建后的 `dist/dsh/index.js`；官方 bundle 安装元数据位于 `package.json` 的 `dsh.bundle.patch` 和 [`cordis.patch.yml`](./cordis.patch.yml)。在 DSH 0.2.0-rc.2 中，实际生效的是 bundle 元数据；`dsh-plugin.json` 的 Community permissions 目前不应被描述为运行时强制隔离。
 - DSH 生命周期使用官方 Harness 的 Cordis `agent/created`、`agent/pre-step`、`session/event`、`systemPrompt.section()`、`systemPrompt.context()` 和 `tools.register()` 扩展点；cleanup 直接对当前 session surface 执行按 ID 的 native replacement，不读取 mirror 文件。`systemPrompt.context()` 负责把 block index 放进模型可见的 runtime context；DSH 自己的 runtime-context snapshot 也会从 mirror records 中排除，避免 index 递归列出自身。普通 mirror 编辑的 `session/event` 只排队 reconcile，实际 mutation 延迟到 `Session.append()` 发布完成、且 `step/start` 打开新 step 之后执行；`agent/pre-step` 只等待已排队的收敛，不执行 mutation。session projection 仍由 DSH 提供，session log 仍是事实来源。
 - DSH 会按当前 session ID 生成 `/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md`。DSH 文件工具可以直接编辑这个 host-side mirror；sandboxed bash 可能拥有不同的 `/tmp`，除非宿主显式共享该 session 目录。
+- DSH 注册 `/clm` 命令（`/clm` 与 `/clm status` 等价）：从当前 session surface 实时计算 mirror 状态，报告 mirror 路径、artifact 是否与 canonical projection 一致、字节数、可编辑/保护 block 数、preview/canonical token 估算、DSH surface 节点数、shrink-only 策略和 mirror 限制。它只读，不写 mirror、不追加 session event，也不缓存状态，因此在第一次 bridge pass 之前也能给出准确结果。
 - bridge 会对 mirror 编辑执行与 Pi 侧相同的 snapshot、结构安全和 shrink-only 校验；合法编辑通过 DSH 原生 `Session.append()` 的 `surfaceOp: { op: "replace" }` seam 写入当前 session，处理后再把 mirror 重写为新的 canonical DSH projection。
 - 当前 bridge 会改变 DSH active surface，这与 Pi 的 branch-local `context_edit` 不是一回事：cleanup 和普通编辑会追加 `tool/result` content replacement 或 `developer/message` replacement（omission 用空 content，assistant 改写用缩短后的文本），原始事件仍保留在 append-only session log 中，`deriveMessages()` 使用新的 surface。DSH 明确禁止 `assistant/message` 携带 `sourceEventSeqs`，而每个 replacement 又必须引用所有被遮蔽的节点，所以 assistant block 不能原地替换成另一个 assistant message。改写后的文本以 developer 身份进入模型可见历史，不再归属原模型回复。它不生成 proposal/receipt 文件，也不注册自定义 session event；reconcile 在事件回调之外串行执行，避免 `Session.append()` reentrant failure。所有 omission 和 assistant 改写都使用 append 时真正打开的 `turn`/`step`（正数），`tool/result` replacement 保持原 event envelope、只改 `content`，并带 `sourceEventSeqs: [targetSeq]`。
 - host entry 不复制 `dsh-ops` 的 Rust 工具、shell、PTC 或 TUI 矩阵，只做 live-context 适配。DSH 仅依赖 host 提供的 Cordis 生命周期，运行时不导入 Pi 的 coding-agent 包。
 
 安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()`/surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。
 
-版本更新说明（0.1.0–0.1.5）已移至 [changelog.md](./changelog.md)。
+版本更新说明（0.1.0–0.1.6）已移至 [changelog.md](./changelog.md)。
 
 本地检查 DSH bridge：
 
@@ -151,7 +153,7 @@ test/{lib,features,adapters,package,harness}
 - [项目结构](./docs/project-structure.md)：说明分层目录、单向依赖规则、测试布局和边界检查。
 - [CLM 技术分析表](./docs/CLM技术分析表.md)：整理 Context Language Models 论文、官方实现和工程取舍。
 - [DSH 证据与 harness](./docs/reports/README.md)：mock host harness 的运行方式和历史验证报告。
-- [更新日志](./changelog.md)：0.1.0–0.1.5 各版本的修复与调整说明。
+- [更新日志](./changelog.md)：0.1.0–0.1.6 各版本的修复与调整说明。
 
 ## 开发检查
 

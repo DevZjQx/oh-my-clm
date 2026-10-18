@@ -10,6 +10,7 @@ import { apply as dshHost } from "../../../dsh/index.ts";
 import { validateJsonSchemaValue } from "@deepseek-ai/dsh-tools";
 import { sessionMirrorPath } from "../../../src/lib/clm-paths.ts";
 import {
+	buildDshMirrorRecords,
 	executeDshCleanup,
 	reconcileDshMirror,
 	renderDshBlockIndex,
@@ -17,6 +18,7 @@ import {
 	type DshFileSystem,
 	type DshSessionLike,
 } from "../../../src/features/live-context/dsh-bridge.ts";
+import { renderMirror } from "../../../src/features/live-context/context-format.ts";
 import { formatCleanupToolResult } from "../../../src/features/live-context/context-cleanup.ts";
 
 class MemoryFiles implements DshFileSystem {
@@ -471,6 +473,10 @@ interface ListenerContext {
 		definitions: Map<string, any>;
 		register(definition: any): () => void;
 	};
+	commands: {
+		definitions: Map<string, any>;
+		register(definition: any): () => void;
+	};
 	systemPrompt: {
 		section(section: { name: string; order: number; text: string }): () => void;
 		context(context: { name: string; order: number; text: string | ((context: { agent?: any }) => string) }): () => void;
@@ -489,12 +495,20 @@ function listenerContext(): ListenerContext {
 	const sections: Array<{ name: string; order: number; text: string }> = [];
 	const contexts: Array<{ name: string; order: number; text: string | ((context: { agent?: any }) => string) }> = [];
 	const definitions = new Map<string, any>();
+	const commandDefinitions = new Map<string, any>();
 	return {
 		tools: {
 			definitions,
 			register(definition: any) {
 				definitions.set(definition.name, definition);
 				return () => definitions.delete(definition.name);
+			},
+		},
+		commands: {
+			definitions: commandDefinitions,
+			register(definition: any) {
+				commandDefinitions.set(definition.name, definition);
+				return () => commandDefinitions.delete(definition.name);
 			},
 		},
 		systemPrompt: {
@@ -718,6 +732,54 @@ test("DSH defers a pending edit until step/start opens the next step", async () 
 		const canonical = fs.readFileSync(mirrorPath, "utf8");
 		assert.doesNotMatch(canonical, /Short repository inspection\./);
 		assert.doesNotMatch(canonical, /I inspected the repository/);
+	} finally {
+		fs.rmSync(path.dirname(mirrorPath), { recursive: true, force: true });
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("DSH /clm command reports the live mirror status and validates arguments", async () => {
+	const root = listenerContext();
+	dshHost({ ...root } as any);
+	const command = root.commands.definitions.get("clm");
+	assert.ok(command, "/clm was not registered");
+	assert.equal(command.name, "clm");
+	assert.equal(command.description, "Show the oh-my-clm live context status");
+
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-dsh-clm-command-"));
+	const sessionId = `dsh-clm-command-${process.pid}-${Date.now()}`;
+	const mirrorPath = sessionMirrorPath(sessionId);
+	const session = dshSession(cwd, sessionId);
+	const invocation = (rawInput: string) => ({
+		agent: { id: sessionId, session },
+		commandId: "command-1",
+		rawInput,
+		attachments: [],
+		signal: new AbortController().signal,
+	});
+	try {
+		const missing = await command.handler(invocation(""));
+		assert.equal(missing.kind, "success", missing.text);
+		assert.match(missing.text, /^oh-my-clm status \(DSH\)/);
+		assert.ok(missing.text.includes(`mirror: ${mirrorPath}`), missing.text);
+		assert.match(missing.text, /mirror state: missing \(written on the next bridge pass\)/);
+		assert.match(missing.text, /editable blocks: 3/);
+		assert.match(missing.text, /protected blocks: 1/);
+		assert.match(missing.text, /canonical editable: ~\d+ tokens/);
+		assert.match(missing.text, /DSH surface nodes: 5/);
+		assert.match(missing.text, /edit policy: shrink-only/);
+
+		// The status compares the artifact byte-for-byte with the canonical
+		// projection, so an untouched bridge-written mirror reports "in sync".
+		fs.mkdirSync(path.dirname(mirrorPath), { recursive: true, mode: 0o700 });
+		fs.writeFileSync(mirrorPath, renderMirror(buildDshMirrorRecords(session, { mirrorPath })), "utf8");
+		const synced = await command.handler(invocation(" status "));
+		assert.equal(synced.kind, "success", synced.text);
+		assert.match(synced.text, /mirror state: in sync/);
+
+		const rejected = await command.handler(invocation("refresh"));
+		assert.equal(rejected.kind, "error");
+		assert.match(rejected.text, /Usage: \/clm \[status\]/);
 	} finally {
 		fs.rmSync(path.dirname(mirrorPath), { recursive: true, force: true });
 		fs.rmSync(cwd, { recursive: true, force: true });

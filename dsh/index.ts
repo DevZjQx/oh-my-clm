@@ -6,6 +6,7 @@ import {
 } from "../src/lib/clm-paths.ts";
 import { writePrivateText } from "../src/lib/clm-files.ts";
 import {
+	buildDshMirrorRecords,
 	dshOpenTurnStep,
 	executeDshCleanup,
 	reconcileDshMirror,
@@ -15,6 +16,10 @@ import {
 	type DshFileSystem,
 	type DshSessionLike,
 } from "../src/features/live-context/dsh-bridge.ts";
+import {
+	estimateMirrorTokens,
+	renderMirror,
+} from "../src/features/live-context/context-format.ts";
 import {
 	formatCleanupToolResult,
 	parseCleanupArgs,
@@ -40,8 +45,31 @@ interface DshToolsRuntime {
 	register(definition: unknown): () => unknown;
 }
 
+interface DshCommandResult {
+	readonly kind: "success" | "error";
+	readonly text: string;
+}
+
+interface DshCommandInvocation {
+	readonly agent: DshAgent;
+	/** Exact text following `/clm`, including separator whitespace. */
+	readonly rawInput: string;
+}
+
+interface DshCommandDefinition {
+	readonly name: string;
+	readonly description: string;
+	readonly input?: { readonly hint: string };
+	readonly handler: (invocation: DshCommandInvocation) => DshCommandResult | Promise<DshCommandResult>;
+}
+
+interface DshCommandsRuntime {
+	register(definition: DshCommandDefinition): () => unknown;
+}
+
 interface DshContext {
 	readonly tools?: DshToolsRuntime;
+	readonly commands?: DshCommandsRuntime;
 	readonly systemPrompt?: {
 		section(section: { name: string; order: number; text: string }): () => void;
 		context?(context: {
@@ -213,6 +241,69 @@ function createDshCleanupTool(getState: (sessionId: string) => DshBridgeState | 
 	};
 }
 
+const CLM_COMMAND_USAGE = "Usage: /clm [status]";
+
+/** Compare the on-disk mirror with the projection the bridge would write now. */
+function mirrorStateText(current: string | undefined, canonical: string): string {
+	if (current === undefined) return "missing (written on the next bridge pass)";
+	if (current === canonical) return "in sync";
+	return "differs from the current projection (pending edit or stale)";
+}
+
+/**
+ * Human-readable status for the active DSH session. Everything is derived from
+ * the session surface and the canonical mirror projection; no state is cached,
+ * so `/clm status` is accurate even before the first bridge pass.
+ */
+function dshStatusText(session: DshSessionLike, options: DshBridgeOptions): string {
+	const records = buildDshMirrorRecords(session, options);
+	const editable = records.filter((record) => !record.protected);
+	const canonicalText = renderMirror(records);
+	const fixedTokens = options.fixedTokens ?? 0;
+	const canonicalTokens = estimateMirrorTokens(editable);
+	const previewTokens = estimateMirrorTokens(editable, (record) => record.renderText ?? record.text);
+	return [
+		"oh-my-clm status (DSH)",
+		`session: ${String(session.id)}`,
+		`mirror: ${options.mirrorPath}`,
+		`mirror state: ${mirrorStateText(readText(options.mirrorPath), canonicalText)}`,
+		`mirror bytes: ${Buffer.byteLength(canonicalText, "utf8")}`,
+		`editable blocks: ${editable.length}`,
+		`protected blocks: ${records.length - editable.length}`,
+		`mirror preview: ~${previewTokens} tokens; canonical editable: ~${canonicalTokens} tokens`,
+		`estimated request: ~${fixedTokens + canonicalTokens} tokens (fixed request ~${fixedTokens} + editable mirror ~${canonicalTokens})`,
+		`DSH surface nodes: ${session.surface.nodes.length}`,
+		"edit policy: shrink-only",
+		`mirror limits: ${options.maxBlockChars ?? 12_000} chars/block, ${options.maxMirrorChars ?? 96_000} chars total`,
+	].join("\n");
+}
+
+function createDshClmCommand(): DshCommandDefinition {
+	return {
+		name: "clm",
+		description: "Show the oh-my-clm live context status",
+		input: { hint: "status" },
+		handler: (invocation) => {
+			const input = invocation.rawInput.trim();
+			if (input.length > 0 && input !== "status") {
+				return { kind: "error", text: CLM_COMMAND_USAGE };
+			}
+			const session = invocation.agent?.session;
+			if (!session) {
+				return { kind: "error", text: "oh-my-clm: the active DSH agent has no session." };
+			}
+			try {
+				return { kind: "success", text: dshStatusText(session, optionsFor(session)) };
+			} catch (error) {
+				return {
+					kind: "error",
+					text: `oh-my-clm: could not render status: ${error instanceof Error ? error.message : String(error)}`,
+				};
+			}
+		},
+	};
+}
+
 function logResult(ctx: DshContext, result: ReturnType<typeof reconcileDshMirror>): void {
 	if (result.status === "applied") {
 		const tokenNote = result.beforeTokens !== undefined && result.afterTokens !== undefined
@@ -296,6 +387,14 @@ export function apply(ctx: DshContext): void {
 		ctx.logger?.warn?.("oh-my-clm: DSH tools runtime unavailable; cleanup tool was not registered");
 	}
 
+	if (ctx.commands) {
+		// `/clm` mirrors the Pi extension's status command. The command registry
+		// owns the definition as a Cordis effect, so it is removed with the plugin.
+		ctx.commands.register(createDshClmCommand());
+	} else {
+		ctx.logger?.warn?.("oh-my-clm: DSH commands runtime unavailable; /clm was not registered");
+	}
+
 	ctx.on("agent/created", ({ agent }: { agent: DshAgent }) => {
 		const session = agent.session;
 		if (!session) {
@@ -338,4 +437,4 @@ export function apply(ctx: DshContext): void {
 	});
 }
 
-export const inject = ["systemPrompt", "tools"] as const;
+export const inject = ["systemPrompt", "tools", "commands"] as const;
