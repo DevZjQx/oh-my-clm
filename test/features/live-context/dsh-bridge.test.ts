@@ -3,8 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { apply as dshHost } from "../dsh/index.ts";
-import { sessionMirrorPath } from "../src/clm-paths.ts";
+import { apply as dshHost } from "../../../dsh/index.ts";
+import { sessionMirrorPath } from "../../../src/lib/clm-paths.ts";
 import {
 	executeDshCleanup,
 	reconcileDshMirror,
@@ -12,7 +12,7 @@ import {
 	type DshBridgeState,
 	type DshFileSystem,
 	type DshSessionLike,
-} from "../src/dsh-bridge.ts";
+} from "../../../src/features/live-context/dsh-bridge.ts";
 
 class MemoryFiles implements DshFileSystem {
 	readonly files = new Map<string, string>();

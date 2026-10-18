@@ -1,4 +1,4 @@
-import { CLM_MIRROR_FILENAME } from "./clm-paths.js";
+import { CLM_MIRROR_FILENAME } from "../../lib/clm-paths.js";
 import { cleanupMirrorForRecords, cleanupToolResult, planCleanup, } from "./context-cleanup.js";
 import { buildMirrorRecords, DEFAULT_MAX_BLOCK_CHARS, DEFAULT_MAX_MIRROR_CHARS, estimateMessageTokens, estimateMirrorTokens, mirrorSignature, parseMirror, planContextEdits, renderBlockIndex, renderMirror, } from "./context-format.js";
 /** The DSH-facing mirror filename deliberately matches the Pi adapter. */

@@ -12,7 +12,7 @@ import {
 	renderBlockIndex,
 	renderMirror,
 	type MirrorRecord,
-} from "../src/context-format.ts";
+} from "../../../src/features/live-context/context-format.ts";
 
 const records: MirrorRecord[] = [
 	{

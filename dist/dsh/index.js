@@ -1,8 +1,8 @@
 import * as fs from "node:fs";
-import { CLM_MIRROR_FILENAME, CLM_TEMP_ROOT, sessionMirrorPath, } from "../src/clm-paths.js";
-import { writePrivateText } from "../src/clm-files.js";
-import { dshOpenTurnStep, executeDshCleanup, reconcileDshMirror, renderDshBlockIndex, } from "../src/dsh-bridge.js";
-import { formatCleanupToolResult, parseCleanupArgs, } from "../src/context-cleanup.js";
+import { CLM_MIRROR_FILENAME, CLM_TEMP_ROOT, sessionMirrorPath, } from "../src/lib/clm-paths.js";
+import { writePrivateText } from "../src/lib/clm-files.js";
+import { dshOpenTurnStep, executeDshCleanup, reconcileDshMirror, renderDshBlockIndex, } from "../src/features/live-context/dsh-bridge.js";
+import { formatCleanupToolResult, parseCleanupArgs, } from "../src/features/live-context/context-cleanup.js";
 export const name = "oh-my-clm";
 const PROMPT_SECTION = "oh-my-clm:live-context";
 const BLOCK_INDEX_CONTEXT = "oh-my-clm:block-index";

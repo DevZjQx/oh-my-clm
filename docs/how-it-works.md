@@ -268,16 +268,18 @@ pi --extension ./extensions/clm.ts
 | 文件 | 职责 |
 | --- | --- |
 | [`extensions/clm.ts`](../extensions/clm.ts) | Pi lifecycle handlers、mirror 同步、临时预算 nudge、`/clm status`、self-read guard |
-| [`src/context-format.ts`](../src/context-format.ts) | Pi/DSH 共用的 record 构建、文本投影、序号 ID、mirror 渲染/解析、snapshot、编辑规划和 token/gate 校验 |
-| [`src/context-cleanup.ts`](../src/context-cleanup.ts) | 双宿主共用的 block-ID cleanup 参数、配对/保护校验和完整 span 删除；不依赖截断 preview |
-| [`src/dsh-bridge.ts`](../src/dsh-bridge.ts) | DSH surface 适配、mirror 生命周期、安全校验和 `Session.append()` replacement mutation；cleanup 直接走 active surface |
+| [`src/features/live-context/context-format.ts`](../src/features/live-context/context-format.ts) | Pi/DSH 共用的 record 构建、文本投影、序号 ID、mirror 渲染/解析、snapshot、编辑规划和 token/gate 校验 |
+| [`src/features/live-context/context-cleanup.ts`](../src/features/live-context/context-cleanup.ts) | 双宿主共用的 block-ID cleanup 参数、配对/保护校验和完整 span 删除；不依赖截断 preview |
+| [`src/features/live-context/dsh-bridge.ts`](../src/features/live-context/dsh-bridge.ts) | DSH surface 适配、mirror 生命周期、安全校验和 `Session.append()` replacement mutation；cleanup 直接走 active surface |
 | [`dsh/index.ts`](../dsh/index.ts) | Cordis host entry：system prompt、agent/session 生命周期和文件 I/O |
-| [`src/clm-files.ts`](../src/clm-files.ts) | session mirror 的原子写入和私有文件权限（目录 0700、文件 0600） |
+| [`src/lib/clm-files.ts`](../src/lib/clm-files.ts) | session mirror 的原子写入和私有文件权限（目录 0700、文件 0600） |
 | [`dsh-plugin.json`](../dsh-plugin.json) | DSH Community v0.15 host manifest；`cordis.patch.yml` 是官方 bundle 安装层 |
-| [`test/context-format.test.ts`](../test/context-format.test.ts) | 协议、截断、gate、stale snapshot、tool 配对和安全边界测试 |
-| [`test/context-cleanup.test.ts`](../test/context-cleanup.test.ts) | cleanup ID 校验、block 1 保留、截断 preview、完整 span 删除和配对失败测试 |
-| [`test/extension.test.ts`](../test/extension.test.ts) | Pi extension 生命周期、持久化 edit、预算 nudge 和 self-read guard 测试 |
-| [`test/session-integration.test.ts`](../test/session-integration.test.ts) | Pi `SessionManager` 对 context edit、原始历史和 branch 隔离的集成测试 |
+| [`test/features/live-context/context-format.test.ts`](../test/features/live-context/context-format.test.ts) | 协议、截断、gate、stale snapshot、tool 配对和安全边界测试 |
+| [`test/features/live-context/context-cleanup.test.ts`](../test/features/live-context/context-cleanup.test.ts) | cleanup ID 校验、block 1 保留、截断 preview、完整 span 删除和配对失败测试 |
+| [`test/adapters/extension.test.ts`](../test/adapters/extension.test.ts) | Pi extension 生命周期、持久化 edit、预算 nudge 和 self-read guard 测试 |
+| [`test/adapters/session-integration.test.ts`](../test/adapters/session-integration.test.ts) | Pi `SessionManager` 对 context edit、原始历史和 branch 隔离的集成测试 |
+
+完整的目录职责、导入边界和新增文件放置规则见 [`docs/project-structure.md`](./project-structure.md)。
 
 ## 9. 如何验证实现
 

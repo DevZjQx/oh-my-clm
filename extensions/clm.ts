@@ -24,8 +24,8 @@ import {
 	type EditPlanOptions,
 	type MirrorRecord,
 	type ProjectionEntryLike,
-} from "../src/context-format.ts";
-import { writePrivateText } from "../src/clm-files.ts";
+} from "../src/features/live-context/context-format.ts";
+import { writePrivateText } from "../src/lib/clm-files.ts";
 import {
 	cleanupToolResult,
 	formatCleanupToolResult,
@@ -34,8 +34,8 @@ import {
 	planCleanup,
 	removeMirrorBlocks,
 	type CleanupToolResult,
-} from "../src/context-cleanup.ts";
-import { sessionMirrorPath } from "../src/clm-paths.ts";
+} from "../src/features/live-context/context-cleanup.ts";
+import { sessionMirrorPath } from "../src/lib/clm-paths.ts";
 const STATUS_KEY = "oh-my-clm";
 const PROMPT_MARKER = "<pi-clm-live-context>";
 const CONTEXT_NUDGE_MARKER = "<pi-clm-budget-nudge>";

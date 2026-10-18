@@ -8,7 +8,7 @@
  * asserts the mirror and native Session.append surface-replacement behaviour
  * described in the package README. It does not model a proposal/receipt file.
  *
- * Usage: node clm-dsh-host-test.mjs [path/to/unpacked/package]
+ * Usage: node test/harness/clm-dsh-host-test.mjs [path/to/unpacked/package]
  */
 import * as fs from "node:fs";
 import * as path from "node:path";

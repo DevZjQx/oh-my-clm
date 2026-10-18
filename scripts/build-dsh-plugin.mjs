@@ -23,11 +23,11 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const defaultOutput = path.join(root, "dsh-clm");
 const dshRuntimeFiles = [
 	"dist/dsh/index.js",
-	"dist/src/clm-files.js",
-	"dist/src/clm-paths.js",
-	"dist/src/context-cleanup.js",
-	"dist/src/context-format.js",
-	"dist/src/dsh-bridge.js",
+	"dist/src/lib/clm-files.js",
+	"dist/src/lib/clm-paths.js",
+	"dist/src/features/live-context/context-cleanup.js",
+	"dist/src/features/live-context/context-format.js",
+	"dist/src/features/live-context/dsh-bridge.js",
 ];
 const packageFiles = ["README.md", "dsh-plugin.json", "cordis.patch.yml", "dist", "locale", "icon.svg"];
 const dshRuntimePeerDependencies = {

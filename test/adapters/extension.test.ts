@@ -3,8 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { sessionMirrorPath } from "../src/clm-paths.ts";
-import extension from "../extensions/clm.ts";
+import { sessionMirrorPath } from "../../src/lib/clm-paths.ts";
+import extension from "../../extensions/clm.ts";
 
 test("extension mirrors a projection and emits persistent context edits at turn_end", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-"));

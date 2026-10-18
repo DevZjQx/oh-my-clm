@@ -1,4 +1,4 @@
-import { CLM_MIRROR_FILENAME } from "./clm-paths.ts";
+import { CLM_MIRROR_FILENAME } from "../../lib/clm-paths.ts";
 import {
 	cleanupMirrorForRecords,
 	cleanupToolResult,

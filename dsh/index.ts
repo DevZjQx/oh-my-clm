@@ -3,8 +3,8 @@ import {
 	CLM_MIRROR_FILENAME,
 	CLM_TEMP_ROOT,
 	sessionMirrorPath,
-} from "../src/clm-paths.ts";
-import { writePrivateText } from "../src/clm-files.ts";
+} from "../src/lib/clm-paths.ts";
+import { writePrivateText } from "../src/lib/clm-files.ts";
 import {
 	dshOpenTurnStep,
 	executeDshCleanup,
@@ -14,12 +14,12 @@ import {
 	type DshBridgeState,
 	type DshFileSystem,
 	type DshSessionLike,
-} from "../src/dsh-bridge.ts";
+} from "../src/features/live-context/dsh-bridge.ts";
 import {
 	formatCleanupToolResult,
 	parseCleanupArgs,
 	type CleanupToolResult,
-} from "../src/context-cleanup.ts";
+} from "../src/features/live-context/context-cleanup.ts";
 
 export const name = "oh-my-clm";
 const PROMPT_SECTION = "oh-my-clm:live-context";

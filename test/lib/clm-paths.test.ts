@@ -8,8 +8,8 @@ import {
 	CLM_TEMP_ROOT,
 	sessionDirectory,
 	sessionMirrorPath,
-} from "../src/clm-paths.ts";
-import { writePrivateText } from "../src/clm-files.ts";
+} from "../../src/lib/clm-paths.ts";
+import { writePrivateText } from "../../src/lib/clm-files.ts";
 
 test("session artifact paths are absolute, stable, and isolated from cwd", () => {
 	const sessionId = "session-123";

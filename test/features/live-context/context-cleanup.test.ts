@@ -6,8 +6,8 @@ import {
 	parseCleanupMirror,
 	planCleanup,
 	removeMirrorBlocks,
-} from "../src/context-cleanup.ts";
-import { parseMirror, renderMirror, type MirrorRecord } from "../src/context-format.ts";
+} from "../../../src/features/live-context/context-cleanup.ts";
+import { parseMirror, renderMirror, type MirrorRecord } from "../../../src/features/live-context/context-format.ts";
 
 function cleanupRecords(): MirrorRecord[] {
 	return [
