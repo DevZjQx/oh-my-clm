@@ -49,7 +49,8 @@
     "test": "node --experimental-strip-types --test \"test/**/*.test.ts\"",
     "build:dsh": "tsc -p tsconfig.dsh.json",
     "build:dsh:plugin": "node scripts/build-dsh-plugin.mjs",
-    "check": "node scripts/check-boundaries.mjs && npm run build:dsh && node --experimental-strip-types --check extensions/clm.ts && node --experimental-strip-types --check src/features/live-context/context-format.ts && node --experimental-strip-types --check src/features/live-context/dsh-bridge.ts && node --check dist/dsh/index.js && node --check scripts/build-dsh-plugin.mjs && node scripts/check-dsh-package.mjs",
+    "git:setup": "node scripts/setup-git-credentials.mjs",
+    "check": "node scripts/check-boundaries.mjs && npm run build:dsh && node --experimental-strip-types --check extensions/clm.ts && node --experimental-strip-types --check src/features/live-context/context-format.ts && node --experimental-strip-types --check src/features/live-context/dsh-bridge.ts && node --check dist/dsh/index.js && node --check scripts/build-dsh-plugin.mjs && node --check scripts/git-credential.mjs && node --check scripts/setup-git-credentials.mjs && node scripts/check-dsh-package.mjs",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.dsh.json --noEmit",
     "prepack": "npm run build:dsh"
   },
