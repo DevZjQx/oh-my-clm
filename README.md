@@ -12,9 +12,9 @@ Pi 为下一次请求构建当前 branch 的 projection 时，扩展会把可编
 /tmp/clm-${sessionId}/LIVE_CTX_MAIN.md
 ```
 
-`${sessionId}` 是运行时 session ID；即使多个 session 使用同一个工作目录，它们也不会共享或覆盖 mirror。旧版本生成的 `.pi/clm` 文件不会被自动迁移或删除。
+`${sessionId}` 是运行时 session ID。多个 session 即使使用同一个工作目录，也不会共享或覆盖 mirror。旧版本生成的 `.pi/clm` 文件不会被自动迁移或删除。
 
-模型可以调用 Pi/DSH 都提供的 `cleanup({ blockIds: [...] })` 工具，按 editable block ID 删除 stale、重复或自指噪声；cleanup 在一次工具调用内完成 host-side 变更，不依赖完整 block body 或 `old_string`。需要缩短已有 block 时，rewrite 脚本应在同一个 host-side 工具调用内完成 read+write；普通 edit 只适用于完整且未截断的 body。DSH 会等触发文件编辑的 session event 发布完成后再应用 native replacement，因此脚本必须在工具返回前完成写入，不要在后台持续重写 mirror：
+模型可以调用 Pi/DSH 都提供的 `cleanup({ blockIds: [...] })` 工具，按 editable block ID 删除 stale、重复或自指噪声。cleanup 在一次工具调用内完成 host-side 变更，不依赖完整 block body 或 `old_string`。需要缩短已有 block 时，rewrite 脚本要在同一个 host-side 工具调用内完成 read+write；普通 edit 只适用于完整且未截断的 body。DSH 会等触发文件编辑的 session event 发布完成后再应用 native replacement，所以脚本必须在工具返回前写完，不能在后台持续重写 mirror：
 
 ```text
 <!-- pi-clm-v2 -->
@@ -31,13 +31,12 @@ Pi 为下一次请求构建当前 branch 的 projection 时，扩展会把可编
 - 初始用户任务受到保护，不会出现在可编辑区域中；user-authored block 可以被省略，但不能被模型改写。
 - mirror preview 有固定的单 block 和总大小上限；截断只影响显示，不改变 canonical source。
 - `cleanup({ blockIds: [...] })` 按当前 1-based editable ID 删除 block；load-bearing block 1 始终保留，assistant/tool-result 配对也会整体处理。未知、重复、过期或协议损坏的 ID 会整体拒绝。
-- DSH 的 runtime context 会包含当前可编辑 block 的 `<oh-my-clm-block-index>`：每条记录给出 cleanup 使用的 1-based ID、role 和短 preview；列表较长时只显示头部 40 个和尾部 40 个，中间省略并给出 ID 区间。`cleanup` 的 tool result 也会返回刷新后的 index。因此清理时不需要为了确认 ID 或内容去读 `LIVE_CTX_MAIN.md`；只有需要完整、未截断的正文做 rewrite 时才读 mirror。
-- cleanup 后需要改写时，rewrite 脚本必须在同一个 host-side 工具调用内完成 read+write；edit 只适用于完整、未截断的 old body。
+- DSH 的 runtime context 会包含当前可编辑 block 的 `<oh-my-clm-block-index>`，每条记录给出 cleanup 使用的 1-based ID、role 和短 preview。列表较长时只显示头部 40 个和尾部 40 个，中间省略并给出 ID 区间。`cleanup` 的 tool result 也会返回刷新后的 index。所以清理时不需要为了确认 ID 或内容去读 `LIVE_CTX_MAIN.md`；只有需要完整、未截断的正文做 rewrite 时才读 mirror。
 - 如果工具结果读取了 `LIVE_CTX_MAIN.md`，该结果会在未来 projection 中替换成短指针，避免 mirror 自我复制。
 - 改写或删除 assistant tool turn 时，配对的 tool result 也会一起处理，避免孤立的 tool message。
 - 合法修改在 `turn_end` 通过 Pi 原生 `context_edit` 持久化；原始 session JSONL 不会被改写。
 
-这不是对 session JSONL 的直接压缩：context edit 属于当前 branch，所以 `/tree`、fork 和 session resume 继续遵守 Pi 的分支语义。
+由于 context edit 属于当前 branch，`/tree`、fork 和 session resume 继续遵守 Pi 的分支语义。
 
 ## 试用
 
@@ -53,8 +52,8 @@ pi --extension ./extensions/clm.ts
 pi -e .
 ```
 
-开始一项会产生几轮工具输出的任务。需要整理历史时，模型可以按 block ID 调用 `cleanup({ blockIds: [...] })`，也可以按照系统提示对
-`/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md` 做同 call 的 rewrite/edit。也可以直接使用 Pi 原生 `/compact` 完成手动压缩。扩展不会再发送一个额外的“compact LLM turn”。
+开始一项会产生几轮工具输出的任务。需要整理历史时，模型可以按 block ID 调用 `cleanup({ blockIds: [...] })`，也可以按系统提示对
+`/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md` 做同 call 的 rewrite/edit；手动压缩直接使用 Pi 原生 `/compact`。扩展不额外发送 “compact LLM turn”。
 
 ## 命令
 
@@ -64,11 +63,11 @@ pi -e .
 
 `/clm status` 显示 mirror 路径、字节数、可编辑/保护 block 数、preview/canonical 估算 token、Pi context usage、目标预算、shrink-only 策略和 branch 上已持久化的 context edit 数量。
 
-扩展会在 session start、branch 切换和请求前自动刷新 mirror；没有 `/clm refresh`。直接在 agent turn 外修改 mirror 会在下一次同步时恢复为 canonical projection，避免未经校验的内容进入 session。
+扩展会在 session start、branch 切换和请求前自动刷新 mirror；没有 `/clm refresh` 命令。在 agent turn 之外直接修改 mirror，会在下一次同步时被恢复为 canonical projection，避免未经校验的内容进入 session。
 
 ## 预算与生命周期
 
-`CLM_CONTEXT_BUDGET` 是一个近似的目标预算，不是第二个 context window，也不会阻止已经过大的请求。接近目标时，扩展在 `context` hook 返回一条**临时** nudge，要求模型只做一次 mirror 编辑；该 nudge 不写入 session history。预算没有设置时，不发送 nudge。
+`CLM_CONTEXT_BUDGET` 是一个近似的目标预算，不是第二个 context window，也不会阻止已经过大的请求。接近目标时，扩展会在 `context` hook 返回一条临时 nudge，要求模型只做一次 mirror 编辑；该 nudge 不写入 session history。没有设置预算时不发送 nudge。
 
 超过 Pi 自身 context window 时，交给 Pi 原生 auto-compaction；需要手动整理时使用 Pi 原生 `/compact`。这避免在已经过大的完整上下文上再追加一次 `/clm-compact` LLM 请求。
 
@@ -76,11 +75,11 @@ pi -e .
 CLM_CONTEXT_BUDGET=32000 pi --extension ./extensions/clm.ts
 ```
 
-所有接受的 mirror 编辑都采用固定的 **shrink-only** 策略：按 Pi 的结构化估算，编辑后的上下文必须严格短于编辑前。没有可安全缩短的编辑会被拒绝。系统 prompt 等 mirror 之外的固定 token 会计入预算估算。
+所有接受的 mirror 编辑都采用固定的 shrink-only 策略：按 Pi 的结构化估算，编辑后的上下文必须严格短于编辑前。不能安全缩短上下文的编辑会被拒绝。系统 prompt 等 mirror 之外的固定 token 会计入预算估算。
 
-mirror 的显示上限是固定的：单 block 约 `12000` 字符，总 mirror 约 `96000` 字符；这些限制不再通过环境变量分叉配置。
+mirror 的显示上限是固定的：单 block 约 `12000` 字符，总 mirror 约 `96000` 字符。
 
-token 计数使用共享格式层的 provider-independent `estimateMessageTokens(message)`，按消息分别估算。对当前 Pi 支持的 text、thinking、tool call、图片、system sections 和 tool declarations，它采用与 Pi host 一致的 `3.5 chars/token` 近似及 rounding；共享层不导入 Pi runtime，因此仍保留 DSH 的 `reasoning`、`tool-call`、`tool` 和其他自有消息形状的 fallback 估算。当前 Pi extension 的公开 `ExtensionContext` 只提供 effective system prompt，`fixedRequestTokens` 因此只计该 prompt；tool declaration overhead 只有在 host 传入结构化 system message 时才会被计入，否则必须视为 incomplete approximation。它不是 provider 的精确 tokenizer；Pi/DSH 自身的 context window 仍是最终约束。
+token 计数使用共享格式层的 provider-independent `estimateMessageTokens(message)`，按消息分别估算。对当前 Pi 支持的 text、thinking、tool call、图片、system sections 和 tool declarations，它采用与 Pi host 一致的 `3.5 chars/token` 近似及 rounding。共享层不导入 Pi runtime，所以 DSH 的 `reasoning`、`tool-call`、`tool` 和其他自有消息形状仍走 fallback 估算。当前 Pi extension 的公开 `ExtensionContext` 只提供 effective system prompt，`fixedRequestTokens` 因此只计该 prompt；tool declaration overhead 只有在 host 传入结构化 system message 时才会被计入，否则这个估算就不完整。它不是 provider 的精确 tokenizer；Pi/DSH 自身的 context window 仍是最终约束。
 
 生成的 `/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md` 位于系统临时目录，不属于发布包，也不应提交到 Git。目录默认使用 `0700`，mirror 文件默认使用 `0600`；宿主仍负责临时文件清理和内容审计。
 
@@ -95,10 +94,10 @@ token 计数使用共享格式层的 provider-independent `estimateMessageTokens
 - DSH 生命周期使用官方 Harness 的 Cordis `agent/created`、`agent/pre-step`、`session/event`、`systemPrompt.section()`、`systemPrompt.context()` 和 `tools.register()` 扩展点；cleanup 直接对当前 session surface 执行按 ID 的 native replacement，不读取 mirror 文件。`systemPrompt.context()` 负责把 block index 放进模型可见的 runtime context；DSH 自己的 runtime-context snapshot 也会从 mirror records 中排除，避免 index 递归列出自身。普通 mirror 编辑的 `session/event` 只排队 reconcile，实际 mutation 延迟到 `Session.append()` 发布完成、且 `step/start` 打开新 step 之后执行；`agent/pre-step` 只等待已排队的收敛，不执行 mutation。session projection 仍由 DSH 提供，session log 仍是事实来源。
 - DSH 会按当前 session ID 生成 `/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md`。DSH 文件工具可以直接编辑这个 host-side mirror；sandboxed bash 可能拥有不同的 `/tmp`，除非宿主显式共享该 session 目录。
 - bridge 会对 mirror 编辑执行与 Pi 侧相同的 snapshot、结构安全和 shrink-only 校验；合法编辑通过 DSH 原生 `Session.append()` 的 `surfaceOp: { op: "replace" }` seam 写入当前 session，处理后再把 mirror 重写为新的 canonical DSH projection。
-- 当前 bridge **会**改变 DSH active surface，但不把它描述成 Pi 的 branch-local `context_edit`：cleanup 和普通编辑会追加 `tool/result` content replacement 或 `developer/message` replacement（omission 用空 content，assistant 改写用缩短后的文本），原始事件仍保留在 append-only session log 中，`deriveMessages()` 使用新的 surface。DSH 明确禁止 `assistant/message` 携带 `sourceEventSeqs`，而每个 replacement 又必须引用所有被遮蔽的节点，所以 assistant block 不能原地替换成另一个 assistant message；改写后的文本以 developer 身份进入模型可见历史，不再归属原模型回复。它不生成 proposal/receipt 文件，也不注册自定义 session event；reconcile 在事件回调之外串行执行，避免 `Session.append()` reentrant failure。所有 omission 和 assistant 改写都使用 append 时真正打开的 `turn`/`step`（正数），`tool/result` replacement 保持原 event envelope、只改 `content`，并带 `sourceEventSeqs: [targetSeq]`。
+- 当前 bridge 会改变 DSH active surface，这与 Pi 的 branch-local `context_edit` 不是一回事：cleanup 和普通编辑会追加 `tool/result` content replacement 或 `developer/message` replacement（omission 用空 content，assistant 改写用缩短后的文本），原始事件仍保留在 append-only session log 中，`deriveMessages()` 使用新的 surface。DSH 明确禁止 `assistant/message` 携带 `sourceEventSeqs`，而每个 replacement 又必须引用所有被遮蔽的节点，所以 assistant block 不能原地替换成另一个 assistant message。改写后的文本以 developer 身份进入模型可见历史，不再归属原模型回复。它不生成 proposal/receipt 文件，也不注册自定义 session event；reconcile 在事件回调之外串行执行，避免 `Session.append()` reentrant failure。所有 omission 和 assistant 改写都使用 append 时真正打开的 `turn`/`step`（正数），`tool/result` replacement 保持原 event envelope、只改 `content`，并带 `sourceEventSeqs: [targetSeq]`。
 - host entry 不复制 `dsh-ops` 的 Rust 工具、shell、PTC 或 TUI 矩阵，只做 live-context 适配。DSH 仅依赖 host 提供的 Cordis 生命周期，运行时不导入 Pi 的 coding-agent 包。
 
-安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现现在另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()`/surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。
+安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()`/surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。
 
 版本更新说明（0.1.0–0.1.4）已移至 [changelog.md](./changelog.md)。
 
@@ -124,7 +123,7 @@ node scripts/build-dsh-plugin.mjs --output ./artifacts/oh-my-clm.tgz
 
 这个脚本会先编译并检查 host entry，再生成只包含 DSH host、运行时 `dist`、manifest、bundle patch、locale、icon 的 npm tgz；Pi extension、TypeScript 源码、测试文件和开发依赖不会进入该专用包。`@deepseek-ai/dsh-tools` 仅作为可选 peer 声明用于兼容性检查，不产生运行时依赖，也不得改回 `dependencies`（原因见 [changelog.md](./changelog.md) 的 0.1.1 说明）。普通 `npm pack` 仍用于构建同时包含 Pi 与 DSH 内容的完整包。
 
-`npm run build:dsh` 会从 `src/features/live-context/dsh-bridge.ts` 和共享格式层生成 `dist/`；`npm pack` 的 `prepack` 也会执行这一步。仓库测试主要是 mock host 和契约/包检查；外部 DSH 验证报告另外覆盖了真实 CLI 安装、bundle activation、system prompt 和 mirror/file-tool 生成。DSH 文件工具运行在宿主侧时可以访问 `/tmp/clm-*`；sandbox 内的 bash 不一定共享同一个 `/tmp`，应按提示使用文件工具编辑 mirror。`Session.append()` 的 replacement 会走正常 `session/event` 发布路径；需要立即验证后端崩溃持久性的部署应由宿主使用官方 `session/flush` 检查点，而插件不猜测或注册额外 flush API。
+`npm run build:dsh` 会从 `src/features/live-context/dsh-bridge.ts` 和共享格式层生成 `dist/`；`npm pack` 的 `prepack` 也会执行这一步。仓库测试主要是 mock host 和契约/包检查；外部 DSH 验证报告另外覆盖了真实 CLI 安装、bundle activation、system prompt 和 mirror/file-tool 生成。DSH 文件工具运行在宿主侧时可以访问 `/tmp/clm-*`；sandbox 内的 bash 不一定共享同一个 `/tmp`，应按提示使用文件工具编辑 mirror。`Session.append()` 的 replacement 会走正常 `session/event` 发布路径；需要立即验证后端崩溃持久性的部署应由宿主使用官方 `session/flush` 检查点，插件本身不猜测或注册额外的 flush API。
 
 DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 `CLM_CONTEXT_FIXED_TOKENS`；它们只影响 mirror preview 或 shrink-only safety gate 的近似估算，不改变 DSH 的 context window。
 
