@@ -4,6 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { apply as dshHost } from "../../../dsh/index.ts";
+// Test-only import: the plugin bundle must not load a second copy of this host
+// package (its tool scheduler is keyed by a module-level Symbol), but the test
+// needs the host's real output validator to reproduce INVALID_TOOL_OUTPUT.
+import { validateJsonSchemaValue } from "@deepseek-ai/dsh-tools";
 import { sessionMirrorPath } from "../../../src/lib/clm-paths.ts";
 import {
 	executeDshCleanup,
@@ -519,6 +523,46 @@ function listenerContext(): ListenerContext {
 		},
 	};
 }
+
+test("DSH cleanup tool value passes the declared output schema", async () => {
+	const root = listenerContext();
+	dshHost({ ...root } as any);
+	const tool = root.tools.definitions.get("cleanup");
+	assert.ok(tool?.output?.schema);
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-dsh-output-"));
+	const previous = process.env.CLM_CLEANUP_RESULT;
+	const run = async (id: string) => {
+		const session = dshSession(cwd, id);
+		const args = { blockIds: [3] };
+		const value = await tool.execute(args, { agent: { session } });
+		return { value, rendered: tool.output.render(args, value) };
+	};
+	try {
+		// DSH validates the returned value against output.schema (which declares
+		// additionalProperties: false) before rendering. Host-only rendering state
+		// such as the copy mode must not ride along, or every call fails with
+		// ToolOutputError(INVALID_TOOL_OUTPUT).
+		delete process.env.CLM_CLEANUP_RESULT;
+		const compact = await run("dsh-output-tool");
+		assert.deepEqual(validateJsonSchemaValue(tool.output.schema, compact.value, "value"), []);
+		assert.deepEqual(compact.rendered, [{ type: "text", text: "cleanup applied; removed block(s): 3." }]);
+
+		process.env.CLM_CLEANUP_RESULT = "none";
+		const silent = await run("dsh-output-tool-none");
+		assert.deepEqual(validateJsonSchemaValue(tool.output.schema, silent.value, "value"), []);
+		assert.deepEqual(silent.rendered, [{ type: "text", text: "" }]);
+
+		process.env.CLM_CLEANUP_RESULT = "full";
+		const full = await run("dsh-output-tool-full");
+		assert.deepEqual(validateJsonSchemaValue(tool.output.schema, full.value, "value"), []);
+		const fullText = full.rendered[0]?.text ?? "";
+		assert.match(fullText, /^cleanup applied; removed block\(s\): 3\.\n\n<oh-my-clm-block-index>/);
+	} finally {
+		if (previous === undefined) delete process.env.CLM_CLEANUP_RESULT;
+		else process.env.CLM_CLEANUP_RESULT = previous;
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+});
 
 test("mock DSH host loads the entry, registers hooks, and mutates the active surface", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-dsh-host-"));

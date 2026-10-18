@@ -19,6 +19,7 @@ import {
 	formatCleanupToolResult,
 	parseCleanupArgs,
 	parseCleanupResultCopy,
+	type CleanupResultCopy,
 	type CleanupToolResult,
 } from "../src/features/live-context/context-cleanup.ts";
 
@@ -96,6 +97,16 @@ The DSH bridge mirrors the current session surface to \`${mirrorTemplate}\`.
 </oh-my-clm-dsh-live-context>`;
 }
 
+/**
+ * Copy mode for the model-visible cleanup result. The bridge stamps it into its
+ * transient result, but the tool strips that host-only field before DSH
+ * validates the output; the renderer parses the same environment switch
+ * independently, so both sides stay in sync.
+ */
+function cleanupResultCopy(): CleanupResultCopy {
+	return parseCleanupResultCopy(process.env.CLM_CLEANUP_RESULT);
+}
+
 function optionsFor(session: DshSessionLike): DshBridgeOptions {
 	const sessionId = String(session.id);
 	const mirrorPath = sessionMirrorPath(sessionId);
@@ -105,7 +116,7 @@ function optionsFor(session: DshSessionLike): DshBridgeOptions {
 		maxBlockChars: positiveEnv("CLM_MAX_BLOCK_CHARS", 12_000),
 		maxMirrorChars: positiveEnv("CLM_MAX_MIRROR_CHARS", 96_000),
 		fixedTokens: positiveEnv("CLM_CONTEXT_FIXED_TOKENS", 0),
-		cleanupResult: parseCleanupResultCopy(process.env.CLM_CLEANUP_RESULT),
+		cleanupResult: cleanupResultCopy(),
 	};
 }
 
@@ -144,6 +155,12 @@ const cleanupParameters = {
 	required: ["blockIds"],
 } as const;
 
+/**
+ * The declared output is the tool's model-visible contract: DSH validates the
+ * returned body value against it and rejects any undeclared property because
+ * of `additionalProperties: false`, so host-only rendering state (the cleanup
+ * copy mode) must not ride along in the returned object.
+ */
 const cleanupOutputSchema = {
 	type: "object",
 	properties: {
@@ -165,7 +182,10 @@ function createDshCleanupTool(getState: (sessionId: string) => DshBridgeState | 
 		output: {
 			schema: cleanupOutputSchema,
 			render: (_args: unknown, value: unknown) => [
-				{ type: "text", text: formatCleanupToolResult(value as CleanupToolResult) },
+				{
+					type: "text",
+					text: formatCleanupToolResult(value as CleanupToolResult, cleanupResultCopy()),
+				},
 			],
 		},
 		isConcurrencySafe: () => false,
@@ -177,13 +197,18 @@ function createDshCleanupTool(getState: (sessionId: string) => DshBridgeState | 
 			// erased at this host boundary.
 			const session = exec.agent?.session as unknown as DshSessionLike | undefined;
 			if (!session) throw new Error("cleanup requires an active DSH agent session.");
-			return executeDshCleanup(
+			const result = await executeDshCleanup(
 				session,
 				parsed.args.blockIds,
 				optionsFor(session),
 				fileSystem,
 				getState(String(session.id)),
 			);
+			// `copy` steers how much text output.render emits. It is host-side
+			// rendering state, not tool-output data, so keep it out of the value
+			// DSH snapshots and validates against cleanupOutputSchema.
+			const { copy: _copy, ...output } = result;
+			return output;
 		},
 	};
 }

@@ -333,8 +333,7 @@ export function cleanupToolResult(plan, blockIndex, copy = "compact") {
 export function parseCleanupResultCopy(value) {
     return value === "full" || value === "none" ? value : "compact";
 }
-export function formatCleanupToolResult(result) {
-    const copy = result.copy ?? "full";
+export function formatCleanupToolResult(result, copy = result.copy ?? "full") {
     if (copy === "none")
         return "";
     const summary = result.status === "applied"

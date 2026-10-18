@@ -455,8 +455,10 @@ export function parseCleanupResultCopy(value: string | undefined): CleanupResult
 	return value === "full" || value === "none" ? value : "compact";
 }
 
-export function formatCleanupToolResult(result: CleanupToolResult): string {
-	const copy = result.copy ?? "full";
+export function formatCleanupToolResult(
+	result: CleanupToolResult,
+	copy: CleanupResultCopy = result.copy ?? "full",
+): string {
 	if (copy === "none") return "";
 	const summary = result.status === "applied"
 		? `cleanup applied; removed block(s): ${result.removedBlockIds.join(", ")}.`

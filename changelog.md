@@ -11,6 +11,7 @@
 
 ### 修复
 
+- **DSH 插件里 `cleanup` 工具每次调用都报 `INVALID_TOOL_OUTPUT`。** 0.1.5 让 `cleanup` 结果带上 `copy` 字段供渲染层选择输出长度，但 DSH 会先用工具声明的 `output.schema`（`additionalProperties: false`）校验返回值的每个属性，未声明的 `copy` 直接让整次调用失败：`tool "cleanup" returned invalid output: "value.copy" is not a declared property`，清理实际上已生效却拿不到结果。现在 `copy` 只作为宿主侧渲染状态保留在 `executeDshCleanup` 的返回值里，`dsh/index.ts` 在 return 前把它剥离，渲染改由 `CLM_CLEANUP_RESULT` 重新解析。新增测试用 DSH 自己的 `validateJsonSchemaValue` 校验三种 copy 模式下的返回值，防止再次携带未声明字段。
 - **DSH 插件管理器不显示自定义图标。** DSH 通过 `readPluginMeta` 解析 `<pkg>/package.json` 读取顶层 `icon`，而这个路径受 `exports` 约束；原 `exports` 没有 `"./package.json"`，解析被 `ERR_PACKAGE_PATH_NOT_EXPORTED` 静默跳过，只剩 `locale` 里的标题/描述，图标回退到默认图。根包和 `build:dsh:plugin` 生成的专用包现在都导出 `./package.json`，`check-dsh-package` 与 manifest 测试也会校验 `icon` 和这两个导出，防止回归。
 
 ### 调整
