@@ -15,6 +15,7 @@
 - **`dsh-clm/` 只保留构建输出。** 历史验证报告移到 `docs/reports/` 并补充说明；`dsh-clm/` 改为 gitignore 的 tgz 输出目录。
 - **删除已移除功能的空占位文件。** 移除 `src/compact.ts`、`src/trajectory.ts` 和同名的空测试。
 - **新增单向依赖检查。** `scripts/check-boundaries.mjs` 接入 `npm run check`，检查 `shared → feature → host adapter` 的导入方向、跨 feature 导入和 barrel 文件。目录职责见 [`docs/project-structure.md`](./docs/project-structure.md)。
+- **更换插件图标。** `icon.svg` 改为“长度递减的上下文块 + 琥珀色清理徽标”的扁平图标，对应 shrink-only 的上下文整理动作；深色圆角底保证在浅色和深色界面中都可用，16–48px 下仍能辨认。
 
 发布包中的入口仍然是 `extensions/clm.ts` 和 `dist/dsh/index.js`；`package.json` 的 `files` 白名单和 `tsconfig.dsh.json` 已同步新的源码路径。
 

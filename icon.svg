@@ -1,5 +1,21 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="oh-my-clm">
-  <rect width="128" height="128" rx="28" fill="#18212f"/>
-  <path d="M30 35h68v12H30zM30 58h49v12H30zM30 81h35v12H30z" fill="#8ee6c7"/>
-  <path d="m86 64 12 12-12 12" fill="none" stroke="#ffd166" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <title>oh-my-clm</title>
+  <defs>
+    <linearGradient id="omc-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#223245"/>
+      <stop offset="1" stop-color="#0f1924"/>
+    </linearGradient>
+    <radialGradient id="omc-glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#8ee6c7" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#8ee6c7" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="128" height="128" rx="30" fill="url(#omc-bg)"/>
+  <rect x="0.75" y="0.75" width="126.5" height="126.5" rx="29.25" fill="none" stroke="#ffffff" stroke-opacity="0.08"/>
+  <circle cx="52" cy="48" r="46" fill="url(#omc-glow)"/>
+  <rect x="30" y="33" width="60" height="14" rx="7" fill="#51667c"/>
+  <rect x="30" y="54" width="46" height="15" rx="7.5" fill="#8ee6c7"/>
+  <rect x="30" y="76" width="34" height="14" rx="7" fill="#51667c"/>
+  <circle cx="96" cy="95" r="13" fill="#ffd166"/>
+  <rect x="89" y="93" width="14" height="4" rx="2" fill="#16212e"/>
 </svg>
