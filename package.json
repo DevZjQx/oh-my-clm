@@ -36,6 +36,7 @@
   "main": "./dist/dsh/index.js",
   "exports": {
     ".": "./dist/dsh/index.js",
+    "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },

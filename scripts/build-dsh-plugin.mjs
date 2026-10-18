@@ -133,6 +133,10 @@ function createStagingPackage(stageRoot, packageJson) {
 	stagedPackageJson.main = "./dist/dsh/index.js";
 	stagedPackageJson.exports = {
 		".": "./dist/dsh/index.js",
+		// DSH resolves `<pkg>/package.json` through the exports map to read display
+		// metadata (title, description, and the top-level `icon` file). Omitting this
+		// entry silently drops the icon and falls back to the default artwork.
+		"./package.json": "./package.json",
 		"./locale/*.json": "./locale/*.json",
 		"./icon": "./icon.svg",
 	};

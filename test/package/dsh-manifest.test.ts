@@ -21,6 +21,9 @@ test("DSH community manifest and official bundle metadata point at the built hos
 	assert.equal(entry.includes(".."), false);
 	assert.equal(fs.existsSync(path.join(root, entry)), true);
 	assert.equal(packageJson.dsh.bundle.patch, "./cordis.patch.yml");
+	assert.equal(packageJson.icon, "./icon.svg");
+	assert.equal(packageJson.exports["./package.json"], "./package.json");
+	assert.equal(packageJson.exports["./icon"], "./icon.svg");
 	assert.equal(fs.existsSync(path.join(root, "locale/en.json")), true);
 	assert.equal(fs.existsSync(path.join(root, "locale/zh.json")), true);
 	assert.equal(fs.existsSync(path.join(root, "icon.svg")), true);
