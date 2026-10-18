@@ -153,16 +153,6 @@ test/{lib,features,adapters,package,harness}
 - [DSH 证据与 harness](./docs/reports/README.md)：mock host harness 的运行方式和历史验证报告。
 - [更新日志](./changelog.md)：0.1.0–0.1.5 各版本的修复与调整说明。
 
-## 推送凭据
-
-仓库根目录的 `.env`（已在 `.gitignore` 中）保存 `GITHUB_USER` 和 `GITHUB_TOKEN`。克隆后执行一次：
-
-```bash
-npm run git:setup
-```
-
-它把本仓库的 `credential.helper` 指向 `scripts/git-credential.mjs`，该 helper 只在 `host=github.com` 时从 `.env` 读取 token，`store`/`erase` 一律忽略，所以 token 不会被写进 `~/.git-credentials`。配置后 `git push`、`git fetch` 直接可用，不需要 `gh` CLI、SSH key 或交互式密码；`git config --local --get-all credential.helper` 可确认是否生效。token 需要 `Contents: Read and write`（fine-grained）或 `repo`（classic）权限。
-
 ## 开发检查
 
 ```bash
