@@ -13,6 +13,7 @@ import {
 	type DshFileSystem,
 	type DshSessionLike,
 } from "../../../src/features/live-context/dsh-bridge.ts";
+import { formatCleanupToolResult } from "../../../src/features/live-context/context-cleanup.ts";
 
 class MemoryFiles implements DshFileSystem {
 	readonly files = new Map<string, string>();
@@ -129,9 +130,10 @@ function dshSession(
 	return session;
 }
 
-function bridgeOptions(sessionId = "dsh-session-1") {
+function bridgeOptions(sessionId = "dsh-session-1", cleanupResult?: "compact" | "full" | "none") {
 	return {
 		mirrorPath: sessionMirrorPath(sessionId),
+		...(cleanupResult ? { cleanupResult } : {}),
 	};
 }
 
@@ -207,9 +209,10 @@ test("DSH cleanup removes selected blocks directly from the active surface", () 
 	assert.equal(result.status, "applied");
 	assert.deepEqual(result.requestedBlockIds, [3]);
 	assert.deepEqual(result.removedBlockIds, [3]);
-	assert.match(result.blockIndex ?? "", /\n1\. assistant: I inspected the repository/);
-	assert.match(result.blockIndex ?? "", /\n2\. toolResult: Large output that can be omitted\./);
-	assert.doesNotMatch(result.blockIndex ?? "", /Keep this later request/);
+	// Default copy is compact: the refreshed index is already re-rendered in
+	// each step's runtime context, so the result carries only the confirmation.
+	assert.equal(result.blockIndex, undefined);
+	assert.match(formatCleanupToolResult(result), /^cleanup applied; removed block\(s\): 3\.$/);
 	assert.deepEqual(session.surface.nodes, [0, 1, 2, 3, 7]);
 	assert.doesNotMatch(files.readText(options.mirrorPath) ?? "", /CLM_ENTRY id=3 role=user/);
 	assert.match(files.readText(options.mirrorPath) ?? "", /CLM_ENTRY id=1 role=assistant/);
@@ -221,10 +224,49 @@ test("DSH cleanup removes selected blocks directly from the active surface", () 
 	const protectedResult = executeDshCleanup(session, [1], bridgeOptions(String(session.id)));
 	assert.equal(protectedResult.status, "rejected");
 	assert.match(protectedResult.reason, /block 1/i);
-	assert.match(protectedResult.blockIndex ?? "", /\n2\. toolResult:/);
+	assert.equal(protectedResult.blockIndex, undefined);
 	const pairedResult = executeDshCleanup(session, [2], bridgeOptions(String(session.id)));
 	assert.equal(pairedResult.status, "rejected");
 	assert.match(pairedResult.reason, /block 1|paired/i);
+});
+
+test("DSH cleanup result copy is compact by default with opt-in full and none", () => {
+	const compactSession = dshSession();
+	const compact = executeDshCleanup(compactSession, [3], bridgeOptions(String(compactSession.id)));
+	assert.equal(compact.status, "applied");
+	assert.equal(compact.copy, "compact");
+	assert.equal(compact.blockIndex, undefined);
+	assert.doesNotMatch(formatCleanupToolResult(compact), /\n1\. assistant/);
+
+	const fullSession = dshSession();
+	const full = executeDshCleanup(fullSession, [3], {
+		...bridgeOptions(String(fullSession.id)),
+		cleanupResult: "full",
+	});
+	assert.equal(full.status, "applied");
+	assert.equal(full.copy, "full");
+	assert.match(full.blockIndex ?? "", /\n1\. assistant: I inspected the repository/);
+	assert.match(full.blockIndex ?? "", /\n2\. toolResult: Large output that can be omitted\./);
+	assert.doesNotMatch(full.blockIndex ?? "", /Keep this later request/);
+	assert.match(formatCleanupToolResult(full), /removed block\(s\): 3\.[\s\S]*\n1\. assistant/);
+
+	const noneSession = dshSession();
+	const none = executeDshCleanup(noneSession, [3], {
+		...bridgeOptions(String(noneSession.id)),
+		cleanupResult: "none",
+	});
+	assert.equal(none.status, "applied");
+	assert.equal(none.copy, "none");
+	assert.equal(formatCleanupToolResult(none), "");
+
+	// Rejections follow the same copy mode.
+	const rejected = executeDshCleanup(dshSession(), [1], {
+		...bridgeOptions("reject-full"),
+		cleanupResult: "full",
+	});
+	assert.equal(rejected.status, "rejected");
+	assert.match(rejected.blockIndex ?? "", /I inspected the repository/);
+	assert.match(formatCleanupToolResult(rejected), /cleanup rejected;[\s\S]*block 1/);
 });
 
 test("DSH runtime-context snapshots are not editable blocks", () => {

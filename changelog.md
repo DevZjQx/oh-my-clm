@@ -2,10 +2,11 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/how-it-works.md`](./docs/how-it-works.md)。
 
-## 未发布（内部结构整理）
+## 0.1.5（当前版本）
 
 ### 新增
 
+- **`cleanup` 结果默认紧凑化，新增 `CLM_CLEANUP_RESULT`。** DSH 的 cleanup 工具结果默认只返回一行确认（状态 + 请求/移除 ID），不再附带刷新后的 block index——同一份索引已经由 `systemPrompt.context` 在每步动态重渲染，重复拷贝只是噪声。`CLM_CLEANUP_RESULT=full` 恢复附带索引的旧行为，`none` 则不返回结果文本；工具调用与结果事件本身仍完整保留在 session surface 中。Pi 扩展没有索引拷贝，行为不变。
 - **`cleanup` 使用纪律进入模型可见上下文。** 新增导出常量 `CLEANUP_DISCIPLINE`（`src/features/live-context/context-format.ts`），同时用于 DSH 的 `<oh-my-clm-block-index>` 末尾和 Pi 的 system prompt，避免两侧措辞漂移。内容只有两条可机械执行的规则：把要删的 ID 合并在一次调用里（删完会重新编号，不要用旧 ID 连续调用）；tool-call block 与配对结果一起删、优先清理 assistant/tool-result 噪声而不是 user turn、拿不准的 ID 留到下次。两个 host 的 `blockIds` 参数说明也补上“一次调用传完”的提示。索引净增约一行。
 
 ### 修复
@@ -14,16 +15,17 @@
 
 ### 调整
 
+- **Mirror 协议头改为宿主中立的 `clm-v2`。** 原 `<!-- pi-clm-v2 -->` 由 Pi 扩展和 DSH bridge 共用，但名字暗示它只属于 Pi；现在写入统一为 `<!-- clm-v2 -->`。旧头不再被识别：升级后 `/tmp` 里遗留的 mirror 会在下一次同步被新头重写，按旧头编辑则会被拒绝。协议识别、自读保护和 cleanup 错误文案现在都从 `MIRROR_VERSION` / `MIRROR_HEADER` 单一来源派生，避免版本升级时再次漂移。
 - **源码改为 `src/lib` + `src/features/live-context` 两层。** 共享的 mirror 文件写入和路径解析移到 `src/lib`；mirror 协议、cleanup 和 DSH bridge 移入 `src/features/live-context`；Pi/DSH 入口路径保持不变。
 - **测试按层分组。** `test/` 现在镜像源码分层（`lib`、`features/live-context`、`adapters`、`package`），手动 mock-host harness 移到 `test/harness/`。
-- **`dsh-clm/` 只保留构建输出。** 历史验证报告移到 `docs/reports/` 并补充说明；`dsh-clm/` 改为 gitignore 的 tgz 输出目录。
+- **构建产物目录从 `dsh-clm/` 改名为 `artifacts/`。** 历史验证报告早已移到 `docs/reports/`，但 `dsh-clm/` 和源码目录 `dsh/` 名字过于接近，容易被当成同级的源码/产物对而误合并。输出目录改为 `artifacts/` 并继续 gitignore；`scripts/build-dsh-plugin.mjs` 的默认输出、README、项目结构文档同步更新，`dsh/`、`dist/dsh/` 这些宿主约定路径保持不变。
 - **删除已移除功能的空占位文件。** 移除 `src/compact.ts`、`src/trajectory.ts` 和同名的空测试。
 - **新增单向依赖检查。** `scripts/check-boundaries.mjs` 接入 `npm run check`，检查 `shared → feature → host adapter` 的导入方向、跨 feature 导入和 barrel 文件。目录职责见 [`docs/project-structure.md`](./docs/project-structure.md)。
 - **更换插件图标。** `icon.svg` 改为“长度递减的上下文块 + 琥珀色清理徽标”的扁平图标，对应 shrink-only 的上下文整理动作；深色圆角底保证在浅色和深色界面中都可用，16–48px 下仍能辨认。
 
 发布包中的入口仍然是 `extensions/clm.ts` 和 `dist/dsh/index.js`；`package.json` 的 `files` 白名单和 `tsconfig.dsh.json` 已同步新的源码路径。
 
-## 0.1.4（当前版本）
+## 0.1.4
 
 ### 调整
 

@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 
-export const MIRROR_VERSION = "pi-clm-v2";
+/** Host-neutral format version shared by the Pi extension and the DSH bridge. */
+export const MIRROR_VERSION = "clm-v2";
+/** The exact protocol header line; rendering, parsing, and self-read detection all use it. */
+export const MIRROR_HEADER = `<!-- ${MIRROR_VERSION} -->`;
 export const DEFAULT_MAX_BLOCK_CHARS = 12_000;
 export const DEFAULT_MAX_MIRROR_CHARS = 96_000;
 
@@ -243,7 +246,7 @@ export function buildMirrorRecords(
 function selfReferenceText(text: string, mirrorPath?: string): string | undefined {
 	const normalized = normalizeText(text);
 	if (!normalized) return undefined;
-	const looksLikeMirror = normalized.includes("<!-- pi-clm-v") && normalized.includes("[[CLM_ENTRY");
+	const looksLikeMirror = normalized.includes(MIRROR_HEADER) && normalized.includes("[[CLM_ENTRY");
 	const namesTheMirror = Boolean(mirrorPath && normalized.includes(mirrorPath));
 	if (!looksLikeMirror && !namesTheMirror) return undefined;
 	return "[oh-my-clm] Self-referential live-context output omitted from the editable mirror (" +
@@ -361,7 +364,7 @@ export function renderBlockIndex(
 
 export function renderMirror(records: readonly MirrorRecord[], options: { snapshot?: string } = {}): string {
 	const header = [
-		"<!-- " + MIRROR_VERSION + " -->",
+		MIRROR_HEADER,
 		"<!-- CLM_SNAPSHOT " + (options.snapshot ?? mirrorFingerprint(records)) + " -->",
 		"<!-- Edit block bodies only. Keep CLM_ENTRY and closing markers intact. -->",
 		"<!-- id is the editable block's ordinal; do not change it or reorder blocks. -->",
@@ -386,7 +389,7 @@ export function renderMirror(records: readonly MirrorRecord[], options: { snapsh
 export function parseMirror(text: string): ParsedMirror {
 	const normalized = String(text ?? "").replace(/\r\n?/g, "\n");
 	const lines = normalized.split("\n");
-	const version = lines.some((line) => line.trim() === "<!-- " + MIRROR_VERSION + " -->") ? MIRROR_VERSION : undefined;
+	const version = lines.some((line) => line.trim() === MIRROR_HEADER) ? MIRROR_VERSION : undefined;
 	const snapshot = lines.map((line) => line.trim().match(SNAPSHOT_PATTERN)?.[1]).find(Boolean);
 	const blocks = new Map<string, ParsedMirrorBlock>();
 	const duplicateIds: string[] = [];

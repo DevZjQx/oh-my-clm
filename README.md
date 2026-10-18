@@ -17,7 +17,7 @@ Pi 为下一次请求构建当前 branch 的 projection 时，扩展会把可编
 模型可以调用 Pi/DSH 都提供的 `cleanup({ blockIds: [...] })` 工具，按 editable block ID 删除 stale、重复或自指噪声。cleanup 在一次工具调用内完成 host-side 变更，不依赖完整 block body 或 `old_string`。需要缩短已有 block 时，rewrite 脚本要在同一个 host-side 工具调用内完成 read+write；普通 edit 只适用于完整且未截断的 body。DSH 会等触发文件编辑的 session event 发布完成后再应用 native replacement，所以脚本必须在工具返回前写完，不能在后台持续重写 mirror：
 
 ```text
-<!-- pi-clm-v2 -->
+<!-- clm-v2 -->
 <!-- CLM_SNAPSHOT ... -->
 
 [[CLM_ENTRY id=1 role=assistant]]
@@ -99,7 +99,7 @@ token 计数使用共享格式层的 provider-independent `estimateMessageTokens
 
 安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()`/surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。
 
-版本更新说明（0.1.0–0.1.4）已移至 [changelog.md](./changelog.md)。
+版本更新说明（0.1.0–0.1.5）已移至 [changelog.md](./changelog.md)。
 
 本地检查 DSH bridge：
 
@@ -114,18 +114,18 @@ npm pack --dry-run
 
 ```bash
 npm run build:dsh:plugin
-# 默认输出：dsh-clm/oh-my-clm-<version>.tgz
+# 默认输出：artifacts/oh-my-clm-<version>.tgz
 
 # 也可以指定输出目录或具体文件
-node scripts/build-dsh-plugin.mjs ./artifacts
-node scripts/build-dsh-plugin.mjs --output ./artifacts/oh-my-clm.tgz
+node scripts/build-dsh-plugin.mjs ./out
+node scripts/build-dsh-plugin.mjs --output ./out/oh-my-clm.tgz
 ```
 
 这个脚本会先编译并检查 host entry，再生成只包含 DSH host、运行时 `dist`、manifest、bundle patch、locale、icon 的 npm tgz；Pi extension、TypeScript 源码、测试文件和开发依赖不会进入该专用包。`@deepseek-ai/dsh-tools` 仅作为可选 peer 声明用于兼容性检查，不产生运行时依赖，也不得改回 `dependencies`（原因见 [changelog.md](./changelog.md) 的 0.1.1 说明）。普通 `npm pack` 仍用于构建同时包含 Pi 与 DSH 内容的完整包。
 
 `npm run build:dsh` 会从 `src/features/live-context/dsh-bridge.ts` 和共享格式层生成 `dist/`；`npm pack` 的 `prepack` 也会执行这一步。仓库测试主要是 mock host 和契约/包检查；外部 DSH 验证报告另外覆盖了真实 CLI 安装、bundle activation、system prompt 和 mirror/file-tool 生成。DSH 文件工具运行在宿主侧时可以访问 `/tmp/clm-*`；sandbox 内的 bash 不一定共享同一个 `/tmp`，应按提示使用文件工具编辑 mirror。`Session.append()` 的 replacement 会走正常 `session/event` 发布路径；需要立即验证后端崩溃持久性的部署应由宿主使用官方 `session/flush` 检查点，插件本身不猜测或注册额外的 flush API。
 
-DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 `CLM_CONTEXT_FIXED_TOKENS`；它们只影响 mirror preview 或 shrink-only safety gate 的近似估算，不改变 DSH 的 context window。
+DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 `CLM_CONTEXT_FIXED_TOKENS`；它们只影响 mirror preview 或 shrink-only safety gate 的近似估算，不改变 DSH 的 context window。`CLM_CLEANUP_RESULT` 控制 cleanup 工具结果的拷贝量：默认 `compact` 只返回一行确认（刷新后的 block index 已经在每步的 runtime context 中重渲染），`full` 会在结果后附带刷新后的索引，`none` 则不产生结果文本；它只影响模型可见的结果，不改变工具调用记录本身。
 
 ## 项目结构
 
@@ -151,7 +151,7 @@ test/{lib,features,adapters,package,harness}
 - [项目结构](./docs/project-structure.md)：说明分层目录、单向依赖规则、测试布局和边界检查。
 - [CLM 技术分析表](./docs/CLM技术分析表.md)：整理 Context Language Models 论文、官方实现和工程取舍。
 - [DSH 证据与 harness](./docs/reports/README.md)：mock host harness 的运行方式和历史验证报告。
-- [更新日志](./changelog.md)：0.1.0–0.1.4 各版本的修复与调整说明。
+- [更新日志](./changelog.md)：0.1.0–0.1.5 各版本的修复与调整说明。
 
 ## 开发检查
 
@@ -162,4 +162,4 @@ npm run typecheck
 npm pack --dry-run
 ```
 
-Pi 入口只依赖 Pi 在运行时提供的 host packages；DSH host entry 只依赖 DSH/Cordis 提供的公开生命周期对象。开发依赖用于类型检查和生成 `dist/`。发布白名单包含 `dsh-plugin.json`、`cordis.patch.yml`、`extensions/clm.ts`、`src/lib/`、`src/features/live-context/`、`dsh/`、`dist/`、`locale/` 和 `icon.svg`，不包含本地 session 生成物、`dsh-clm/` 打包输出或 `/tmp/clm-*` mirror 文件。
+Pi 入口只依赖 Pi 在运行时提供的 host packages；DSH host entry 只依赖 DSH/Cordis 提供的公开生命周期对象。开发依赖用于类型检查和生成 `dist/`。发布白名单包含 `dsh-plugin.json`、`cordis.patch.yml`、`extensions/clm.ts`、`src/lib/`、`src/features/live-context/`、`dsh/`、`dist/`、`locale/` 和 `icon.svg`，不包含本地 session 生成物、`artifacts/` 打包输出或 `/tmp/clm-*` mirror 文件。

@@ -3,7 +3,7 @@
   "manifestVersion": "0.15",
   "id": "oh-my-clm.live-context",
   "name": "oh-my-clm",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "license": "MIT",
   "facets": {
     "host": {

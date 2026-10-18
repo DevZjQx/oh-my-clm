@@ -1,4 +1,4 @@
-import { MIRROR_VERSION, mirrorFingerprint, estimateMirrorTokens, } from "./context-format.js";
+import { MIRROR_HEADER, MIRROR_VERSION, mirrorFingerprint, estimateMirrorTokens, } from "./context-format.js";
 const SNAPSHOT_PATTERN = /^<!-- CLM_SNAPSHOT ([a-f0-9]{16}) -->$/;
 const BLOCK_START_PATTERN = /^\[\[CLM_ENTRY\s+id=([^\s\]]+)\s+role=([^\s\]]+)\]\]$/;
 const EMPTY_MARKER = "<!-- CLM_EMPTY -->";
@@ -78,7 +78,7 @@ export function parseCleanupArgs(value) {
 export function parseCleanupMirror(text) {
     const normalized = String(text ?? "").replace(/\r\n?/g, "\n");
     const lines = normalized.split("\n");
-    const version = lines.some((line) => line.trim() === `<!-- ${MIRROR_VERSION} -->`) ? MIRROR_VERSION : undefined;
+    const version = lines.some((line) => line.trim() === MIRROR_HEADER) ? MIRROR_VERSION : undefined;
     const snapshot = lines.map((line) => line.trim().match(SNAPSHOT_PATTERN)?.[1]).find(Boolean);
     const blocks = new Map();
     const duplicateIds = [];
@@ -144,7 +144,7 @@ function validateMirrorForCleanup(records, parsed, requestedBlockIds, options) {
     const beforeTokens = fixedTokens(options) + estimateMirrorTokens(records);
     if (!parsed.recognized) {
         return rejectPlan(requestedBlockIds, parsed.malformed
-            ? "Malformed pi-clm-v2 mirror; refusing to clean a partial document."
+            ? `Malformed ${MIRROR_VERSION} mirror; refusing to clean a partial document.`
             : "No valid CLM mirror header was found; refusing to clean the file.", beforeTokens);
     }
     if (parsed.snapshot !== mirrorFingerprint(records)) {
@@ -314,20 +314,31 @@ export function removeMirrorBlocks(text, blockIds) {
     }
     return result;
 }
-export function cleanupToolResult(plan, blockIndex) {
+export function cleanupToolResult(plan, blockIndex, copy = "compact") {
     const result = {
         status: plan.status === "applied" ? "applied" : "rejected",
         requestedBlockIds: [...plan.requestedBlockIds],
         removedBlockIds: [...plan.removedBlockIds],
         reason: plan.status === "applied" ? "" : plan.reason ?? "Cleanup was rejected.",
+        copy,
     };
     if (blockIndex)
         result.blockIndex = blockIndex;
     return result;
 }
+/**
+ * Parse the `CLM_CLEANUP_RESULT` environment value. Unknown values fall back
+ * to `compact` so a typo never silently restores the verbose result.
+ */
+export function parseCleanupResultCopy(value) {
+    return value === "full" || value === "none" ? value : "compact";
+}
 export function formatCleanupToolResult(result) {
+    const copy = result.copy ?? "full";
+    if (copy === "none")
+        return "";
     const summary = result.status === "applied"
         ? `cleanup applied; removed block(s): ${result.removedBlockIds.join(", ")}.`
         : `cleanup rejected; ${result.reason}`;
-    return result.blockIndex ? `${summary}\n\n${result.blockIndex}` : summary;
+    return copy === "full" && result.blockIndex ? `${summary}\n\n${result.blockIndex}` : summary;
 }

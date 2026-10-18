@@ -394,21 +394,25 @@ export function applyDshContextEdits(session, plan, records, options) {
  * fresh canonical mirror after the tool result settles.
  */
 export function executeDshCleanup(session, blockIds, options, io, state) {
+    const copy = options.cleanupResult ?? "compact";
     const records = buildDshMirrorRecords(session, options);
     const plan = planCleanup(records, cleanupMirrorForRecords(records), blockIds, { fixedTokens: options.fixedTokens });
     if (plan.status !== "applied") {
-        return cleanupToolResult(plan, renderBlockIndex(records));
+        const index = copy === "full" ? renderBlockIndex(records) : undefined;
+        return cleanupToolResult(plan, index, copy);
     }
     try {
         const mutation = applyDshContextEdits(session, plan, records, options);
         if (mutation.status !== "applied") {
-            return {
+            const index = copy === "full"
+                ? renderBlockIndex(buildDshMirrorRecords(session, options))
+                : undefined;
+            return cleanupToolResult({
                 status: "rejected",
                 requestedBlockIds: [...plan.requestedBlockIds],
                 removedBlockIds: [],
                 reason: mutation.reason ?? "The DSH session rejected the cleanup mutation.",
-                blockIndex: renderBlockIndex(buildDshMirrorRecords(session, options)),
-            };
+            }, index, copy);
         }
         const nextRecords = buildDshMirrorRecords(session, options);
         if (io) {
@@ -428,18 +432,21 @@ export function executeDshCleanup(session, blockIds, options, io, state) {
                 state.lastProcessedMirror = undefined;
             }
         }
-        // Return the post-mutation ordinal space with the tool result. A second
-        // cleanup call in the same step would otherwise use IDs that shifted.
-        return cleanupToolResult(plan, renderBlockIndex(nextRecords));
+        // The refreshed index is re-rendered in every step's runtime context, so
+        // copy it into the tool result only on explicit opt-in.
+        const index = copy === "full" ? renderBlockIndex(nextRecords) : undefined;
+        return cleanupToolResult(plan, index, copy);
     }
     catch (error) {
-        return {
+        const index = copy === "full"
+            ? renderBlockIndex(buildDshMirrorRecords(session, options))
+            : undefined;
+        return cleanupToolResult({
             status: "rejected",
             requestedBlockIds: [...plan.requestedBlockIds],
             removedBlockIds: [],
             reason: `DSH cleanup mutation failed: ${error instanceof Error ? error.message : String(error)}`,
-            blockIndex: renderBlockIndex(buildDshMirrorRecords(session, options)),
-        };
+        }, index, copy);
     }
 }
 /**

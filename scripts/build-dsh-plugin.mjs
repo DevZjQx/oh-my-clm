@@ -20,7 +20,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const defaultOutput = path.join(root, "dsh-clm");
+const defaultOutput = path.join(root, "artifacts");
 const dshRuntimeFiles = [
 	"dist/dsh/index.js",
 	"dist/src/lib/clm-files.js",

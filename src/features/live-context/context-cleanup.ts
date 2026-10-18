@@ -1,4 +1,5 @@
 import {
+	MIRROR_HEADER,
 	MIRROR_VERSION,
 	mirrorFingerprint,
 	estimateMirrorTokens,
@@ -31,6 +32,13 @@ export interface CleanupArgs {
 	blockIds: number[];
 }
 
+/**
+ * How much of a cleanup result survives into the model-visible tool result.
+ * `compact` is the default because the live block index is re-rendered in
+ * every step's runtime context; repeating it in the result only spends tokens.
+ */
+export type CleanupResultCopy = "compact" | "full" | "none";
+
 export interface CleanupToolResult {
 	status: "applied" | "rejected";
 	requestedBlockIds: number[];
@@ -38,6 +46,8 @@ export interface CleanupToolResult {
 	reason: string;
 	/** Fresh block index after the mutation (or the current one on rejection). */
 	blockIndex?: string;
+	/** Copy mode; absent results keep the legacy `full` formatter behavior. */
+	copy?: CleanupResultCopy;
 }
 
 export interface CleanupPlan extends EditPlan {
@@ -150,7 +160,7 @@ export function parseCleanupArgs(value: unknown):
 export function parseCleanupMirror(text: string): CleanupParsedMirror {
 	const normalized = String(text ?? "").replace(/\r\n?/g, "\n");
 	const lines = normalized.split("\n");
-	const version = lines.some((line) => line.trim() === `<!-- ${MIRROR_VERSION} -->`) ? MIRROR_VERSION : undefined;
+	const version = lines.some((line) => line.trim() === MIRROR_HEADER) ? MIRROR_VERSION : undefined;
 	const snapshot = lines.map((line) => line.trim().match(SNAPSHOT_PATTERN)?.[1]).find(Boolean);
 	const blocks = new Map<string, { role: string }>();
 	const duplicateIds: string[] = [];
@@ -220,7 +230,7 @@ function validateMirrorForCleanup(
 		return rejectPlan(
 			requestedBlockIds,
 			parsed.malformed
-				? "Malformed pi-clm-v2 mirror; refusing to clean a partial document."
+				? `Malformed ${MIRROR_VERSION} mirror; refusing to clean a partial document.`
 				: "No valid CLM mirror header was found; refusing to clean the file.",
 			beforeTokens,
 		);
@@ -424,21 +434,33 @@ export function removeMirrorBlocks(text: string, blockIds: readonly number[]): s
 export function cleanupToolResult(
 	plan: Pick<CleanupPlan, "status" | "requestedBlockIds" | "removedBlockIds" | "reason">,
 	blockIndex?: string,
+	copy: CleanupResultCopy = "compact",
 ): CleanupToolResult {
 	const result: CleanupToolResult = {
 		status: plan.status === "applied" ? "applied" : "rejected",
 		requestedBlockIds: [...plan.requestedBlockIds],
 		removedBlockIds: [...plan.removedBlockIds],
 		reason: plan.status === "applied" ? "" : plan.reason ?? "Cleanup was rejected.",
+		copy,
 	};
 	if (blockIndex) result.blockIndex = blockIndex;
 	return result;
 }
 
+/**
+ * Parse the `CLM_CLEANUP_RESULT` environment value. Unknown values fall back
+ * to `compact` so a typo never silently restores the verbose result.
+ */
+export function parseCleanupResultCopy(value: string | undefined): CleanupResultCopy {
+	return value === "full" || value === "none" ? value : "compact";
+}
+
 export function formatCleanupToolResult(result: CleanupToolResult): string {
+	const copy = result.copy ?? "full";
+	if (copy === "none") return "";
 	const summary = result.status === "applied"
 		? `cleanup applied; removed block(s): ${result.removedBlockIds.join(", ")}.`
 		: `cleanup rejected; ${result.reason}`;
-	return result.blockIndex ? `${summary}\n\n${result.blockIndex}` : summary;
+	return copy === "full" && result.blockIndex ? `${summary}\n\n${result.blockIndex}` : summary;
 }
 

@@ -34,7 +34,7 @@ oh-my-clm
 │   ├── project-structure.md     # 本文
 │   └── reports                  # 历史验证报告 + 报告说明
 ├── dist                         # tsc 构建产物（随仓库提交）
-├── dsh-clm                      # DSH tgz 输出目录（构建生成，gitignore）
+├── artifacts                    # DSH tgz 输出目录（构建生成，gitignore）
 ├── dsh-plugin.json              # DSH Community v0.15 manifest
 ├── cordis.patch.yml             # 官方 bundle 安装层
 └── package.json
@@ -96,7 +96,7 @@ Pi 和 DSH 都通过固定路径发现入口：`package.json` 的 `pi.extensions
 | 目录 | 内容 | 是否提交 |
 | --- | --- | --- |
 | `dist/` | `tsc -p tsconfig.dsh.json` 的构建产物，DSH 运行时直接加载 | 提交 |
-| `dsh-clm/` | `scripts/build-dsh-plugin.mjs` 生成的插件 tgz | 不提交（gitignore） |
+| `artifacts/` | `scripts/build-dsh-plugin.mjs` 生成的插件 tgz | 不提交（gitignore） |
 | `docs/reports/` | 历史验证报告及其说明 | 提交 |
 | `/tmp/clm-<sessionId>/` | 运行时 live mirror，不属于仓库 | 不提交 |
 

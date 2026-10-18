@@ -280,7 +280,7 @@ test("turn_end replaces a tool result that read the live mirror", async () => {
 				{
 					role: "toolResult",
 					toolCallId: "self-read",
-					content: [{ type: "text", text: "<!-- pi-clm-v2 -->\\n[[CLM_ENTRY id=old role=assistant]]" }],
+					content: [{ type: "text", text: "<!-- clm-v2 -->\\n[[CLM_ENTRY id=old role=assistant]]" }],
 					isError: false,
 				},
 			],

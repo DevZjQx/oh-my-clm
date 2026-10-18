@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import { CLM_MIRROR_FILENAME, CLM_TEMP_ROOT, sessionMirrorPath, } from "../src/lib/clm-paths.js";
 import { writePrivateText } from "../src/lib/clm-files.js";
 import { dshOpenTurnStep, executeDshCleanup, reconcileDshMirror, renderDshBlockIndex, } from "../src/features/live-context/dsh-bridge.js";
-import { formatCleanupToolResult, parseCleanupArgs, } from "../src/features/live-context/context-cleanup.js";
+import { formatCleanupToolResult, parseCleanupArgs, parseCleanupResultCopy, } from "../src/features/live-context/context-cleanup.js";
 export const name = "oh-my-clm";
 const PROMPT_SECTION = "oh-my-clm:live-context";
 const BLOCK_INDEX_CONTEXT = "oh-my-clm:block-index";
@@ -27,7 +27,7 @@ function promptText() {
     return `<oh-my-clm-dsh-live-context>
 The DSH bridge mirrors the current session surface to \`${mirrorTemplate}\`.
 - The live runtime context includes an \`<oh-my-clm-block-index>\` with 1-based IDs, roles, and short previews for the first and last 40 editable blocks; when the list is longer, the middle ID range is summarized. Choose cleanup IDs from that index; you do not need to read LIVE_CTX_MAIN.md just to discover IDs or identify a block.
-- Use the registered \`cleanup({ blockIds: [...] })\` tool for stale, redundant, or self-referential blocks; it works by ID, preserves load-bearing block 1, and does not read truncated bodies. Its result includes the refreshed block index.
+- Use the registered \`cleanup({ blockIds: [...] })\` tool for stale, redundant, or self-referential blocks; it works by ID, preserves load-bearing block 1, and does not read truncated bodies. By default the result is a one-line confirmation; the refreshed block index already appears in each step's runtime context. Set CLM_CLEANUP_RESULT=full to append the refreshed index, or =none to suppress the result text.
 - Read LIVE_CTX_MAIN.md only when you need the full, untruncated body for a rewrite. Edit only the bodies of existing CLM_ENTRY blocks; keep the protocol header, CLM_SNAPSHOT, IDs, roles, and closing markers unchanged.
 - Shorten an existing block or delete it to request omitting stale history. Keep CLM_EMPTY when deleting every editable block.
 - The initial user task is protected. User-authored blocks may be omitted but cannot be rewritten.
@@ -50,6 +50,7 @@ function optionsFor(session) {
         maxBlockChars: positiveEnv("CLM_MAX_BLOCK_CHARS", 12_000),
         maxMirrorChars: positiveEnv("CLM_MAX_MIRROR_CHARS", 96_000),
         fixedTokens: positiveEnv("CLM_CONTEXT_FIXED_TOKENS", 0),
+        cleanupResult: parseCleanupResultCopy(process.env.CLM_CLEANUP_RESULT),
     };
 }
 /**

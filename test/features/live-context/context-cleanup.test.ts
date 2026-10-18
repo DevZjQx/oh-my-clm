@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	cleanupToolResult,
 	formatCleanupToolResult,
 	parseCleanupArgs,
 	parseCleanupMirror,
+	parseCleanupResultCopy,
 	planCleanup,
 	removeMirrorBlocks,
 } from "../../../src/features/live-context/context-cleanup.ts";
@@ -60,7 +62,7 @@ test("cleanup validates IDs and removes whole spans without reconstructing bodie
 	assert.deepEqual(plan.omittedIds, ["stale-answer", "self-read"]);
 
 	const cleaned = removeMirrorBlocks(mirror, plan.removedBlockIds);
-	assert.match(cleaned, /^<!-- pi-clm-v2 -->/);
+	assert.match(cleaned, /^<!-- clm-v2 -->/);
 	assert.match(cleaned, /CLM_SNAPSHOT/);
 	assert.match(cleaned, /CLM_ENTRY id=1 role=assistant/);
 	assert.match(cleaned, /Load-bearing block one\./);
@@ -169,4 +171,24 @@ test("cleanup refuses to remove a paired owner when block 1 must remain", () => 
 	const plan = planCleanup(records, parseCleanupMirror(renderMirror(records)), [2]);
 	assert.equal(plan.status, "rejected");
 	assert.match(plan.reason ?? "", /block 1|paired/i);
+});
+
+test("cleanup result formatting honors compact, full, and none copies", () => {
+	const plan = {
+		status: "applied" as const,
+		requestedBlockIds: [2],
+		removedBlockIds: [2],
+		reason: "",
+	};
+	const compact = cleanupToolResult(plan, "1. assistant: anchor");
+	assert.equal(compact.copy, "compact");
+	assert.equal(formatCleanupToolResult(compact), "cleanup applied; removed block(s): 2.");
+	const full = cleanupToolResult(plan, "1. assistant: anchor", "full");
+	assert.equal(formatCleanupToolResult(full), "cleanup applied; removed block(s): 2.\n\n1. assistant: anchor");
+	const none = cleanupToolResult(plan, "1. assistant: anchor", "none");
+	assert.equal(formatCleanupToolResult(none), "");
+	assert.equal(parseCleanupResultCopy(undefined), "compact");
+	assert.equal(parseCleanupResultCopy("full"), "full");
+	assert.equal(parseCleanupResultCopy("none"), "none");
+	assert.equal(parseCleanupResultCopy("verbose"), "compact");
 });

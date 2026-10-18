@@ -73,7 +73,7 @@ Pi context_edit entry
 cleanup({ "blockIds": [2, 3, 4] })
 ```
 
-该工具在一次调用内读取当前 host 状态、按 block ID 完成删除并在返回前写完结果；它不依赖正文，也不会因为 preview 截断而构造错误的 `old_string`。load-bearing block 1、协议头和 `CLM_SNAPSHOT` 保留；assistant/tool-result 配对会一起处理。
+该工具在一次调用内读取当前 host 状态、按 block ID 完成删除并在返回前写完结果；它不依赖正文，也不会因为 preview 截断而构造错误的 `old_string`。load-bearing block 1、协议头和 `CLM_SNAPSHOT` 保留；assistant/tool-result 配对会一起处理。默认情况下工具结果只有一行确认，因为刷新后的 block index 已经在下一步的 runtime context 中重渲染；设置 `CLM_CLEANUP_RESULT=full` 可在结果后附带索引，`none` 则不向模型返回结果文本。工具调用和结果事件本身仍完整保留在 session surface 中。
 
 DSH bridge 还会把当前可编辑 block 的索引放进模型可见的 runtime context：
 
@@ -133,10 +133,10 @@ DSH 的 `Session` surface 是由官方框架从已提交事件增量投影出来
 
 ## 3. Mirror 文件格式
 
-当前协议版本为 `pi-clm-v2`：
+当前协议版本为 `clm-v2`（宿主中立，Pi 与 DSH 共用）：
 
 ```markdown
-<!-- pi-clm-v2 -->
+<!-- clm-v2 -->
 <!-- CLM_SNAPSHOT 6e4c2a1f8b7d9012 -->
 <!-- Edit block bodies only. Keep CLM_ENTRY and closing markers intact. -->
 <!-- id is the editable block's ordinal; do not change it or reorder blocks. -->
@@ -154,7 +154,7 @@ DSH 的 `Session` surface 是由官方框架从已提交事件增量投影出来
 
 ### Header 和 snapshot
 
-- `pi-clm-v2` 是协议版本；
+- `clm-v2` 是协议版本；它是文件格式版本，不是宿主标识，宿主差异由入口、system prompt 标记和各自的原生应用语义承担；
 - `CLM_SNAPSHOT` 是 canonical records 的 SHA-256 前缀；
 - snapshot 用于检测 mirror 刷新后的竞态或过期文件，失配时拒绝编辑而不是把整份文件当作删除。
 

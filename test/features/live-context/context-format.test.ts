@@ -275,6 +275,17 @@ test("a stale snapshot is rejected before any omission is planned", () => {
 	assert.match(plan.reason ?? "", /stale/i);
 });
 
+test("the legacy pi-clm-v2 header is not recognized", () => {
+	const legacy = renderMirror(records).replace("<!-- clm-v2 -->", "<!-- pi-clm-v2 -->");
+	const parsed = parseMirror(legacy);
+	assert.equal(parsed.recognized, false);
+	assert.equal(parsed.version, undefined);
+	assert.equal(parsed.malformed, false);
+	const plan = planContextEdits(records, parsed);
+	assert.equal(plan.status, "rejected");
+	assert.match(plan.reason ?? "", /No valid CLM mirror header/);
+});
+
 test("a self-referential tool result gets a compact mirror preview", () => {
 	const projected = buildMirrorRecords([
 		{
@@ -283,7 +294,7 @@ test("a self-referential tool result gets a compact mirror preview", () => {
 		},
 		{
 			sourceEntry: { id: "self", type: "message" },
-			messages: [{ role: "toolResult", content: [{ type: "text", text: "<!-- pi-clm-v2 -->\\n[[CLM_ENTRY id=old role=assistant]]" }] }],
+			messages: [{ role: "toolResult", content: [{ type: "text", text: "<!-- clm-v2 -->\\n[[CLM_ENTRY id=old role=assistant]]" }] }],
 		},
 	], { mirrorPath: "/tmp/clm-test-session/LIVE_CTX_MAIN.md" });
 	assert.match(projected[1]?.renderText ?? "", /Self-referential/);

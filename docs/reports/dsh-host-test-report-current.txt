@@ -56,10 +56,11 @@ node:  v26.11.1
 
 == 5b. direct cleanup tool ==
   PASS  defineTool rejects malformed numeric IDs before execute
+  PASS  cleanup result copy is compact by default
   PASS  cleanup returns an applied canonical result
   PASS  cleanup removes the selected active-surface block
   PASS  cleanup writes the canonical mirror before tool return
-  PASS  cleanup result returns the refreshed block index
+  PASS  cleanup result returns the refreshed block index when full copy is enabled
   PASS  cleanup omission uses the open turn
   PASS  cleanup omission uses the open step
   PASS  cleanup does not write a second artifact
@@ -121,7 +122,7 @@ node:  v26.11.1
   PASS  host listeners are removed on dispose
   PASS  tool registration is removed on dispose
 
-94 passed, 0 failed, 1 observation(s)
+95 passed, 0 failed, 1 observation(s)
 
 observations (measured behaviour, not asserted contract):
   - agent.id/session.id mismatch: session/event sync is silently skipped when agent.id !== session.id; DSH enforces equality so this is unreachable in-product
