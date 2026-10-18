@@ -87,7 +87,7 @@ When the list is longer, this index shows the first 40 and last 40 blocks and su
 </oh-my-clm-block-index>
 ```
 
-索引使用与 `cleanup` 完全相同的 1-based ordinal，并附带 role 和单行短 preview，因此模型不需要为了确认“哪个 ID 对应哪段内容”而读取 mirror。列表超过 80 个 block 时，只显示头部 40 个和尾部 40 个，中间用一行 `... N editable block(s) omitted ... (IDs A-B)` 标出区间；这样长会话仍能看到最新 block 的 ID，同时避免索引无限增长。`cleanup` 的 tool result 也会返回执行后的新索引，避免同一步内连续清理时继续使用已经移位的旧 ID。只有需要完整、未截断的正文做 rewrite 时，才需要打开 mirror。
+索引使用与 `cleanup` 完全相同的 1-based ordinal，并附带 role 和单行短 preview，因此模型不需要为了确认“哪个 ID 对应哪段内容”而读取 mirror。列表超过 80 个 block 时，只显示头部 40 个和尾部 40 个，中间用一行 `... N editable block(s) omitted ... (IDs A-B)` 标出区间；这样长会话仍能看到最新 block 的 ID，同时避免索引无限增长。`cleanup` 的 tool result 也会返回执行后的新索引，避免同一步内连续清理时继续使用已经移位的旧 ID。索引末尾固定附一条 `cleanup` 使用纪律（Pi 侧放在 system prompt 里）：把要删的 ID 合并在**一次**调用里，因为删完会重新编号；tool-call block 必须和它的配对结果一起删；优先清理 assistant/tool-result 噪声而不是 user turn；拿不准的 ID 留到下次——少删一个 block 只花窗口，删错一个要花正确性。只有需要完整、未截断的正文做 rewrite 时，才需要打开 mirror。
 
 需要改写时，模型可以使用一次短 rewrite 脚本完成 read+write；普通 edit 只适用于完整、未截断的 body。模型只能修改已有 block 的 body 或删除已有 block，不能通过添加 block 注入新的上下文消息。ID 是当前 mirror 中从 `1` 开始的可读编辑序号；扩展内部仍映射到 Pi 的 opaque entry ID。
 

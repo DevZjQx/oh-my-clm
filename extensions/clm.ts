@@ -12,6 +12,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	buildMirrorRecords,
+	CLEANUP_DISCIPLINE,
 	DEFAULT_MAX_BLOCK_CHARS,
 	DEFAULT_MAX_MIRROR_CHARS,
 	estimateMessageTokens,
@@ -167,6 +168,7 @@ When old conversation turns become noise, manage your own Pi context through \`$
 - The file uses blocks like \`[[CLM_ENTRY id=1 role=assistant]]\` followed by a matching \`[[/CLM_ENTRY id=1]]\`; the id is an editable ordinal. Keep both markers exactly as written and do not reorder blocks.
 - Keep the \`CLM_SNAPSHOT\` line and protocol comments intact. It prevents stale edits from changing a newer projection.
 - Use the registered \`cleanup({ blockIds: [...] })\` tool for stale, redundant, or self-referential blocks; it works by ID, preserves load-bearing block 1, and does not read truncated bodies.
+- ${CLEANUP_DISCIPLINE}
 - For a \`rewrite\`, use one host-side script that completes its read and write before returning; preserve the protocol header, \`CLM_SNAPSHOT\`, and block 1.
 - For an \`edit\`, change the smallest necessary existing block body to a short, faithful summary only when the complete old body is available; never use a truncated preview as \`old_string\`.
 - Delete an editable block to omit stale history. To delete the last editable block, leave the \`<!-- CLM_EMPTY -->\` marker.
@@ -256,7 +258,7 @@ const state: {
 const cleanupParameters = Type.Object({
 	blockIds: Type.Array(
 		Type.Integer({ minimum: 1 }),
-		{ minItems: 1, uniqueItems: true, description: "1-based editable block IDs; block 1 is always preserved." },
+		{ minItems: 1, uniqueItems: true, description: "1-based editable block IDs, batched into one call because IDs renumber after each removal; block 1 is always preserved." },
 	),
 }, { additionalProperties: false });
 
@@ -418,6 +420,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use cleanup({ blockIds: [...] }) to remove stale blocks by ID.",
 			"Block 1 is load-bearing and is always preserved.",
+			"Pass every target in one call; cleanup renumbers IDs after each removal.",
 			"Cleanup is sequential and completes its host-side mirror write before returning.",
 		],
 		parameters: cleanupParameters,

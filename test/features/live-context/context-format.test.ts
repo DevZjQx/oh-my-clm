@@ -298,6 +298,8 @@ test("block index exposes the same 1-based IDs as the mirror without protected b
 	assert.match(index, /\n3\. user: Keep the important repository fact\./);
 	assert.doesNotMatch(index, /Build a context editor\./);
 	assert.match(index, /cleanup\(\{ blockIds:/);
+	assert.match(index, /Batch every removal into one cleanup call/);
+	assert.match(index, /Delete a tool-call block together with its paired result/);
 	assert.match(index, /Block 1 is load-bearing/);
 });
 

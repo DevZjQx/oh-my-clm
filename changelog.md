@@ -4,6 +4,10 @@
 
 ## 未发布（内部结构整理）
 
+### 新增
+
+- **`cleanup` 使用纪律进入模型可见上下文。** 新增导出常量 `CLEANUP_DISCIPLINE`（`src/features/live-context/context-format.ts`），同时用于 DSH 的 `<oh-my-clm-block-index>` 末尾和 Pi 的 system prompt，避免两侧措辞漂移。内容只有两条可机械执行的规则：把要删的 ID 合并在一次调用里（删完会重新编号，不要用旧 ID 连续调用）；tool-call block 与配对结果一起删、优先清理 assistant/tool-result 噪声而不是 user turn、拿不准的 ID 留到下次。两个 host 的 `blockIds` 参数说明也补上“一次调用传完”的提示。索引净增约一行。
+
 ### 调整
 
 - **源码改为 `src/lib` + `src/features/live-context` 两层。** 共享的 mirror 文件写入和路径解析移到 `src/lib`；mirror 协议、cleanup 和 DSH bridge 移入 `src/features/live-context`；Pi/DSH 入口路径保持不变。

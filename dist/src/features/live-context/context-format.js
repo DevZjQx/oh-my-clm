@@ -2,6 +2,17 @@ import { createHash } from "node:crypto";
 export const MIRROR_VERSION = "pi-clm-v2";
 export const DEFAULT_MAX_BLOCK_CHARS = 12_000;
 export const DEFAULT_MAX_MIRROR_CHARS = 96_000;
+/**
+ * The single cleanup habit that is both the most useful and the least likely to
+ * remove something load-bearing. It is deliberately mechanical rather than
+ * judgment-based, because the failure mode is a wrong ID, not a wrong opinion:
+ * batch every target into one call (IDs renumber after each removal), name the
+ * block by an identity the model can verify, and treat a skipped block as far
+ * cheaper than a guessed one. Kept as one string so the Pi prompt, the DSH
+ * block index, and the tool descriptions cannot drift apart.
+ */
+export const CLEANUP_DISCIPLINE = "Batch every removal into one cleanup call using only IDs you can positively identify — IDs renumber after each removal, so never chain calls on stale IDs. " +
+    "Delete a tool-call block together with its paired result, prefer assistant/tool-result noise over user turns, and leave any uncertain ID for a later pass: an unremoved block costs window, a wrong one costs correctness.";
 const EMPTY_MARKER = "<!-- CLM_EMPTY -->";
 const SNAPSHOT_PATTERN = /^<!-- CLM_SNAPSHOT ([a-f0-9]{16}) -->$/;
 const BLOCK_START_PATTERN = /^\[\[CLM_ENTRY\s+id=([^\s\]]+)\s+role=([^\s\]]+)\]\]$/;
@@ -232,7 +243,8 @@ export function renderBlockIndex(records, options = {}) {
         `When the list is longer, this index shows the first ${headCount} and last ${tailCount} blocks and summarizes the omitted ID range.`,
         ...lines,
         "Call cleanup({ blockIds: [...] }) with these 1-based IDs to omit stale blocks.",
-        "Block 1 is load-bearing and is always preserved. IDs renumber after a cleanup or another block removal, so use the latest index.",
+        CLEANUP_DISCIPLINE,
+        "Block 1 is load-bearing and is always preserved.",
         "The protected initial task has no block ID and is not listed.",
         "</oh-my-clm-block-index>",
     ].join("\n");

@@ -82,7 +82,7 @@ const cleanupParameters = {
         blockIds: {
             type: "array",
             items: { type: "integer" },
-            description: "1-based editable block IDs from the live block index; IDs must be positive and unique; block 1 is always preserved.",
+            description: "1-based editable block IDs from the live block index; pass every target in one call (IDs renumber after each removal); IDs must be positive and unique; block 1 is always preserved.",
         },
     },
     required: ["blockIds"],
