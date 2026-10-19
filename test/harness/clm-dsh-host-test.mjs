@@ -282,7 +282,13 @@ section("2. system prompt section");
 	check("runtime block index context registered exactly once", host.contexts.length === 1, `got ${host.contexts.length}`);
 	check("runtime block index context name", host.contexts[0]?.name === "oh-my-clm:block-index", String(host.contexts[0]?.name));
 	check("runtime block index context sorts after host policy", host.contexts[0]?.order === 200, String(host.contexts[0]?.order));
+	// The production default is the turn digest; the per-block listing is the
+	// fallback shape, so render it explicitly instead of depending on the default.
+	const previousIndexMode = process.env.CLM_INDEX_MODE;
+	process.env.CLM_INDEX_MODE = "blocks";
 	const blockIndex = typeof host.contexts[0]?.text === "function" ? host.contexts[0].text({ agent }) : "";
+	if (previousIndexMode === undefined) delete process.env.CLM_INDEX_MODE;
+	else process.env.CLM_INDEX_MODE = previousIndexMode;
 	check("block index lists editable 1-based IDs", blockIndex.includes("1. assistant:") && blockIndex.includes("3. assistant:"), blockIndex);
 	check("block index excludes the protected initial task", !blockIndex.includes("PROTECTED INITIAL TASK"), blockIndex);
 	check("section tells the model to use the runtime block index", typeof sectionValue.text === "string" && sectionValue.text.includes("<oh-my-clm-block-index>"));
@@ -386,7 +392,13 @@ section("5b. direct cleanup tool");
 	// declared output schema; compact mode is visible through the absent index.
 	check("cleanup result copy is compact by default", rejected?.status === "rejected" && rejected.blockIndex === undefined && !("copy" in rejected), JSON.stringify(rejected));
 	process.env.CLM_CLEANUP_RESULT = "full";
+	// The refreshed index in `full` copy must be the per-block listing, which is
+	// the fallback shape; the default digest lists turns instead of blocks.
+	const previousIndexMode = process.env.CLM_INDEX_MODE;
+	process.env.CLM_INDEX_MODE = "blocks";
 	const result = await cleanupTool.execute({ blockIds: [3] }, { agent: { session } });
+	if (previousIndexMode === undefined) delete process.env.CLM_INDEX_MODE;
+	else process.env.CLM_INDEX_MODE = previousIndexMode;
 	delete process.env.CLM_CLEANUP_RESULT;
 	check("cleanup returns an applied canonical result", result?.status === "applied", JSON.stringify(result));
 	check("cleanup removes the selected active-surface block", session.surfaceSeq.join(",") === "0,3,4,8", session.surfaceSeq.join(","));

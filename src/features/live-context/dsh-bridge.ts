@@ -2,6 +2,7 @@ import { CLM_MIRROR_FILENAME } from "../../lib/clm-paths.ts";
 import {
 	cleanupMirrorForRecords,
 	cleanupToolResult,
+	describeCleanupList,
 	planCleanup,
 	type CleanupArgs,
 	type CleanupResultCopy,
@@ -636,6 +637,14 @@ export function executeDshCleanup(
 ): CleanupToolResult {
 	const copy: CleanupResultCopy = options.cleanupResult ?? "compact";
 	const records = buildDshMirrorRecords(session, options);
+	const listTarget = Array.isArray(targets) ? undefined : (targets as CleanupArgs).list;
+	if (listTarget) {
+		// Read-only drill-down: the rows of a range the index only named. It does
+		// not touch the surface, the mirror, or the cached index text.
+		return describeCleanupList(records, listTarget, {
+			maxPreviewChars: options.blockIndex?.maxPreviewChars,
+		});
+	}
 	const plan = planCleanup(records, cleanupMirrorForRecords(records), targets, { fixedTokens: options.fixedTokens });
 	if (plan.status !== "applied") {
 		const index = copy === "full" ? renderDshBlockIndex(session, options) : undefined;

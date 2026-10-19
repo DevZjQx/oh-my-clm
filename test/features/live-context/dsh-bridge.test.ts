@@ -240,6 +240,28 @@ test("DSH cleanup removes selected blocks directly from the active surface", () 
 	assert.match(pairedResult.reason, /block 1|paired/i);
 });
 
+test("DSH cleanup list returns rows and leaves the surface and mirror untouched", () => {
+	const session = dshSession();
+	const files = new MemoryFiles();
+	const options = bridgeOptions(String(session.id));
+	const before = [...session.surface.nodes];
+	const listed = executeDshCleanup(
+		session,
+		{ blockIds: [], explicitIds: [], rangedIds: [], skipRoles: [], list: { start: 1, end: 3 } },
+		options,
+		files,
+	);
+	assert.equal(listed.status, "listed");
+	assert.deepEqual(listed.removedBlockIds, []);
+	assert.match(listed.rows ?? "", /^<oh-my-clm-block-list>\nRead-only rows for IDs 1-3; nothing was removed\.\n/);
+	assert.match(listed.rows ?? "", /\n1\. assistant: I inspected the repository/);
+	assert.match(listed.rows ?? "", /\n3\. user: Keep this later request\./);
+	assert.deepEqual(session.surface.nodes, before);
+	// A listing answers from the projection, so it does not even create the mirror.
+	assert.equal(files.readText(options.mirrorPath), undefined);
+	assert.equal(formatCleanupToolResult(listed, "none"), listed.rows);
+});
+
 test("DSH cleanup result copy is compact by default with opt-in full and none", () => {
 	const compactSession = dshSession();
 	const compact = executeDshCleanup(compactSession, [3], bridgeOptions(String(compactSession.id)));
@@ -303,13 +325,14 @@ test("DSH block index honors the compact host options", () => {
 	const session = dshSession("/workspace/index-options", "dsh-index-options");
 	const options = {
 		...bridgeOptions(String(session.id)),
-		blockIndex: { maxPreviewChars: 24, headBlocks: 1, middleBlocks: 1 },
+		blockIndex: { maxPreviewChars: 24, headBlocks: 1, tailBlocks: 1 },
 	};
 	const index = renderDshBlockIndex(session, options);
 	assert.match(index, /\n1\. assistant: I inspected the repo/);
-	assert.match(index, /\n2\. toolResult:/);
-	assert.doesNotMatch(index, /\n3\. user: Keep this later request\./);
-	assert.doesNotMatch(index, /omitted from this index/);
+	// The tail window keeps the newest block; the gap between is named.
+	assert.match(index, /\n3\. user: Keep this later request\./);
+	assert.doesNotMatch(index, /\n2\. toolResult:/);
+	assert.match(index, /\.\.\. 1 editable block\(s\) omitted \(ID 2\)\./);
 });
 
 test("DSH block index refreshes every N steps and invalidates after cleanup", () => {
@@ -648,6 +671,18 @@ test("DSH cleanup tool value passes the declared output schema", async () => {
 		assert.deepEqual(validateJsonSchemaValue(tool.output.schema, full.value, "value"), []);
 		const fullText = full.rendered[0]?.text ?? "";
 		assert.match(fullText, /^cleanup applied; removed 1 block\(s\): 3\.\n\n<oh-my-clm-block-index>/);
+
+		// A read-only listing is a distinct status with its own payload, and it
+		// must pass the same declared schema.
+		delete process.env.CLM_CLEANUP_RESULT;
+		const listSession = dshSession(cwd, "dsh-output-tool-list");
+		const listArgs = { list: "1-3" };
+		const listed = await tool.execute(listArgs, { agent: { session: listSession } });
+		assert.equal(listed.status, "listed");
+		assert.deepEqual(validateJsonSchemaValue(tool.output.schema, listed, "value"), []);
+		const listedText = tool.output.render(listArgs, listed)[0]?.text ?? "";
+		assert.match(listedText, /^<oh-my-clm-block-list>\nRead-only rows for IDs 1-3; nothing was removed\./);
+		assert.deepEqual(listSession.surface.nodes, [0, 1, 2, 3, 4]);
 	} finally {
 		if (previous === undefined) delete process.env.CLM_CLEANUP_RESULT;
 		else process.env.CLM_CLEANUP_RESULT = previous;

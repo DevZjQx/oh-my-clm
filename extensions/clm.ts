@@ -29,6 +29,7 @@ import {
 import { writePrivateText } from "../src/lib/clm-files.ts";
 import {
 	cleanupToolResult,
+	describeCleanupList,
 	formatCleanupToolResult,
 	parseCleanupArgs,
 	parseCleanupMirror,
@@ -167,7 +168,7 @@ function promptAppendix(ctx: ExtensionContext): string {
 When old conversation turns become noise, manage your own Pi context through \`${filePath}\`.
 - The file uses blocks like \`[[CLM_ENTRY id=1 role=assistant]]\` followed by a matching \`[[/CLM_ENTRY id=1]]\`; the id is an editable ordinal. Keep both markers exactly as written and do not reorder blocks.
 - Keep the \`CLM_SNAPSHOT\` line and protocol comments intact. It prevents stale edits from changing a newer projection.
-- Use the registered \`cleanup({ blockIds: [...] })\` tool for stale, redundant, or self-referential blocks; it works by ID, preserves load-bearing block 1, and does not read truncated bodies.
+- Use the registered \`cleanup({ blockIds: [...] })\` tool for stale, redundant, or self-referential blocks; it works by ID, preserves load-bearing block 1, and does not read truncated bodies. \`cleanup({ list: \"A-B\" })\` is read-only: it returns the rows of a range (role and short preview) so you can inspect before deleting.
 - ${CLEANUP_DISCIPLINE}
 - For a \`rewrite\`, use one host-side script that completes its read and write before returning; preserve the protocol header, \`CLM_SNAPSHOT\`, and block 1.
 - For an \`edit\`, change the smallest necessary existing block body to a short, faithful summary only when the complete old body is available; never use a truncated preview as \`old_string\`.
@@ -268,14 +269,19 @@ const cleanupParameters = Type.Object({
 		Type.Union([Type.Literal("user"), Type.Literal("assistant"), Type.Literal("toolResult"), Type.Literal("custom")]),
 		{ uniqueItems: true, description: "Roles to keep even when a requested range covers them; use [\"user\"] to drop a turn's tool noise but keep the human message." },
 	)),
+	list: Type.Optional(Type.String({
+		pattern: "^\\d+(\\s*-\\s*\\d+)?$",
+		description: "Read-only: return the rows of this inclusive ID range (\"3-16\" or \"42\") without removing anything. Use it to inspect a range before deleting it. Cannot be combined with blockIds, ranges, or skipRoles.",
+	})),
 }, { additionalProperties: false });
 
 const cleanupOutputSchema = Type.Object({
-	status: Type.Union([Type.Literal("applied"), Type.Literal("rejected")]),
+	status: Type.Union([Type.Literal("applied"), Type.Literal("rejected"), Type.Literal("listed")]),
 	requestedBlockIds: Type.Array(Type.Integer({ minimum: 1 })),
 	removedBlockIds: Type.Array(Type.Integer({ minimum: 1 })),
 	pairedRemovalIds: Type.Array(Type.Integer({ minimum: 1 })),
 	reason: Type.String(),
+	rows: Type.Optional(Type.String()),
 }, { additionalProperties: false });
 
 function rejectedCleanupResult(requestedBlockIds: readonly number[], reason: string): CleanupToolResult {
@@ -293,15 +299,19 @@ function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolRe
 	if (!parsedArgs.ok) return rejectedCleanupResult([], parsedArgs.reason);
 
 	const filePath = mirrorPath(ctx);
-	const text = readText(filePath);
-	if (text === undefined) return rejectedCleanupResult(parsedArgs.args.blockIds, `The live mirror is unavailable at ${filePath}.`);
-
 	const settings = config();
 	const records = buildMirrorRecords(getProjection(ctx).entries, {
 		mirrorPath: filePath,
 		maxBlockChars: settings.maxBlockChars,
 		maxMirrorChars: settings.maxMirrorChars,
 	});
+	// A listing is answered from the projection and never touches the mirror, so
+	// it works even while the mirror file is missing or stale.
+	if (parsedArgs.args.list) return describeCleanupList(records, parsedArgs.args.list);
+
+	const text = readText(filePath);
+	if (text === undefined) return rejectedCleanupResult(parsedArgs.args.blockIds, `The live mirror is unavailable at ${filePath}.`);
+
 	const plan = planCleanup(
 		records,
 		parseCleanupMirror(text),
@@ -425,10 +435,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "cleanup",
 		label: "Cleanup context",
-		description: "Remove stale CLM context blocks by ID without reading or reconstructing their bodies.",
+		description: "Remove stale CLM context blocks by ID without reading or reconstructing their bodies, or list the rows of an ID range (read-only) to identify targets.",
 		promptSnippet: "Remove stale context blocks by ID",
 		promptGuidelines: [
 			"Use cleanup({ ranges: [\"A-B\"] }) for a whole turn, or cleanup({ blockIds: [...] }) for individual blocks.",
+			"Use cleanup({ list: \"A-B\" }) to read the rows of a range without removing anything; it cannot be combined with removal targets.",
 			"Block 1 is load-bearing and is always preserved.",
 			"Pass every target in one call; cleanup renumbers IDs after each removal. Paired tool results are reported separately.",
 			"Cleanup is sequential and completes its host-side mirror write before returning.",
@@ -462,6 +473,7 @@ export default function (pi: ExtensionAPI) {
 					removedBlockIds: result.removedBlockIds,
 					pairedRemovalIds: result.pairedRemovalIds,
 					reason: result.reason,
+					...(result.rows === undefined ? {} : { rows: result.rows }),
 				},
 				isError: result.status === "rejected",
 			};

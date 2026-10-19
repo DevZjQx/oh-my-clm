@@ -19,8 +19,8 @@ import {
 import {
 	CLEANUP_DISCIPLINE,
 	DEFAULT_BLOCK_INDEX_HEAD,
-	DEFAULT_BLOCK_INDEX_MIDDLE,
 	DEFAULT_BLOCK_INDEX_PREVIEW_CHARS,
+	DEFAULT_BLOCK_INDEX_TAIL,
 	DEFAULT_DIGEST_MAX_LINES,
 	estimateMirrorTokens,
 	renderMirror,
@@ -134,7 +134,7 @@ function indexMode(): "blocks" | "digest" {
  * names the actual layout.
  */
 function indexContract(refreshSteps: number): string {
-	return `The live runtime context includes an \`<oh-my-clm-block-index>\` with 1-based cleanup IDs. It lists either individual blocks or one line per completed turn (inclusive ID ranges with an estimated token cost). The turn still in progress may appear only as a start anchor (\`IDs N..\`) and is not a safe cleanup target while its tool pairs may still be settling. The index is refreshed immediately after a cleanup or mirror edit and at most every ${refreshSteps} step(s) otherwise, so blocks created since the last refresh may only be discoverable by reading LIVE_CTX_MAIN.md.`;
+	return `The live runtime context includes an \`<oh-my-clm-block-index>\` with 1-based cleanup IDs. It lists either individual blocks or one line per completed turn (inclusive ID ranges with an estimated token cost), always as a head run plus a recency run, and names every unlisted stretch with an omission line giving its ID range. The turn still in progress may appear only as a start anchor (\`IDs N..\`) and is not a safe cleanup target while its tool pairs may still be settling. The index is refreshed immediately after a cleanup or mirror edit and at most every ${refreshSteps} step(s) otherwise, so blocks created since the last refresh are not listed. When a range is only named by an omission line, read its rows with \`cleanup({ list: "A-B" })\` instead of opening the mirror.`;
 }
 
 function promptText(): string {
@@ -145,7 +145,7 @@ The DSH bridge mirrors the current session surface to \`${mirrorTemplate}\`.
 - ${indexContract(refreshSteps)}
 - ${CLEANUP_DISCIPLINE}
 - Block 1 is load-bearing and is always preserved. The protected initial task has no block ID and is not listed.
-- Use the registered \`cleanup\` tool for stale, redundant, or self-referential blocks: \`cleanup({ ranges: [\"3-16\"] })\` removes a whole turn, \`cleanup({ blockIds: [...] })\` removes individual blocks, and \`skipRoles: [\"user\"]\` keeps human messages inside a range. It works by ID and does not read truncated bodies; paired tool results are removed with their owner and reported separately. By default the result is a one-line confirmation; the refreshed index appears after the next refresh. Set CLM_CLEANUP_RESULT=full to append the refreshed index immediately, or =none to suppress the result text.
+- Use the registered \`cleanup\` tool for stale, redundant, or self-referential blocks: \`cleanup({ ranges: [\"3-16\"] })\` removes a whole turn, \`cleanup({ blockIds: [...] })\` removes individual blocks, and \`skipRoles: [\"user\"]\` keeps human messages inside a range. \`cleanup({ list: \"3-16\" })\` is read-only: it returns the rows of that range and changes nothing, which is how you inspect a range the index named but did not list. It works by ID and does not read truncated bodies; paired tool results are removed with their owner and reported separately. By default the result is a one-line confirmation; the refreshed index appears after the next refresh. Set CLM_CLEANUP_RESULT=full to append the refreshed index immediately, or =none to suppress the result text.
 - Read LIVE_CTX_MAIN.md only when you need the full, untruncated body for a rewrite. Edit only the bodies of existing CLM_ENTRY blocks; keep the protocol header, CLM_SNAPSHOT, IDs, roles, and closing markers unchanged.
 - Shorten an existing block or delete it to request omitting stale history. Keep CLM_EMPTY when deleting every editable block.
 - The initial user task is protected. User-authored blocks may be omitted but cannot be rewritten.
@@ -181,7 +181,9 @@ function optionsFor(session: DshSessionLike): DshBridgeOptions {
 		blockIndex: {
 			maxPreviewChars: positiveEnv("CLM_INDEX_PREVIEW", DEFAULT_BLOCK_INDEX_PREVIEW_CHARS),
 			headBlocks: positiveEnv("CLM_INDEX_HEAD", DEFAULT_BLOCK_INDEX_HEAD),
-			middleBlocks: positiveEnv("CLM_INDEX_MIDDLE", DEFAULT_BLOCK_INDEX_MIDDLE),
+			// `CLM_INDEX_MIDDLE` is the pre-rename knob; it is honoured as a
+			// fallback so an existing profile keeps its override.
+			tailBlocks: positiveEnv("CLM_INDEX_TAIL", positiveEnv("CLM_INDEX_MIDDLE", DEFAULT_BLOCK_INDEX_TAIL)),
 			maxLines: positiveEnv("CLM_INDEX_LINES", DEFAULT_DIGEST_MAX_LINES),
 		},
 	};
@@ -236,6 +238,10 @@ const cleanupParameters = {
 			items: { type: "string", enum: ["user", "assistant", "toolResult", "custom"] },
 			description: "Roles to keep even when a requested range covers them; use [\"user\"] to drop a turn's tool noise but keep the human message.",
 		},
+		list: {
+			type: "string",
+			description: "Read-only: return the rows of this inclusive ID range (\"3-16\" or \"42\") without removing anything. Use it to inspect a range the index named but did not list. Cannot be combined with blockIds, ranges, or skipRoles.",
+		},
 	},
 	additionalProperties: false,
 } as const;
@@ -249,12 +255,13 @@ const cleanupParameters = {
 const cleanupOutputSchema = {
 	type: "object",
 	properties: {
-		status: { type: "string", enum: ["applied", "rejected"] },
+		status: { type: "string", enum: ["applied", "rejected", "listed"] },
 		requestedBlockIds: { type: "array", items: { type: "integer" } },
 		removedBlockIds: { type: "array", items: { type: "integer" } },
 		pairedRemovalIds: { type: "array", items: { type: "integer" } },
 		reason: { type: "string" },
 		blockIndex: { type: "string" },
+		rows: { type: "string" },
 	},
 	required: ["status", "requestedBlockIds", "removedBlockIds", "pairedRemovalIds", "reason"],
 	additionalProperties: false,
@@ -263,7 +270,7 @@ const cleanupOutputSchema = {
 function createDshCleanupTool(getState: (sessionId: string) => DshBridgeState | undefined) {
 	return {
 		name: "cleanup",
-		description: "Remove stale CLM context blocks by ID range or by individual ID from the live block index without reading or reconstructing their bodies.",
+		description: "Remove stale CLM context blocks by ID range or by individual ID from the live block index without reading or reconstructing their bodies, or list the rows of a range (read-only) to identify targets the index only named.",
 		parameters: cleanupParameters,
 		output: {
 			schema: cleanupOutputSchema,

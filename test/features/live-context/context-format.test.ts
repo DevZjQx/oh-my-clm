@@ -11,6 +11,7 @@ import {
 	planContextEdits,
 	renderBlockDigest,
 	renderBlockIndex,
+	renderBlockList,
 	renderMirror,
 	type MirrorRecord,
 } from "../../../src/features/live-context/context-format.ts";
@@ -332,7 +333,7 @@ test("block index previews are single-line and bounded", () => {
 	assert.match(previewLine, /…$/);
 });
 
-test("the block index shows the first 40 plus a 25-block window at the midpoint", () => {
+test("the block index lists the head plus the most recent blocks", () => {
 	const many: MirrorRecord[] = Array.from({ length: 200 }, (_, index) => ({
 		id: `block-${index + 1}`,
 		role: "assistant",
@@ -344,16 +345,19 @@ test("the block index shows the first 40 plus a 25-block window at the midpoint"
 	const listed = index.split("\n");
 	const at = (line: string) => listed.findIndex((value) => value === line);
 	assert.ok(at("1. assistant: content 1") >= 0);
-	assert.ok(at("88. assistant: content 88") > at("40. assistant: content 40"));
-	assert.ok(at("112. assistant: content 112") > at("88. assistant: content 88"));
-	// Both skipped runs are named, so an ID jump is never mistaken for a gap.
-	assert.equal(at("... 47 editable block(s) omitted (IDs 41-87)."), at("40. assistant: content 40") + 1);
-	assert.equal(at("... 88 editable block(s) omitted (IDs 113-200)."), at("112. assistant: content 112") + 1);
-	// 65 listed blocks, 2 omission lines, 2 wrapper lines, 1 caption line.
-	assert.equal(listed.length, 70);
+	assert.ok(at("12. assistant: content 12") > 0);
+	// Recency gets the budget: the trailing window is the last 40 blocks.
+	assert.ok(at("161. assistant: content 161") > at("12. assistant: content 12"));
+	assert.ok(at("200. assistant: content 200") > at("161. assistant: content 161"));
+	assert.doesNotMatch(index, /\n13\. assistant:/);
+	assert.doesNotMatch(index, /\n160\. assistant:/);
+	// The one skipped run is named, so an ID jump is never mistaken for a gap.
+	assert.equal(at("... 148 editable block(s) omitted (IDs 13-160)."), at("12. assistant: content 12") + 1);
+	// 52 listed blocks, 1 omission line, 2 wrapper lines, 1 caption line.
+	assert.equal(listed.length, 56);
 });
 
-test("the centered middle window slides to sit after the head on a short session", () => {
+test("the tail window covers the last blocks of a longer session", () => {
 	const many: MirrorRecord[] = Array.from({ length: 80 }, (_, index) => ({
 		id: `block-${index + 1}`,
 		role: "assistant",
@@ -362,16 +366,16 @@ test("the centered middle window slides to sit after the head on a short session
 		toolCallIds: [],
 	}));
 	const index = renderBlockIndex(many, { maxPreviewChars: 32 });
-	assert.match(index, /\n40\. assistant: content 40\n/);
+	assert.match(index, /\n12\. assistant: content 12\n/);
+	assert.doesNotMatch(index, /\n13\. assistant:/);
+	assert.match(index, /\n\.\.\. 28 editable block\(s\) omitted \(IDs 13-40\)\.\n/);
 	assert.match(index, /\n41\. assistant: content 41\n/);
-	assert.match(index, /\n65\. assistant: content 65\n/);
-	assert.doesNotMatch(index, /\n66\. assistant:/);
-	// The window abuts the head, so only the tail needs an omission line.
-	assert.doesNotMatch(index, /omitted \(IDs 41-/);
-	assert.match(index, /\n\.\.\. 15 editable block\(s\) omitted \(IDs 66-80\)\.\n/);
+	assert.match(index, /\n80\. assistant: content 80\n/);
+	// The window reaches the end, so no second omission line is needed.
+	assert.doesNotMatch(index, /omitted \(IDs 81-/);
 });
 
-test("the block index head and middle stay configurable", () => {
+test("the block index head and tail stay configurable", () => {
 	const many: MirrorRecord[] = Array.from({ length: 120 }, (_, index) => ({
 		id: `block-${index + 1}`,
 		role: "assistant",
@@ -379,10 +383,12 @@ test("the block index head and middle stay configurable", () => {
 		protected: false,
 		toolCallIds: [],
 	}));
-	const index = renderBlockIndex(many, { maxPreviewChars: 32, headBlocks: 40, middleBlocks: 40 });
-	assert.match(index, /\n80\. assistant: content 80\n/);
-	assert.doesNotMatch(index, /\n81\. assistant:/);
-	assert.match(index, /\n\.\.\. 40 editable block\(s\) omitted \(IDs 81-120\)\.\n/);
+	const index = renderBlockIndex(many, { maxPreviewChars: 32, headBlocks: 5, tailBlocks: 10 });
+	assert.match(index, /\n5\. assistant: content 5\n/);
+	assert.doesNotMatch(index, /\n6\. assistant:/);
+	assert.match(index, /\n\.\.\. 105 editable block\(s\) omitted \(IDs 6-110\)\.\n/);
+	assert.match(index, /\n111\. assistant: content 111\n/);
+	assert.match(index, /\n120\. assistant: content 120\n/);
 });
 
 test("the block index adds no omission line when every block is listed", () => {
@@ -398,7 +404,7 @@ test("the block index adds no omission line when every block is listed", () => {
 	assert.doesNotMatch(index, /omitted/);
 });
 
-test("the block index names everything it omits when the middle window is disabled", () => {
+test("the block index names everything it omits when the tail window is disabled", () => {
 	const many: MirrorRecord[] = Array.from({ length: 60 }, (_, index) => ({
 		id: `block-${index + 1}`,
 		role: "assistant",
@@ -406,15 +412,15 @@ test("the block index names everything it omits when the middle window is disabl
 		protected: false,
 		toolCallIds: [],
 	}));
-	const single = renderBlockIndex(many, { maxPreviewChars: 32, headBlocks: 10, middleBlocks: 0 });
+	const single = renderBlockIndex(many, { maxPreviewChars: 32, headBlocks: 10, tailBlocks: 0 });
 	assert.match(single, /\n\.\.\. 50 editable block\(s\) omitted \(IDs 11-60\)\.\n/);
-	const none = renderBlockIndex(many, { maxPreviewChars: 32, headBlocks: 0, middleBlocks: 0 });
+	const none = renderBlockIndex(many, { maxPreviewChars: 32, headBlocks: 0, tailBlocks: 0 });
 	assert.match(none, /\n\.\.\. 60 editable block\(s\) omitted \(IDs 1-60\)\.\n/);
 	assert.doesNotMatch(none, /\n1\. assistant:/);
 });
 
 test("a single omitted block gets a singular ID in the omission line", () => {
-	const many: MirrorRecord[] = Array.from({ length: 66 }, (_, index) => ({
+	const many: MirrorRecord[] = Array.from({ length: 53 }, (_, index) => ({
 		id: `block-${index + 1}`,
 		role: "assistant",
 		text: `content ${index + 1}`,
@@ -422,8 +428,8 @@ test("a single omitted block gets a singular ID in the omission line", () => {
 		toolCallIds: [],
 	}));
 	const index = renderBlockIndex(many, { maxPreviewChars: 32 });
-	assert.match(index, /\n\.\.\. 1 editable block\(s\) omitted \(ID 66\)\.\n/);
-	assert.doesNotMatch(index, /ID 66-66/);
+	assert.match(index, /\n\.\.\. 1 editable block\(s\) omitted \(ID 13\)\.\n/);
+	assert.doesNotMatch(index, /ID 13-13/);
 });
 
 test("the block index preview defaults to 64 characters", () => {
@@ -442,6 +448,60 @@ test("the block index preview defaults to 64 characters", () => {
 
 test("the block index is empty when every block is protected", () => {
 	assert.equal(renderBlockIndex([records[0]!]), "");
+});
+
+const listRecords: MirrorRecord[] = [
+	{ id: "task", role: "user", text: "Protected task.", protected: true, toolCallIds: [] },
+	{ id: "a1", role: "assistant", text: "First block.", protected: false, toolCallIds: [] },
+	{ id: "t1", role: "toolResult", text: "Second block.", protected: false, toolCallIds: [] },
+	{ id: "u2", role: "user", text: "Third block.", protected: false, toolCallIds: [] },
+	{ id: "a2", role: "assistant", text: "Fourth block.", protected: false, toolCallIds: [] },
+];
+
+test("the block list returns read-only rows for one range", () => {
+	const listed = renderBlockList(listRecords, { start: 2, end: 4 }, { maxPreviewChars: 24 });
+	assert.ok(listed.ok);
+	if (!listed.ok) return;
+	assert.match(listed.text, /^<oh-my-clm-block-list>\nRead-only rows for IDs 2-4; nothing was removed\.\n/);
+	assert.match(listed.text, /\n2\. toolResult: Second block\.\n/);
+	assert.match(listed.text, /\n3\. user: Third block\.\n/);
+	assert.match(listed.text, /\n4\. assistant: Fourth block\.\n/);
+	assert.match(listed.text, /\n<\/oh-my-clm-block-list>$/);
+});
+
+test("the block list clamps the range and rejects a start past the end", () => {
+	const clamped = renderBlockList(listRecords, { start: 2, end: 999 });
+	assert.ok(clamped.ok);
+	if (!clamped.ok) return;
+	assert.match(clamped.text, /Read-only rows for IDs 2-4;/);
+	const past = renderBlockList(listRecords, { start: 9, end: 12 });
+	assert.equal(past.ok, false);
+	if (past.ok) return;
+	assert.match(past.reason, /last ID 4/);
+	const empty = renderBlockList([listRecords[0]!], { start: 1, end: 2 });
+	assert.equal(empty.ok, false);
+});
+
+test("the block list truncates by character budget and names the next range", () => {
+	const many: MirrorRecord[] = Array.from({ length: 40 }, (_, index) => ({
+		id: `block-${index + 1}`,
+		role: "assistant",
+		text: `content ${index + 1} ${"x".repeat(40)}`,
+		protected: false,
+		toolCallIds: [],
+	}));
+	const listed = renderBlockList(many, { start: 1, end: 40 }, { maxPreviewChars: 64, maxChars: 600 });
+	assert.ok(listed.ok);
+	if (!listed.ok) return;
+	assert.match(listed.text, /^<oh-my-clm-block-list>\nRead-only rows for IDs 1-40; nothing was removed\.\n/);
+	const rows = [...listed.text.matchAll(/^(\d+)\. assistant: /gm)].map((match) => Number(match[1]));
+	assert.ok(rows.length > 0 && rows.length < 40, `listed ${rows.length} rows`);
+	assert.deepEqual(rows, Array.from({ length: rows.length }, (_, index) => index + 1));
+	const last = rows[rows.length - 1]!;
+	assert.match(
+		listed.text,
+		new RegExp(`\\.\\.\\. ${40 - last} more block\\(s\\); call cleanup\\(\\{ list: "${last + 1}-40" \\}\\) to continue\\.`),
+	);
 });
 
 const digestRecords: MirrorRecord[] = [
@@ -517,6 +577,49 @@ test("block digest caps listed turns and names the omitted ID range", () => {
 	assert.doesNotMatch(digest, /turn 30/);
 	assert.ok(lines.some((line) => /^\.\.\. \d+ editable block\(s\) omitted \(IDs \d+-\d+\)\.$/.test(line)));
 	assert.match(digest, /IDs 118\.\. \(current turn, not listed\): turn 60/);
+});
+
+function rankedDigestRecords(): MirrorRecord[] {
+	const many: MirrorRecord[] = [];
+	for (let turn = 1; turn <= 60; turn += 1) {
+		many.push({
+			id: `u${turn}`,
+			role: "user",
+			text: `turn ${turn}`,
+			protected: turn === 1,
+			toolCallIds: [],
+		});
+		many.push({
+			id: `a${turn}`,
+			role: "assistant",
+			text: turn === 30 ? "x".repeat(2_000) : `answer ${turn}`,
+			protected: false,
+			toolCallIds: [],
+		});
+	}
+	return many;
+}
+
+test("block digest names the largest omitted turns by cost", () => {
+	const digest = renderBlockDigest(rankedDigestRecords(), { maxLines: 6 });
+	// Turn 30 is omitted by the cap and is by far the most expensive stretch, so
+	// the summary names it first: that is the range worth reclaiming.
+	assert.match(digest, /\n\.\.\. largest omitted turns: 58-59 \(\d+(?:\.\d+)?k? tok\), /);
+	assert.match(digest, /58-59 \([\d.]+k? tok\)[^\n]*\.\n/);
+});
+
+test("block digest omits the ranking line when every turn is listed", () => {
+	assert.doesNotMatch(renderBlockDigest(digestRecords), /largest omitted turns/);
+});
+
+test("the digest ranking line stays byte-stable while a turn appends", () => {
+	const many = rankedDigestRecords();
+	const first = renderBlockDigest(many, { maxLines: 6 });
+	const withNoise: MirrorRecord[] = [
+		...many,
+		{ id: "a61", role: "assistant", text: "Still working.", protected: false, toolCallIds: [] },
+	];
+	assert.equal(renderBlockDigest(withNoise, { maxLines: 6 }), first);
 });
 
 test("block digest stays useful when the only editable blocks are the live run", () => {

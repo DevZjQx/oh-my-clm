@@ -13,14 +13,27 @@ export const DEFAULT_MAX_MIRROR_CHARS = 96_000;
  * host's stable system-prompt section, not in this per-step payload.
  */
 export const DEFAULT_BLOCK_INDEX_PREVIEW_CHARS = 64;
-export const DEFAULT_BLOCK_INDEX_HEAD = 40;
 /**
- * Size of the middle window. The window is centered on the session midpoint, so
- * 200 editable blocks with this default list 88-112: the head covers 1-40, and
- * blocks 41-87 plus 113-200 stay out of the index but are named by omission
- * lines giving their ID ranges.
+ * Head rows are the "do not touch" anchor: the opening task and the first
+ * exchange, which a cleanup almost never targets. The budget that is left over
+ * goes to the trailing window, where stale-but-still-remembered noise (the
+ * actual cleanup surface) accumulates.
  */
-export const DEFAULT_BLOCK_INDEX_MIDDLE = 25;
+export const DEFAULT_BLOCK_INDEX_HEAD = 12;
+/**
+ * Width of the trailing block window. Blocks between the head and this window
+ * are named by an omission line giving their ID range, so a jump in the listed
+ * IDs is never ambiguous and the last listed ID is not mistaken for the last
+ * block.
+ */
+export const DEFAULT_BLOCK_INDEX_TAIL = 40;
+/**
+ * Character budget for one `cleanup({ list: "A-B" })` response. A listing is a
+ * drill-down, not a second mirror: it must stay cheaper than the index itself,
+ * and a truncated listing names the range that continues it instead of leaving a
+ * silently partial view.
+ */
+export const DEFAULT_BLOCK_LIST_CHARS = 6_000;
 
 /**
  * The single cleanup habit that is both the most useful and the least likely to
@@ -34,7 +47,8 @@ export const DEFAULT_BLOCK_INDEX_MIDDLE = 25;
 export const CLEANUP_DISCIPLINE =
 	"Batch every removal into one cleanup call using only IDs you can positively identify — IDs renumber after each removal, so never chain calls on stale IDs. " +
 	"Prefer one inclusive range per turn (`cleanup({ ranges: [\"3-16\"] })`) over a long list of individual IDs, and add `skipRoles: [\"user\"]` when a range should drop the tool noise but keep the human message. " +
-	"Delete a tool-call block together with its paired result, prefer assistant/tool-result noise over user turns, and leave any uncertain ID for a later pass: an unremoved block costs window, a wrong one costs correctness.";
+	"Delete a tool-call block together with its paired result, prefer assistant/tool-result noise over user turns, and leave any uncertain ID for a later pass: an unremoved block costs window, a wrong one costs correctness. " +
+	"If you are unsure what an unlisted range contains, read it with `cleanup({ list: \"A-B\" })` instead of guessing: guessing costs correctness, listing costs one cheap call.";
 
 const EMPTY_MARKER = "<!-- CLM_EMPTY -->";
 const SNAPSHOT_PATTERN = /^<!-- CLM_SNAPSHOT ([a-f0-9]{16}) -->$/;
@@ -317,12 +331,8 @@ export interface BlockIndexOptions {
 	maxPreviewChars?: number;
 	/** Number of leading editable blocks listed in the index. */
 	headBlocks?: number;
-	/**
-	 * Size of the window centered on the session midpoint. It is slid forward so
-	 * it starts after the head and never runs past the last block; blocks outside
-	 * the head and this window are not listed.
-	 */
-	middleBlocks?: number;
+	/** Width of the trailing block window listed in the index. */
+	tailBlocks?: number;
 	/** Digest mode: maximum listed turns before older ones collapse. */
 	maxLines?: number;
 }
@@ -343,18 +353,19 @@ function blockPreview(text: string, maxChars: number): string {
  * rewrite still has to read the full body from the mirror. Protected blocks are
  * excluded because they have no cleanup ID and are never editable.
  *
- * Only the dynamic payload lives here. The cleanup discipline, the head/middle
+ * Only the dynamic payload lives here. The cleanup discipline, the head/tail
  * rule, the load-bearing note, and the refresh cadence belong to the host's
  * stable system-prompt section so they are cached once instead of repeated in
  * every runtime-context snapshot.
  *
- * The index lists two runs: the first `headBlocks` editable blocks, then a
- * window of `middleBlocks` centered on the session midpoint. Every block left
- * out of those runs is accounted for by an omission line naming its ID range, so
- * a jump in the listed IDs is never ambiguous and the end of the list is never
- * mistaken for the end of the session. With the defaults, 200 editable blocks
- * list 1-40, an omission line for 41-87, 88-112, and an omission line for
- * 113-200.
+ * The index lists two runs: the first `headBlocks` editable blocks and the last
+ * `tailBlocks`. Recency gets the larger budget because the trailing blocks are
+ * the ones the model still remembers producing; the head is only the "do not
+ * touch" anchor. Every block left between the runs is accounted for by an
+ * omission line naming its ID range, so a jump in the listed IDs is never
+ * ambiguous and the end of the list is never mistaken for the end of the
+ * session. With the defaults, 200 editable blocks list 1-12, an omission line
+ * for 13-160, and 161-200.
  */
 export function renderBlockIndex(
 	records: readonly MirrorRecord[],
@@ -365,7 +376,7 @@ export function renderBlockIndex(
 	const displayIds = editableDisplayIds(records);
 	const maxPreviewChars = Math.max(24, Math.floor(options.maxPreviewChars ?? DEFAULT_BLOCK_INDEX_PREVIEW_CHARS));
 	const headCount = Math.max(0, Math.floor(options.headBlocks ?? DEFAULT_BLOCK_INDEX_HEAD));
-	const middleCount = Math.max(0, Math.floor(options.middleBlocks ?? DEFAULT_BLOCK_INDEX_MIDDLE));
+	const tailCount = Math.max(0, Math.floor(options.tailBlocks ?? DEFAULT_BLOCK_INDEX_TAIL));
 	const lineFor = (record: MirrorRecord): string => {
 		const blockId = displayIds.get(record.id) ?? record.id;
 		return `${blockId}. ${record.role}: ${blockPreview(record.text, maxPreviewChars)}`;
@@ -386,38 +397,96 @@ export function renderBlockIndex(
 	};
 	const headEnd = Math.min(editable.length, headCount);
 	appendRun(1, headEnd);
-	const middle = selectMiddleWindow(editable.length, headEnd, middleCount);
-	if (middle) {
-		appendOmittedRun(headEnd + 1, middle.start - 1);
-		appendRun(middle.start, middle.end);
-		appendOmittedRun(middle.end + 1, editable.length);
+	const tail = selectTailWindow(editable.length, headEnd, tailCount);
+	if (tail) {
+		appendOmittedRun(headEnd + 1, tail.start - 1);
+		appendRun(tail.start, tail.end);
 	} else {
 		appendOmittedRun(headEnd + 1, editable.length);
 	}
 	return [
 		"<oh-my-clm-block-index>",
-		"Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them.",
+		"Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them, cleanup({ list: \"A-B\" }) to read a range's rows.",
 		...lines,
 		"</oh-my-clm-block-index>",
 	].join("\n");
 }
 
 /**
- * Pick the 1-based middle window: `count` consecutive blocks centered on the
- * session midpoint, slid forward when centering would overlap the head and slid
- * back when it would run past the last block. Returns undefined when there is
- * nothing left to list after the head.
+ * Pick the 1-based trailing window: the last `count` blocks, never overlapping
+ * the head. Returns undefined when there is nothing left to list after it.
  */
-export function selectMiddleWindow(
+export function selectTailWindow(
 	total: number,
 	headEnd: number,
 	count: number,
 ): { start: number; end: number } | undefined {
 	if (count <= 0 || headEnd >= total) return undefined;
 	const span = Math.min(count, total - headEnd);
-	const centered = Math.floor(total / 2) - Math.floor(span / 2);
-	const start = Math.max(headEnd + 1, Math.min(centered, total - span + 1));
-	return { start, end: start + span - 1 };
+	return { start: total - span + 1, end: total };
+}
+
+export interface BlockListOptions {
+	/** Maximum characters of one block preview shown per row. */
+	maxPreviewChars?: number;
+	/** Character budget for the complete listing, including header and footer. */
+	maxChars?: number;
+}
+
+export type BlockListResult =
+	| { ok: true; text: string }
+	| { ok: false; reason: string };
+
+/**
+ * Render the read-only rows of one ID range: the drill-down a model needs when
+ * the index only named a gap. The budget is characters rather than rows so one
+ * tool result stays cheaper than the index itself; when it truncates, the footer
+ * names the exact range that continues the listing, so a partial view can never
+ * be mistaken for the whole range.
+ */
+export function renderBlockList(
+	records: readonly MirrorRecord[],
+	range: { start: number; end: number },
+	options: BlockListOptions = {},
+): BlockListResult {
+	const editable = records.filter((record) => !record.protected);
+	if (editable.length === 0) {
+		return { ok: false, reason: "The editable context is empty; there are no block rows to list." };
+	}
+	const start = Math.max(1, Math.floor(range.start));
+	const end = Math.min(editable.length, Math.floor(range.end));
+	if (start > editable.length) {
+		return {
+			ok: false,
+			reason: `IDs ${range.start}-${range.end} start past the end of the editable surface (last ID ${editable.length}).`,
+		};
+	}
+	const maxPreviewChars = Math.max(24, Math.floor(options.maxPreviewChars ?? DEFAULT_BLOCK_INDEX_PREVIEW_CHARS));
+	const maxChars = Math.max(240, Math.floor(options.maxChars ?? DEFAULT_BLOCK_LIST_CHARS));
+	const header = `Read-only rows for IDs ${start}-${end}; nothing was removed.`;
+	const footer = (next: number): string => {
+		const remaining = end - next + 1;
+		return `... ${remaining} more block(s); call cleanup({ list: "${next}-${end}" }) to continue.`;
+	};
+	const lines = [header];
+	let used = header.length;
+	let last = start - 1;
+	for (let blockId = start; blockId <= end; blockId += 1) {
+		const record = editable[blockId - 1]!;
+		const line = `${blockId}. ${record.role}: ${blockPreview(record.text, maxPreviewChars)}`;
+		// Reserve the continuation footer before admitting a row, so the cut is
+		// always explicit and the follow-up range is already named.
+		const reserved = blockId < end ? footer(blockId + 1).length + 1 : 0;
+		if (blockId > start && used + line.length + 1 + reserved > maxChars) break;
+		lines.push(line);
+		used += line.length + 1;
+		last = blockId;
+	}
+	if (last < end) lines.push(footer(last + 1));
+	return {
+		ok: true,
+		text: ["<oh-my-clm-block-list>", ...lines, "</oh-my-clm-block-list>"].join("\n"),
+	};
 }
 
 export interface BlockDigestOptions {
@@ -553,15 +622,38 @@ export function renderBlockDigest(
 	const selected = visible.length <= maxLines
 		? visible
 		: [...visible.slice(0, head), ...visible.slice(visible.length - tail)];
+	// When turns are collapsed, name the biggest of them by cost: reclaimable size
+	// is the quantity a cleanup decision actually needs, and the collapsed middle
+	// is exactly where the model cannot compute it from its own transcript. The
+	// line only reads completed units, so it stays byte-stable inside a turn.
+	const shown = new Set(selected);
+	const hidden = visible.filter((unit) => !shown.has(unit));
+	const rankedHidden = [...hidden].sort((a, b) => unitTokens(b) - unitTokens(a)).slice(0, 3);
+	const hiddenLine = rankedHidden.length === 0
+		? undefined
+		: `... largest omitted turns: ${rankedHidden.map((unit) => {
+			const where = unit.start === unit.end ? `${unit.start}` : `${unit.start}-${unit.end}`;
+			return `${where} (${compactTokens(unitTokens(unit))})`;
+		}).join(", ")}.`;
+	let hiddenNamed = false;
+	const emitHiddenLine = (): void => {
+		if (hiddenNamed || !hiddenLine) return;
+		hiddenNamed = true;
+		lines.push(hiddenLine);
+	};
 	let previousEnd = 0;
 	for (const unit of selected) {
-		if (unit.start > previousEnd + 1) lines.push(omittedLine(previousEnd + 1, unit.start - 1));
+		if (unit.start > previousEnd + 1) {
+			lines.push(omittedLine(previousEnd + 1, unit.start - 1));
+			emitHiddenLine();
+		}
 		lines.push(lineFor(unit));
 		previousEnd = unit.end;
 	}
 	const lastVisible = visible[visible.length - 1];
 	if (lastVisible && lastVisible.end > previousEnd) {
 		lines.push(omittedLine(previousEnd + 1, lastVisible.end));
+		emitHiddenLine();
 	}
 	if (open) {
 		// Only the start is stable while the turn grows; the end is deliberately
@@ -571,7 +663,7 @@ export function renderBlockDigest(
 
 	return [
 		"<oh-my-clm-block-index>",
-		"Editable blocks by cleanup ID; ranges are inclusive. One line per turn; call cleanup({ ranges: [\"A-B\"] }) or cleanup({ blockIds: [...] }) to omit them.",
+		"Editable blocks by cleanup ID; ranges are inclusive. One line per turn; call cleanup({ ranges: [\"A-B\"] }) to omit a turn, cleanup({ list: \"A-B\" }) to read its rows.",
 		...lines,
 		"</oh-my-clm-block-index>",
 	].join("\n");

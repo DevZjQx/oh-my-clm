@@ -79,11 +79,14 @@ DSH bridge 还会把当前可编辑 block 的索引放进模型可见的 runtime
 
 ```text
 <oh-my-clm-block-index>
-Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them.
+Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them, cleanup({ list: "A-B" }) to read a range's rows.
 1. assistant: I inspected the repository and found a small TypeScript project.
 2. toolResult: A very large command output that is no longer useful.
-... 3 editable block(s) omitted (IDs 3-5).
-6. user: Keep the important repository fact.
+…（1–12 行是开头的“别动”锚点，中间省略）
+... 148 editable block(s) omitted (IDs 13-160).
+161. toolResult: the failing test run from an earlier turn
+…
+200. user: Keep the important repository fact.
 </oh-my-clm-block-index>
 ```
 
@@ -91,20 +94,22 @@ Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them.
 
 ```text
 <oh-my-clm-block-index>
-Editable blocks by cleanup ID; ranges are inclusive. One line per turn; call cleanup({ ranges: ["A-B"] }) or cleanup({ blockIds: [...] }) to omit them.
+Editable blocks by cleanup ID; ranges are inclusive. One line per turn; call cleanup({ ranges: ["A-B"] }) to omit a turn, cleanup({ list: "A-B" }) to read its rows.
 1-2. assistant+toolResult ×2 (35 tok): I inspected the repository and found a small TypeScript project.
 3-4. turn ×2 (17 tok): user (10 tok) + 1 noise: Keep the important repository fact.
 IDs 5.. (current turn, not listed): One more turn.
 </oh-my-clm-block-index>
 ```
 
-两种模式都使用与 `cleanup` 完全相同的 1-based ordinal。`blocks` 模式附带 role 和单行短 preview，默认 preview 64 字符，列前 40 个 block 再加一段以会话中点为中心的 25 块窗口（200 块时是 1–40 和 88–112），未列出的每个连续区间用一行 `... N editable block(s) omitted (IDs A-B).` 标出。
+两种模式都使用与 `cleanup` 完全相同的 1-based ordinal。`blocks` 模式附带 role 和单行短 preview，默认 preview 64 字符，列前 12 个 block（开头任务的“别动”锚点）加**最近 40 个**；中间的连续区间用一行 `... N editable block(s) omitted (IDs A-B).` 标出。预算偏向最近内容，因为清理目标是那里刚产出、模型还记得的 stale tool 噪声；中点附近的 block 既不记得、也不是删除对象，`CLM_INDEX_MIDDLE` 已改名为 `CLM_INDEX_TAIL`（旧名作为回退别名保留）。
 
-`digest` 模式每个已完成 turn 一行：包含式 ID 区间、块数、估算 token 和该 turn 的第一条 user 消息。正在进行的 turn 只给稳定的起始锚点 `IDs N..`，不列出：它还在增长，而且工具对可能尚未结算，本来就不是安全的删除目标。因此摘要文本在一个 turn 内字节不变，DSH 的快照去重会命中，索引只在 turn 边界追加一次。`digest` 模式用 `CLM_INDEX_LINES`（默认 40）限制列出的 turn 数，超出部分用省略行标出。
+`digest` 模式每个已完成 turn 一行：包含式 ID 区间、块数、估算 token 和该 turn 的第一条 user 消息。正在进行的 turn 只给稳定的起始锚点 `IDs N..`，不列出：它还在增长，而且工具对可能尚未结算，本来就不是安全的删除目标。因此摘要文本在一个 turn 内字节不变，DSH 的快照去重会命中，索引只在 turn 边界追加一次。`digest` 模式用 `CLM_INDEX_LINES`（默认 40）限制列出的 turn 数，超出部分用省略行标出；被折叠的 turn 再按估算 token 排序，最多取三个写成一行 `... largest omitted turns: 21-24 (4.1k tok), 31-33 (2.9k tok).`。这一行只读已完成 turn，所以同样在一个 turn 内稳定，它回答的是“看不见的那一段里，哪一段最值得回收”。
 
 `cleanup` 可以直接吃区间：`cleanup({ ranges: ["3-16"] })`、`cleanup({ blockIds: [7] })`，以及 `skipRoles: ["user"]`（在区间里保留人类消息）。显式单块 ID 仍然严格校验；range 越界会夹取，range 覆盖 block 1 时保留 block 1。配对级联删除单独以 `paired` 报告，因此“没请求却被删”的 ID 不会被误读成索引错误。
 
-索引的静态协议（tag 含义、cleanup 使用纪律、block 1 与 protected block 规则）放在系统提示词里，随 system prompt 一起缓存；runtime-context 只携带动态行。`blocks` 模式下同一个 turn 内索引最多每 `CLM_INDEX_REFRESH_STEPS`（默认 4）步重渲染一次；节流按“打开中的 turn + 已关闭 step 数”计数，因为 DSH 在 `agent/pre-step` 渲染索引时下一步的 `step/start` 还没写入（旧 turn/step 键因此从未命中，见 E-027）。追加新 block 不会重编号，所以缓存索引里列出的 ID 始终有效；删除会重编号，`cleanup` 或 mirror edit 生效后会立即清空缓存并重渲染，compaction 事件也会保守失效。`CLM_INDEX_REFRESH_STEPS=1` 恢复每步刷新。只有需要完整、未截断的正文做 rewrite、或需要 turn 内逐块定位时，才需要打开 mirror。
+`cleanup({ list: "3-16" })` 是只读展开：返回该区间的逐块行（role + 短 preview），不做任何删除，也不写 mirror。它是索引的另一半——索引只给区间与体积，看不清省略区间里是什么时用它，而不是打开整个 mirror（不看也能按区间删除：模型本来就在自己的 transcript 里见过这些 turn，digest 提供的是地址）。它不能和 `blockIds`/`ranges`/`skipRoles` 同时出现，避免“边看边删”；单次结果有约 6 KB 的字符预算，被截断时末尾会给出继续读取的区间（`... 65 more block(s); call cleanup({ list: "114-178" }) to continue.`），所以不会有静默的部分视图。
+
+索引的静态协议（tag 含义、cleanup 使用纪律、block 1 与 protected block 规则）放在系统提示词里，随 system prompt 一起缓存；runtime-context 只携带动态行。`blocks` 模式下同一个 turn 内索引最多每 `CLM_INDEX_REFRESH_STEPS`（默认 4）步重渲染一次；节流按“打开中的 turn + 已关闭 step 数”计数，因为 DSH 在 `agent/pre-step` 渲染索引时下一步的 `step/start` 还没写入（旧 turn/step 键因此从未命中，见 E-027）。追加新 block 不会重编号，所以缓存索引里列出的 ID 始终有效；删除会重编号，`cleanup` 或 mirror edit 生效后会立即清空缓存并重渲染，compaction 事件也会保守失效。`CLM_INDEX_REFRESH_STEPS=1` 恢复每步刷新。省略区间内需要逐块定位时先调 `cleanup({ list: "A-B" })`；只有需要完整、未截断的正文做 rewrite 时才需要打开 mirror。
 
 需要改写时，模型可以使用一次短 rewrite 脚本完成 read+write；普通 edit 只适用于完整、未截断的 body。模型只能修改已有 block 的 body 或删除已有 block，不能通过添加 block 注入新的上下文消息。ID 是当前 mirror 中从 `1` 开始的可读编辑序号；扩展内部仍映射到 Pi 的 opaque entry ID。
 

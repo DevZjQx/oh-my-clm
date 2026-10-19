@@ -1,5 +1,5 @@
 import { CLM_MIRROR_FILENAME } from "../../lib/clm-paths.js";
-import { cleanupMirrorForRecords, cleanupToolResult, planCleanup, } from "./context-cleanup.js";
+import { cleanupMirrorForRecords, cleanupToolResult, describeCleanupList, planCleanup, } from "./context-cleanup.js";
 import { buildMirrorRecords, DEFAULT_MAX_BLOCK_CHARS, DEFAULT_MAX_MIRROR_CHARS, estimateMessageTokens, estimateMirrorTokens, mirrorSignature, parseMirror, planContextEdits, renderBlockDigest, renderBlockIndex, renderMirror, } from "./context-format.js";
 /** The DSH-facing mirror filename deliberately matches the Pi adapter. */
 export const DSH_MIRROR_FILENAME = CLM_MIRROR_FILENAME;
@@ -459,6 +459,14 @@ export function applyDshContextEdits(session, plan, records, options) {
 export function executeDshCleanup(session, targets, options, io, state) {
     const copy = options.cleanupResult ?? "compact";
     const records = buildDshMirrorRecords(session, options);
+    const listTarget = Array.isArray(targets) ? undefined : targets.list;
+    if (listTarget) {
+        // Read-only drill-down: the rows of a range the index only named. It does
+        // not touch the surface, the mirror, or the cached index text.
+        return describeCleanupList(records, listTarget, {
+            maxPreviewChars: options.blockIndex?.maxPreviewChars,
+        });
+    }
     const plan = planCleanup(records, cleanupMirrorForRecords(records), targets, { fixedTokens: options.fixedTokens });
     if (plan.status !== "applied") {
         const index = copy === "full" ? renderDshBlockIndex(session, options) : undefined;

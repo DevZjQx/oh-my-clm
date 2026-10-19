@@ -60,9 +60,9 @@ mirror 的结构如下：
 DSH 的 runtime context 会包含 `<oh-my-clm-block-index>`，有两种模式（`CLM_INDEX_MODE`）：
 
 - `digest`（默认）：每个已完成的 turn 一行，给出包含式 ID 区间、块数、估算 token 成本和该 turn 的第一条 user 消息；正在进行的 turn 只给稳定的起始锚点（`IDs N..`），不列出。因为文本在一个 turn 内不变，DSH 只会在 turn 边界追加一条快照，而不是每步一条。
-- `blocks`（`CLM_INDEX_MODE=blocks`）：逐个列出可编辑 block，给出 cleanup 使用的 1-based ID、role 和短 preview。列表较长时只显示前 40 个可编辑 block，再加一段以会话中点为中心的 25 块窗口；head 与窗口之间、窗口之后的每个连续区间都用一行 `... N editable block(s) omitted (IDs A-B).` 标出，所以 ID 跳段不会被误读成空洞。
+- `blocks`（`CLM_INDEX_MODE=blocks`）：逐个列出可编辑 block，给出 cleanup 使用的 1-based ID、role 和短 preview。列表较长时显示前 12 个可编辑 block（“别动”锚点）加**最近 40 个**；两者之间的每个连续区间都用一行 `... N editable block(s) omitted (IDs A-B).` 标出，所以 ID 跳段不会被误读成空洞。
 
-`cleanup` 接受 `ranges: ["3-16"]`（包含式区间）或 `blockIds: [...]`（单块），还可以用 `skipRoles: ["user"]` 在一个 turn 区间里保留人类消息。配对级联删除（assistant tool call 与结果）会单独报告为 `paired`，不会混进你请求的 ID。显式单块 ID 仍然严格校验，range 越界会夹取，range 覆盖 block 1 时保留 block 1。只有需要完整、未截断的正文做 rewrite 时才需要读 mirror。
+`cleanup` 接受 `ranges: ["3-16"]`（包含式区间）或 `blockIds: [...]`（单块），还可以用 `skipRoles: ["user"]` 在一个 turn 区间里保留人类消息。配对级联删除（assistant tool call 与结果）会单独报告为 `paired`，不会混进你请求的 ID。显式单块 ID 仍然严格校验，range 越界会夹取，range 覆盖 block 1 时保留 block 1。`cleanup({ list: "3-16" })` 是只读的展开：返回该区间的行（role + 短 preview），不做任何删除，因此“索引只给了省略行、但我想先看清楚”不需要读整个 mirror；它不能和删除目标同时出现。只有需要完整、未截断的正文做 rewrite 时才需要读 mirror。
 
 ### 分支与持久化
 
@@ -182,9 +182,9 @@ node scripts/build-dsh-plugin.mjs --output ./out/oh-my-clm.tgz
 
 DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 `CLM_CONTEXT_FIXED_TOKENS`；它们只影响 mirror preview 或 shrink-only safety gate 的近似估算，不改变 DSH 的 context window。`CLM_CLEANUP_RESULT` 控制 cleanup 工具结果的拷贝量：默认 `compact` 只返回一行确认（刷新后的 block index 会在下一次索引刷新后出现），`full` 会在结果后附带刷新后的索引，`none` 则不产生结果文本；它只影响模型可见的结果，不改变工具调用记录本身。
 
-Block index 的模式与尺寸开关：`CLM_INDEX_MODE`（`digest` 默认 / `blocks`）、`CLM_INDEX_PREVIEW`（默认 64，preview 字符数）、`CLM_INDEX_HEAD`（默认 40）、`CLM_INDEX_MIDDLE`（默认 25，中点窗口大小）、`CLM_INDEX_LINES`（digest 模式最多列出多少个 turn，默认 40）、`CLM_INDEX_REFRESH_STEPS`（默认 4，同一个 turn 内最多每几步重渲染一次）。
+Block index 的模式与尺寸开关：`CLM_INDEX_MODE`（`digest` 默认 / `blocks`）、`CLM_INDEX_PREVIEW`（默认 64，preview 字符数）、`CLM_INDEX_HEAD`（默认 12）、`CLM_INDEX_TAIL`（默认 40，尾部窗口宽度；旧名 `CLM_INDEX_MIDDLE` 仍作为回退别名读取）、`CLM_INDEX_LINES`（digest 模式最多列出多少个 turn，默认 40）、`CLM_INDEX_REFRESH_STEPS`（默认 4，同一个 turn 内最多每几步重渲染一次）。
 
-`blocks` 模式列两段：前 40 个可编辑 block，再加一段以会话中点为中心的 25 块窗口（200 块时是 88–112）；未列出的每个连续区间都用省略行标出。窗口会整体前移以避免和 head 重叠，也会在末尾收边，因此短会话里它会紧接在 head 后面。`digest` 模式每个已完成 turn 一行，正在进行的 turn 只有锚点，所以文本天然在一个 turn 内稳定。
+`blocks` 模式列两段：前 12 个可编辑 block（开头任务的“别动”锚点）加最近 40 个；中间的连续区间用省略行标出。预算偏向最近内容，因为那里的 stale tool 噪声才是清理目标，而开头几轮通常要保留。`digest` 模式每个已完成 turn 一行，正在进行的 turn 只有锚点，所以文本天然在一个 turn 内稳定；被折叠的 turn 会额外给一行 `... largest omitted turns: A-B (x tok), ...`，直接指出回收窗口最大、却不在列表里的区间。
 
 DSH 只在 runtime-context 快照文本变化时追加新快照，因此节流能减少重复注入；`cleanup` 或 mirror edit 生效后会立即失效并重渲染，设为 `1` 可恢复每步刷新。节流按“打开中的 turn + 已关闭 step 数”计数：DSH 在 `agent/pre-step` 渲染索引，此时下一步的 `step/start` 还没写入，旧的 turn/step 键因此从未命中（E-027）。
 

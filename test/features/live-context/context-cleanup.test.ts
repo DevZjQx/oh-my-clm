@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	cleanupToolResult,
+	describeCleanupList,
 	formatBlockIdRuns,
 	formatCleanupToolResult,
 	parseCleanupArgs,
@@ -320,4 +321,54 @@ test("a range that covers block 1 keeps its paired tool result instead of reject
 	const plan = planCleanup(records, structural, withLater.args);
 	assert.equal(plan.status, "applied");
 	assert.deepEqual(plan.removedBlockIds, [3]);
+});
+
+test("cleanup list is parsed as a read-only range and rejects mixed targets", () => {
+	const parsed = parseCleanupArgs({ list: "4-8" });
+	assert.equal(parsed.ok, true);
+	if (!parsed.ok) return;
+	assert.deepEqual(parsed.args.list, { start: 4, end: 8 });
+	assert.deepEqual(parsed.args.blockIds, []);
+	const single = parseCleanupArgs({ list: "7" });
+	assert.equal(single.ok, true);
+	if (single.ok) assert.deepEqual(single.args.list, { start: 7, end: 7 });
+
+	const mixed = parseCleanupArgs({ list: "4-8", blockIds: [2] });
+	assert.equal(mixed.ok, false);
+	if (!mixed.ok) assert.match(mixed.reason, /read-only/);
+	const mixedRange = parseCleanupArgs({ list: "4-8", ranges: ["1-2"] });
+	assert.equal(mixedRange.ok, false);
+	const bad = parseCleanupArgs({ list: "8-4" });
+	assert.equal(bad.ok, false);
+	if (!bad.ok) assert.match(bad.reason, /ends before it starts/);
+	const notString = parseCleanupArgs({ list: true });
+	assert.equal(notString.ok, false);
+	// Empty companions are tolerated: a schema-driven client may always send them.
+	const empty = parseCleanupArgs({ list: "1-2", blockIds: [], ranges: [], skipRoles: [] });
+	assert.equal(empty.ok, true);
+});
+
+test("cleanup list returns read-only rows and is never planned as a removal", () => {
+	const records = cleanupRecords();
+	const listed = describeCleanupList(records, { start: 2, end: 3 });
+	assert.equal(listed.status, "listed");
+	assert.deepEqual(listed.removedBlockIds, []);
+	assert.match(listed.rows ?? "", /^<oh-my-clm-block-list>\nRead-only rows for IDs 2-3; nothing was removed\.\n/);
+	assert.match(listed.rows ?? "", /\n2\. assistant: A stale answer that should be removed\.\n/);
+	// The listing survives every copy mode: it is the requested content, not a
+	// confirmation that may be suppressed.
+	assert.equal(formatCleanupToolResult(listed, "none"), listed.rows);
+	assert.equal(formatCleanupToolResult(listed, "compact"), listed.rows);
+
+	const structural = parseCleanupMirror(renderMirror(records));
+	const parsed = parseCleanupArgs({ list: "2-3" });
+	assert.equal(parsed.ok, true);
+	if (!parsed.ok) return;
+	const plan = planCleanup(records, structural, parsed.args);
+	assert.equal(plan.status, "rejected");
+	assert.match(plan.reason ?? "", /read-only/);
+
+	const past = describeCleanupList(records, { start: 99, end: 120 });
+	assert.equal(past.status, "rejected");
+	assert.match(past.reason, /last ID 4/);
 });

@@ -3,6 +3,7 @@ import {
 	MIRROR_VERSION,
 	mirrorFingerprint,
 	estimateMirrorTokens,
+	renderBlockList,
 	type ContextEditDraft,
 	type EditPlan,
 	type MirrorRecord,
@@ -38,6 +39,17 @@ export interface CleanupArgs {
 	rangedIds: number[];
 	/** Roles to leave in place even when a requested range covers them. */
 	skipRoles: MirrorRole[];
+	/**
+	 * Read-only drill-down target. `cleanup({ list: "A-B" })` returns the rows of
+	 * that range instead of removing anything, so a model can inspect a gap the
+	 * index only named without opening the full mirror.
+	 */
+	list?: CleanupListTarget;
+}
+
+export interface CleanupListTarget {
+	start: number;
+	end: number;
 }
 
 /** Widest inclusive range a single cleanup call may expand to. */
@@ -53,7 +65,7 @@ const CLEANUP_ROLES: readonly MirrorRole[] = ["user", "assistant", "toolResult",
 export type CleanupResultCopy = "compact" | "full" | "none";
 
 export interface CleanupToolResult {
-	status: "applied" | "rejected";
+	status: "applied" | "rejected" | "listed";
 	requestedBlockIds: number[];
 	removedBlockIds: number[];
 	/** Removed only to keep a tool call/result pair structurally valid. */
@@ -61,6 +73,8 @@ export interface CleanupToolResult {
 	reason: string;
 	/** Fresh block index after the mutation (or the current one on rejection). */
 	blockIndex?: string;
+	/** Read-only rows returned by `cleanup({ list: "A-B" })`; never set on a mutation. */
+	rows?: string;
 	/** Copy mode; absent results keep the legacy `full` formatter behavior. */
 	copy?: CleanupResultCopy;
 }
@@ -163,6 +177,10 @@ function rejectPlan(
  * whole turn (`"3-16"`). The distinction is preserved so a mistyped explicit ID
  * is rejected instead of silently ignored, while a range that runs past the end
  * of the current surface simply clamps.
+ *
+ * A third form, `list: "A-B"`, is read-only. It exists because the index names
+ * gaps by range but cannot show what is inside them, and the model must be able
+ * to inspect a range before deleting it without paying for the whole mirror.
  */
 export function parseCleanupArgs(value: unknown):
 	| { ok: true; args: CleanupArgs }
@@ -171,7 +189,7 @@ export function parseCleanupArgs(value: unknown):
 		return { ok: false, reason: "cleanup requires { blockIds: number[] } and/or { ranges: string[] }." };
 	}
 	const unknownKeys = Object.keys(value).filter((key) =>
-		key !== "blockIds" && key !== "ranges" && key !== "skipRoles",
+		key !== "blockIds" && key !== "ranges" && key !== "skipRoles" && key !== "list",
 	);
 	if (unknownKeys.length > 0) {
 		return { ok: false, reason: `cleanup does not accept unknown field(s): ${unknownKeys.join(", ")}.` };
@@ -187,6 +205,38 @@ export function parseCleanupArgs(value: unknown):
 	}
 	if (!Array.isArray(rawSkipRoles)) {
 		return { ok: false, reason: "cleanup skipRoles must be an array of roles." };
+	}
+
+	const rawList = value.list;
+	let list: CleanupListTarget | undefined;
+	if (rawList !== undefined) {
+		if (typeof rawList !== "string") {
+			return { ok: false, reason: "cleanup list must be a range string such as \"3-16\"." };
+		}
+		const match = rawList.trim().match(RANGE_PATTERN);
+		if (!match) {
+			return { ok: false, reason: `cleanup list "${rawList}" must be "A-B" or "A".` };
+		}
+		const start = Number(match[1]);
+		const end = match[2] === undefined ? start : Number(match[2]);
+		if (!positiveSafeInteger(start) || !positiveSafeInteger(end)) {
+			return { ok: false, reason: `cleanup list "${rawList}" must use positive safe integers.` };
+		}
+		if (end < start) {
+			return { ok: false, reason: `cleanup list "${rawList}" ends before it starts.` };
+		}
+		if (end - start + 1 > MAX_RANGE_SPAN) {
+			return { ok: false, reason: `cleanup list "${rawList}" is wider than ${MAX_RANGE_SPAN} blocks.` };
+		}
+		// A listing and a removal in the same call would decide targets from a
+		// partial view, so they stay separate calls by construction.
+		if (rawBlockIds.length > 0 || rawRanges.length > 0 || rawSkipRoles.length > 0) {
+			return {
+				ok: false,
+				reason: "cleanup list is read-only; call it with only `list`, then call cleanup again with the targets you verified.",
+			};
+		}
+		list = { start, end };
 	}
 
 	const explicitIds: number[] = [];
@@ -233,6 +283,9 @@ export function parseCleanupArgs(value: unknown):
 		if (!skipRoles.includes(role as MirrorRole)) skipRoles.push(role as MirrorRole);
 	}
 
+	if (list) {
+		return { ok: true, args: { blockIds: [], explicitIds: [], rangedIds: [], skipRoles, list } };
+	}
 	const rangedIds = [...ranged].filter((blockId) => !seen.has(blockId)).sort((a, b) => a - b);
 	const blockIds = [...explicitIds, ...rangedIds].sort((a, b) => a - b);
 	if (blockIds.length === 0) {
@@ -404,6 +457,16 @@ export function planCleanup(
 	const args = normalizeCleanupArgs(requested);
 	const requestedBlockIds = requestedIdList(requested);
 	if (!args.ok) return rejectPlan(requestedBlockIds, args.reason);
+	if (args.args.list) {
+		// A listing never reaches the mutation planner. Both hosts branch before
+		// this point; this guard keeps a future caller from treating rows as
+		// targets.
+		return rejectPlan(
+			[],
+			"cleanup list is read-only; it does not remove blocks.",
+			fixedTokens(options) + estimateMirrorTokens(records),
+		);
+	}
 
 	const validation = validateMirrorForCleanup(records, parsed, args.args, options);
 	if (validation) return validation;
@@ -518,6 +581,40 @@ export function planCleanup(
 }
 
 /**
+ * Answer a read-only drill-down: the rows of one ID range, never a mutation.
+ *
+ * This is the other half of the block index. The index names every gap by range
+ * but deliberately does not list what is inside it, so a model that wants to
+ * remove a gap can read its rows here for a few hundred tokens instead of
+ * opening the full mirror. Both hosts branch on `args.list` before planning a
+ * cleanup, so a listing can never be scheduled as a deletion.
+ */
+export function describeCleanupList(
+	records: readonly MirrorRecord[],
+	list: CleanupListTarget,
+	options: { maxPreviewChars?: number; maxChars?: number } = {},
+): CleanupToolResult {
+	const rendered = renderBlockList(records, list, options);
+	if (!rendered.ok) {
+		return {
+			status: "rejected",
+			requestedBlockIds: [],
+			removedBlockIds: [],
+			pairedRemovalIds: [],
+			reason: rendered.reason,
+		};
+	}
+	return {
+		status: "listed",
+		requestedBlockIds: [],
+		removedBlockIds: [],
+		pairedRemovalIds: [],
+		reason: "",
+		rows: rendered.text,
+	};
+}
+
+/**
  * Remove whole CLM_ENTRY spans from a mirror after planCleanup has validated
  * the protocol. This preserves all header comments and never reconstructs a
  * block body from the visible preview.
@@ -607,6 +704,11 @@ export function formatCleanupToolResult(
 	result: CleanupToolResult,
 	copy: CleanupResultCopy = result.copy ?? "full",
 ): string {
+	if (result.status === "listed") {
+		// A listing is the content the caller asked for, so the copy mode must not
+		// suppress it; only the one-line mutation confirmation is optional.
+		return result.rows ?? "";
+	}
 	if (copy === "none") return "";
 	if (result.status !== "applied") {
 		const rejected = `cleanup rejected; ${result.reason}`;

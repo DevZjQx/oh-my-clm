@@ -151,6 +151,15 @@ test("Pi cleanup removes selected mirror spans in one tool execution", async () 
 	await handlers.get("session_start")?.({}, ctx);
 	await handlers.get("context")?.({ messages: [] }, ctx);
 	const tool = tools.get("cleanup");
+
+	// The read-only drill-down answers from the projection and changes nothing.
+	const listed = await tool.execute("cleanup-list-1", { list: "1-3" }, undefined, undefined, ctx);
+	assert.equal(listed.isError, false);
+	assert.equal(listed.structuredContent?.status, "listed");
+	assert.match(listed.content?.[0]?.text ?? "", /^<oh-my-clm-block-list>\nRead-only rows for IDs 1-3; nothing was removed\./);
+	assert.match(listed.structuredContent?.rows ?? "", /\n2\. user: Self-referential noise\./);
+	assert.match(fs.readFileSync(sessionMirrorPath(sessionId), "utf8"), /Self-referential noise/);
+
 	const result = await tool.execute("cleanup-1", { blockIds: [2] }, undefined, undefined, ctx);
 	assert.equal(result.isError, false);
 	assert.deepEqual(result.structuredContent?.removedBlockIds, [2]);

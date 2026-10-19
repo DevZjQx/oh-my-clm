@@ -11,9 +11,14 @@
 - **配对级联删除单独上报。** 工具结果新增 `pairedRemovalIds`，文本结果写成 `Paired (not requested): 42`，不再把“没请求却被删”的 ID 混进 `removed`。这正是 `session-08a1d65f` 里 42 被误认为索引错误的来源（E-028）。
 - **`/clm mode [blocks|digest|auto]`（DSH）。** 进程环境只在启动时读取，无法在运行中 A/B；新增命令在当前进程里切换索引形状（`indexModeOverride`），并清空所有缓存的索引文本，从下一步生效；`auto` 撤销会话内覆盖、回到 `CLM_INDEX_MODE`（默认 `digest`）。系统提示里的索引说明改为模式中立，因此切换后不会残留旧形状的描述；`/clm status` 会显示当前模式。
 - **`scripts/measure-session-index.mjs`。** 只读脚本，从 `~/.dsh/sessions` 的真实日志统计索引快照数、字节、步间隔、cleanup 调用形态，并给出 blocks/digest 对比；`--project .` 只看当前项目，`--json` 输出结构化结果。
+- **`cleanup({ list: "A-B" })` 只读展开。** 索引会命名被省略的区间，但看不到区间里是什么；新增的 `list` 参数返回该区间的逐块行（role + 短 preview），不删除、不写 mirror、不依赖 snapshot，两个宿主都支持。它只能单独使用，不能和 `blockIds`/`ranges`/`skipRoles` 混在一次调用里，避免“边看边删”。单次结果有约 6 KB 字符预算，截断时末尾给出继续读取的区间，而不是静默返回部分视图。`CLM_CLEANUP_RESULT=none` 不会吞掉 listing 内容（它只压缩删除确认）。
+- **Digest 增加最大省略 turn 一行。** turn 数超过 `CLM_INDEX_LINES` 时，被折叠的 turn 按估算 token 排序取前三，写成 `... largest omitted turns: 21-24 (4.1k tok), 31-33 (2.9k tok).`。它只读已完成 turn，所以仍然在一个 turn 内字节稳定；回答的是“看不见的那段里哪一段最值得回收”。
 
 ### 调整
 
+- **`blocks` 窗口从“中点 25 块”改为“head 12 + 最近 40 块”。** 索引的唯一用途是把模型还记得的内容翻译成 ID 和区间：中点附近的 block 既不记得（64 字符 preview 也重建不了），也不是清理对象，而最近几轮刚产出的 tool 噪声才是。用 200 字符 fixture 测量：200 块索引从 70 行 / 5,559 B 降到 56 行 / 4,486 B，同时覆盖了原来完全不出现的尾部 40 块；中间区间仍由一行省略行命名。真实会话回放里唯一一次真正依赖窗口的长会话 cleanup（`ranges: ["171-177"]`，当时 383 块）目标原本落在省略区间 41–178 内，新窗口覆盖 334–383，仍然要靠 `cleanup({ list })` 或 mirror 才能定位——这正是把预算从“位置覆盖”转向“最近可识别内容 + 按需展开”的依据。
+- **`CLM_INDEX_MIDDLE` 改名为 `CLM_INDEX_TAIL`。** 它现在表示尾部窗口宽度（默认 40）；旧环境变量名仍作为回退值读取，避免已有 profile 的覆盖静默失效。`BlockIndexOptions.middleBlocks` 同步改为 `tailBlocks`，`selectMiddleWindow` 被 `selectTailWindow` 取代。
+- **两种索引的说明行同步更新。** `blocks` 与 `digest` 的 caption 都提到 `cleanup({ list: "A-B" })`；系统提示里的 `cleanup` 说明、`CLEANUP_DISCIPLINE` 和索引契约都改为“不确定某个区间里是什么就先 `list`，而不是猜着删”——区间删除本身仍然可用，listing 是消除不确定性的廉价手段，不是强制前置。
 - **DSH 系统提示不再解释宿主内部持久化机制。** 移除了 `Session.append()` 的 surface-replacement seam、`sourceEventSeqs` 约束、`developer/message` 归因，以及“这是 DSH surface replacement，不是 Pi 的 branch-local `context_edit`”等说明——它们只关系到 bridge 实现，和模型该做什么无关，只会分散注意力。只保留一条可执行规则：bridge 会校验每次编辑，无法应用的编辑会被拒绝并恢复 canonical mirror，重新读取 mirror 而不是盲目重试。两个测试改为断言提示词不含这些实现细节，防止再次漏回。
 - **Block index 的 middle 改为以会话中点为中心。** 此前 middle 紧接在 head 之后，长会话里只能看到开头 64 条。现在 `CLM_INDEX_MIDDLE`（默认 25）表示一段以中点为中心的窗口：200 块会话列出 1–40 和 88–112，head 与窗口之间、窗口之后的 block 不列出。窗口在贴近 head 或末尾时会整体平移以保持宽度，短会话里仍表现为紧接 head 的连续段。
 - **Block index 用省略行标出被跳过的 ID 区间。** 此前 head 与窗口之间、窗口之后的 block 静默消失，ID 从 40 直接跳到 88 只能靠系统提示里的一句话解释，列表末尾也容易被误当成会话末尾。现在每个未列出的连续区间都会插入一行 `... N editable block(s) omitted (IDs A-B).`（head 与窗口之间一行，窗口之后一行）；全部列出时不加任何省略行。只有 65 块以上的会话才会出现，两行合计约 100 bytes（200 字符 fixture 下 200 块索引为 70 行 / 约 5.6KB）。
