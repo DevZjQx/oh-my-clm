@@ -13,7 +13,12 @@ export const DEFAULT_MAX_MIRROR_CHARS = 96_000;
  */
 export const DEFAULT_BLOCK_INDEX_PREVIEW_CHARS = 64;
 export const DEFAULT_BLOCK_INDEX_HEAD = 40;
-export const DEFAULT_BLOCK_INDEX_MIDDLE = 24;
+/**
+ * Size of the middle window. The window is centered on the session midpoint, so
+ * 200 editable blocks with this default list 88-112: the head covers 1-40, and
+ * blocks 41-87 plus 113-200 stay out of the index.
+ */
+export const DEFAULT_BLOCK_INDEX_MIDDLE = 25;
 /**
  * The single cleanup habit that is both the most useful and the least likely to
  * remove something load-bearing. It is deliberately mechanical rather than
@@ -229,9 +234,11 @@ function blockPreview(text, maxChars) {
  * stable system-prompt section so they are cached once instead of repeated in
  * every runtime-context snapshot.
  *
- * The index lists a contiguous prefix: the first `headBlocks` editable blocks,
- * then the next `middleBlocks`. It intentionally omits the tail and the
- * middle-range summary; later IDs have to be discovered from the mirror.
+ * The index lists two runs: the first `headBlocks` editable blocks, then a
+ * window of `middleBlocks` centered on the session midpoint. Blocks between the
+ * head and that window, and everything after it, are omitted without a summary;
+ * their IDs have to be discovered from the mirror. With the defaults, 200
+ * editable blocks list 1-40 and 88-112.
  */
 export function renderBlockIndex(records, options = {}) {
     const editable = records.filter((record) => !record.protected);
@@ -245,15 +252,32 @@ export function renderBlockIndex(records, options = {}) {
         const blockId = displayIds.get(record.id) ?? record.id;
         return `${blockId}. ${record.role}: ${blockPreview(record.text, maxPreviewChars)}`;
     };
-    const lines = editable
-        .slice(0, Math.min(editable.length, headCount + middleCount))
-        .map(lineFor);
+    const headEnd = Math.min(editable.length, headCount);
+    const selected = editable.slice(0, headEnd);
+    const middle = selectMiddleWindow(editable.length, headEnd, middleCount);
+    if (middle)
+        selected.push(...editable.slice(middle.start - 1, middle.end));
+    const lines = selected.map(lineFor);
     return [
         "<oh-my-clm-block-index>",
         "Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them.",
         ...lines,
         "</oh-my-clm-block-index>",
     ].join("\n");
+}
+/**
+ * Pick the 1-based middle window: `count` consecutive blocks centered on the
+ * session midpoint, slid forward when centering would overlap the head and slid
+ * back when it would run past the last block. Returns undefined when there is
+ * nothing left to list after the head.
+ */
+export function selectMiddleWindow(total, headEnd, count) {
+    if (count <= 0 || headEnd >= total)
+        return undefined;
+    const span = Math.min(count, total - headEnd);
+    const centered = Math.floor(total / 2) - Math.floor(span / 2);
+    const start = Math.max(headEnd + 1, Math.min(centered, total - span + 1));
+    return { start, end: start + span - 1 };
 }
 export function renderMirror(records, options = {}) {
     const header = [

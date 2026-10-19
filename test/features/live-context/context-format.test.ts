@@ -331,8 +331,8 @@ test("block index previews are single-line and bounded", () => {
 	assert.match(previewLine, /…$/);
 });
 
-test("the block index shows the first 40 plus the next 24 by default", () => {
-	const many: MirrorRecord[] = Array.from({ length: 120 }, (_, index) => ({
+test("the block index shows the first 40 plus a 25-block window at the midpoint", () => {
+	const many: MirrorRecord[] = Array.from({ length: 200 }, (_, index) => ({
 		id: `block-${index + 1}`,
 		role: "assistant",
 		text: `content ${index + 1}`,
@@ -342,9 +342,27 @@ test("the block index shows the first 40 plus the next 24 by default", () => {
 	const index = renderBlockIndex(many, { maxPreviewChars: 32 });
 	assert.match(index, /\n1\. assistant: content 1\n/);
 	assert.match(index, /\n40\. assistant: content 40\n/);
-	assert.match(index, /\n64\. assistant: content 64\n/);
-	assert.doesNotMatch(index, /\n65\. assistant:/);
+	assert.doesNotMatch(index, /\n41\. assistant:/);
+	assert.match(index, /\n88\. assistant: content 88\n/);
+	assert.match(index, /\n112\. assistant: content 112\n/);
+	assert.doesNotMatch(index, /\n87\. assistant:/);
+	assert.doesNotMatch(index, /\n113\. assistant:/);
 	assert.doesNotMatch(index, /omitted from this index/);
+});
+
+test("the centered middle window slides to sit after the head on a short session", () => {
+	const many: MirrorRecord[] = Array.from({ length: 80 }, (_, index) => ({
+		id: `block-${index + 1}`,
+		role: "assistant",
+		text: `content ${index + 1}`,
+		protected: false,
+		toolCallIds: [],
+	}));
+	const index = renderBlockIndex(many, { maxPreviewChars: 32 });
+	assert.match(index, /\n40\. assistant: content 40\n/);
+	assert.match(index, /\n41\. assistant: content 41\n/);
+	assert.match(index, /\n65\. assistant: content 65\n/);
+	assert.doesNotMatch(index, /\n66\. assistant:/);
 });
 
 test("the block index head and middle stay configurable", () => {

@@ -86,7 +86,7 @@ Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them.
 </oh-my-clm-block-index>
 ```
 
-索引使用与 `cleanup` 完全相同的 1-based ordinal，并附带 role 和单行短 preview，因此模型不需要为了确认“哪个 ID 对应哪段内容”而读取 mirror。默认单块 preview 64 字符；索引只列前 40 个和紧接着的 24 个 block（共 64 条），不再输出 tail 或中间摘要，更后面的 ID 需要读 mirror。三个尺寸可用 `CLM_INDEX_PREVIEW`、`CLM_INDEX_HEAD`、`CLM_INDEX_MIDDLE` 调整。
+索引使用与 `cleanup` 完全相同的 1-based ordinal，并附带 role 和单行短 preview，因此模型不需要为了确认“哪个 ID 对应哪段内容”而读取 mirror。默认单块 preview 64 字符；索引列前 40 个 block，再加一段以会话中点为中心的 25 块窗口（200 块时是 1–40 和 88–112），不输出 tail 或省略摘要；head 与窗口之间、窗口之后的 ID 需要读 mirror。窗口在靠近 head 或末尾时会整体平移以保持 25 块宽，所以短会话里它紧接在 head 后面。三个尺寸可用 `CLM_INDEX_PREVIEW`、`CLM_INDEX_HEAD`、`CLM_INDEX_MIDDLE` 调整。
 
 索引的静态协议（tag 含义、cleanup 使用纪律、block 1 与 protected block 规则）放在系统提示词里，随 system prompt 一起缓存；runtime-context 只携带动态块行。同一个 turn 内索引最多每 `CLM_INDEX_REFRESH_STEPS`（默认 4）步重渲染一次，因此 DSH 不会在每一步都因为索引文本变化而追加新的 runtime-context 快照。追加新 block 不会重编号，所以缓存索引里列出的 ID 始终有效；删除会重编号，`cleanup` 或 mirror edit 生效后会立即清空缓存并重渲染，compaction 事件也会保守失效。`CLM_INDEX_REFRESH_STEPS=1` 恢复每步刷新。只有需要完整、未截断的正文做 rewrite 时，才需要打开 mirror。
 

@@ -6,6 +6,7 @@
 
 ### 调整
 
+- **Block index 的 middle 改为以会话中点为中心。** 此前 middle 紧接在 head 之后，长会话里只能看到开头 64 条。现在 `CLM_INDEX_MIDDLE`（默认 25）表示一段以中点为中心的窗口：200 块会话列出 1–40 和 88–112，head 与窗口之间、窗口之后的 block 不列出且不产生省略行。窗口在贴近 head 或末尾时会整体平移以保持宽度，短会话里仍表现为紧接 head 的连续段。有 200 块测量：65 行 / 5,559 bytes（200 字符 fixture）。
 - **Block index 按 turn 节流并瘦身。** DSH 只在 runtime-context 快照文本变化时追加新快照；此前索引每步都随新 block 变化，导致每步一条完整快照，长会话持续累积重复索引。现在：
   - 静态协议（tag 含义、cleanup 纪律、block 1/protected 规则）移入 `oh-my-clm:live-context` 系统提示段，索引只保留 tag、一行提示和块行。
   - 单块 preview 默认 64 字符；索引改为 head 40 + middle 24（共 64 条），移除 tail 和中间摘要；新增 `CLM_INDEX_PREVIEW`、`CLM_INDEX_HEAD`、`CLM_INDEX_MIDDLE`（`CLM_INDEX_TAIL` 移除）。

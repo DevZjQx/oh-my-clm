@@ -129,7 +129,7 @@ node scripts/build-dsh-plugin.mjs --output ./out/oh-my-clm.tgz
 
 DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 `CLM_CONTEXT_FIXED_TOKENS`；它们只影响 mirror preview 或 shrink-only safety gate 的近似估算，不改变 DSH 的 context window。`CLM_CLEANUP_RESULT` 控制 cleanup 工具结果的拷贝量：默认 `compact` 只返回一行确认（刷新后的 block index 会在下一次索引刷新后出现），`full` 会在结果后附带刷新后的索引，`none` 则不产生结果文本；它只影响模型可见的结果，不改变工具调用记录本身。
 
-Block index 另有三个尺寸开关和一个节流开关：`CLM_INDEX_PREVIEW`（默认 64，单块 preview 字符数）、`CLM_INDEX_HEAD`（默认 40）、`CLM_INDEX_MIDDLE`（默认 24）、`CLM_INDEX_REFRESH_STEPS`（默认 4，同一个 turn 内最多每几步重渲染一次）。索引只列前 40 个和紧接着的 24 个可编辑 block，不输出 tail 或中间摘要；更后面的 ID 需要读 mirror。DSH 只在 runtime-context 快照文本变化时追加新快照，因此节流能减少每步重复注入；`cleanup` 或 mirror edit 生效后会立即失效并重渲染，设为 `1` 可恢复每步刷新。
+Block index 另有三个尺寸开关和一个节流开关：`CLM_INDEX_PREVIEW`（默认 64，单块 preview 字符数）、`CLM_INDEX_HEAD`（默认 40）、`CLM_INDEX_MIDDLE`（默认 25，中点窗口大小）、`CLM_INDEX_REFRESH_STEPS`（默认 4，同一个 turn 内最多每几步重渲染一次）。索引列两段：前 40 个可编辑 block，再加一段以会话中点为中心的 25 块窗口（200 块时是 88–112）。head 与窗口之间、窗口之后的 block 都不列出，也没有 tail 或省略摘要；那些 ID 需要读 mirror。窗口会整体前移以避免和 head 重叠，也会在末尾收边，因此短会话里它会紧接在 head 后面。DSH 只在 runtime-context 快照文本变化时追加新快照，因此节流能减少每步重复注入；`cleanup` 或 mirror edit 生效后会立即失效并重渲染，设为 `1` 可恢复每步刷新。
 
 ## 项目结构
 
