@@ -31,11 +31,15 @@ oh-my-clm
 │   └── check-boundaries.mjs     # 单向依赖检查
 ├── docs
 │   ├── README.md                # 文档索引
-│   ├── how-it-works.md          # 生命周期与协议说明
+│   ├── features                 # 功能契约（每份文档对应一个可独立理解的机制）
+│   │   ├── live-context-mirror.md
+│   │   ├── cleanup-tool.md
+│   │   └── dsh-surface-bridge.md
 │   ├── project-structure.md     # 本文
-│   ├── CLM技术分析表.md          # 论文/官方实现的技术对照
-│   ├── dsh-cache-explained.md   # DSH 前缀缓存机制的资料整理
-│   ├── fact-check-2026-10-20.md # 本轮事实核查报告（本地，不随 npm 包发布）
+│   ├── reference                # 论文、上游实现和宿主机制的背景资料
+│   │   ├── clm-technical-analysis.md
+│   │   └── dsh-prefix-cache.md
+│   ├── fact-check-2026-10-20.md # 一次性事实核查报告（本地，不随 npm 包发布）
 │   ├── reports                  # 历史验证报告 + 报告说明
 │   └── reckless                 # 内部决策记录/证据账本/路线图（不发布）
 ├── dist                         # tsc 构建产物（随仓库提交）
@@ -44,6 +48,8 @@ oh-my-clm
 ├── cordis.patch.yml             # 官方 bundle 安装层
 └── package.json
 ```
+
+文档按用途分组：`features/` 描述当前行为契约，`reference/` 放外部资料和背景，`reports/` 放验证证据，`reckless/` 是本地决策记录。新增功能文档放进 `docs/features/` 并在 [docs/README.md](./README.md) 登记；根 README 只保留概览和入口链接，详细契约放在功能文档中。
 
 ## 分层与导入规则
 

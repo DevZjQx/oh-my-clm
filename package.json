@@ -1,6 +1,6 @@
 {
   "name": "oh-my-clm",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "A Pi extension and minimal DSH bridge for self-editable live context inspired by the Facebook Research CLM harness.",
   "icon": "./icon.svg",
   "repository": {
@@ -16,10 +16,9 @@
     "README.md",
     "changelog.md",
     "docs/README.md",
-    "docs/how-it-works.md",
+    "docs/features",
     "docs/project-structure.md",
-    "docs/CLM技术分析表.md",
-    "docs/dsh-cache-explained.md",
+    "docs/reference",
     "docs/reports",
     "extensions/clm.ts",
     "src/lib",
@@ -34,7 +33,13 @@
   "keywords": [
     "pi-package",
     "pi-extension",
+    "pi-coding-agent",
+    "dsh-plugin",
     "context-management",
+    "context-engineering",
+    "live-context",
+    "llm-context",
+    "agent-memory",
     "clm"
   ],
   "pi": {

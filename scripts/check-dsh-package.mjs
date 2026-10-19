@@ -20,6 +20,21 @@ if (!fs.existsSync(path.join(root, entry))) throw new Error(`DSH host entry is m
 if (packageJson.dsh?.bundle?.patch !== "./cordis.patch.yml") throw new Error("package.json must expose the official DSH bundle patch");
 if (packageJson.devDependencies?.["@deepseek-ai/dsh-tools"] !== "0.2.0-rc.2") throw new Error("package.json must pin the DSH tool schema runtime for builds");
 if (packageJson.icon !== "./icon.svg") throw new Error("package.json must declare ./icon.svg as its display icon");
+// Keywords drive npm search for both the Pi package and the DSH tarball that
+// scripts/build-dsh-plugin.mjs derives from them; guard the shape here so a typo
+// surfaces before a release instead of after a publish nobody can edit.
+if (!Array.isArray(packageJson.keywords) || packageJson.keywords.length === 0) {
+  throw new Error("package.json must declare search keywords");
+}
+if (packageJson.keywords.some((keyword) => typeof keyword !== "string" || !/^[a-z0-9][a-z0-9.+-]*$/.test(keyword))) {
+  throw new Error("package.json keywords must be lowercase single-token strings");
+}
+if (new Set(packageJson.keywords).size !== packageJson.keywords.length) {
+  throw new Error("package.json keywords must be unique");
+}
+if (!packageJson.keywords.includes("pi-package")) {
+  throw new Error('package.json keywords must keep the "pi-package" host marker');
+}
 // DSH reads `<pkg>/package.json` through the exports map; without this entry the
 // manifest is unreachable and the plugin silently falls back to the default icon.
 if (packageJson.exports?.["./package.json"] !== "./package.json") throw new Error('package.json must export "./package.json" for DSH display metadata');

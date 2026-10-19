@@ -33,6 +33,19 @@ const packageFiles = ["README.md", "dsh-plugin.json", "cordis.patch.yml", "dist"
 const dshRuntimePeerDependencies = {
 	"@deepseek-ai/dsh-tools": "0.2.0-rc.2",
 };
+// The staged tarball is the DSH half of a Pi-and-DSH package: keywords that only
+// describe the Pi side would mislead DSH-side search, so they are filtered out
+// and the DSH marker is added. The shared terms still come from package.json so
+// the two manifests cannot drift apart.
+const piOnlyKeywords = new Set(["pi-package", "pi-extension", "pi-coding-agent"]);
+const dshKeyword = "dsh-plugin";
+
+function dshKeywords(packageJson) {
+	if (!Array.isArray(packageJson.keywords) || packageJson.keywords.length === 0) {
+		throw new Error("package.json must declare keywords so the DSH tarball can reuse them");
+	}
+	return [dshKeyword, ...packageJson.keywords.filter((keyword) => !piOnlyKeywords.has(keyword) && keyword !== dshKeyword)];
+}
 
 function usage() {
 	console.log(`Usage: node scripts/build-dsh-plugin.mjs [output-dir | output-file.tgz]
@@ -122,7 +135,7 @@ function createStagingPackage(stageRoot, packageJson) {
 	for (const field of ["pi", "scripts", "devDependencies", "dependencies"]) {
 		delete stagedPackageJson[field];
 	}
-	stagedPackageJson.keywords = ["dsh-plugin", "context-management", "clm"];
+	stagedPackageJson.keywords = dshKeywords(packageJson);
 	// The host normally already supplies dsh-tools through the DSH bundles. Keep
 	// it as an optional peer for compatibility checks without installing a second
 	// module copy into the profile (the scheduler is keyed by a module-local Symbol).

@@ -1,8 +1,24 @@
 # 更新日志
 
-版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/how-it-works.md`](./docs/how-it-works.md)。
+版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/features/live-context-mirror.md`](./docs/features/live-context-mirror.md)。
 
-## 0.1.9（当前版本）
+## 0.1.10（当前版本）
+
+### 调整
+
+- **npm keywords 补齐到 10 个。** 从 `pi-package`、`pi-extension`、`context-management`、`clm` 扩展为同时覆盖宿主（`pi-coding-agent`、`dsh-plugin`）和概念（`context-engineering`、`live-context`、`llm-context`、`agent-memory`）的词表，让两种搜索意图都能命中：找 Pi 扩展的人和找上下文管理方案的人。keywords 只随版本打包，npm 不提供修改已发布版本的接口，所以只能靠这次发版生效。
+
+### 修复
+
+- **DSH 打包产物的 keywords 不再与 `package.json` 漂移。** `scripts/build-dsh-plugin.mjs` 之前把 `["dsh-plugin", "context-management", "clm"]` 写死在脚本里，每次 `build:dsh:plugin` 都会用这份旧词表覆盖主 `package.json` 的，两边只能靠人工同步。现在改为从 `package.json` 派生并过滤掉 Pi 专属词（`pi-package`、`pi-extension`、`pi-coding-agent`），`dsh-plugin` 固定置为第一个：根包 10 个词、DSH 包 7 个词，共享词只有一处来源。
+- **keywords 进入发布前校验。** `scripts/check-dsh-package.mjs` 新增校验：必须是数组、非空、全小写单 token、无重复、保留 `pi-package` 宿主标记。npm 发布后无法修改 keywords，拼写错误只能在 `npm run check` 阶段拦住，否则要等下一次发版才能纠。
+
+### 文档
+
+- **`docs/` 按用途重组。** 平铺文件改为分组目录：`docs/features/`（live-context-mirror、cleanup-tool、dsh-surface-bridge）、`docs/reference/`（CLM 技术分析表、DSH 前缀缓存），`docs/reports/` 保持原样；`package.json` 的发布白名单同步改为目录，根 README 与 `docs/README.md` 的内部链接全部指向新路径。
+- **README 不再复述版本历史。** 删掉正文中的版本区间和具体版本号引用，版本说明统一由 [`changelog.md`](./changelog.md) 承担。
+
+## 0.1.9
 
 ### 调整
 

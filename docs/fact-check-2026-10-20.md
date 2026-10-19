@@ -1,5 +1,7 @@
 # oh-my-clm 事实核查报告（2026-10-20）
 
+> **文档结构说明**：本报告写于文档重组前，文中的 `docs/how-it-works.md`、`docs/dsh-cache-explained.md`、`docs/CLM技术分析表.md` 路径和行号都指向当时结构。当前对应文档为 [live-context-mirror.md](./features/live-context-mirror.md)、[dsh-prefix-cache.md](./reference/dsh-prefix-cache.md) 和 [clm-technical-analysis.md](./reference/clm-technical-analysis.md)。
+
 > **修复状态（2026-10-20 后续）**：本报告第 1–8 节记录修复前的核查结果，行号指向修复前版本。F1–F13、版本叙事、内部证据文件和低优先级完整性问题已经修复，修复后的验证见第 9 节。
 
 ## 0. 结论摘要
