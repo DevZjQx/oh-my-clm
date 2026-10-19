@@ -6,6 +6,7 @@
 
 ### 调整
 
+- **DSH 系统提示不再解释宿主内部持久化机制。** 移除了 `Session.append()` 的 surface-replacement seam、`sourceEventSeqs` 约束、`developer/message` 归因，以及“这是 DSH surface replacement，不是 Pi 的 branch-local `context_edit`”等说明——它们只关系到 bridge 实现，和模型该做什么无关，只会分散注意力。只保留一条可执行规则：bridge 会校验每次编辑，无法应用的编辑会被拒绝并恢复 canonical mirror，重新读取 mirror 而不是盲目重试。两个测试改为断言提示词不含这些实现细节，防止再次漏回。
 - **Block index 的 middle 改为以会话中点为中心。** 此前 middle 紧接在 head 之后，长会话里只能看到开头 64 条。现在 `CLM_INDEX_MIDDLE`（默认 25）表示一段以中点为中心的窗口：200 块会话列出 1–40 和 88–112，head 与窗口之间、窗口之后的 block 不列出。窗口在贴近 head 或末尾时会整体平移以保持宽度，短会话里仍表现为紧接 head 的连续段。
 - **Block index 用省略行标出被跳过的 ID 区间。** 此前 head 与窗口之间、窗口之后的 block 静默消失，ID 从 40 直接跳到 88 只能靠系统提示里的一句话解释，列表末尾也容易被误当成会话末尾。现在每个未列出的连续区间都会插入一行 `... N editable block(s) omitted (IDs A-B).`（head 与窗口之间一行，窗口之后一行）；全部列出时不加任何省略行。只有 65 块以上的会话才会出现，两行合计约 100 bytes（200 字符 fixture 下 200 块索引为 70 行 / 约 5.6KB）。
 - **系统提示里的 block index 说明收紧为一句。** 索引现在自带省略行和 `cleanup` 调用提示，系统提示不再复述 head/middle 尺寸、省略行格式和“从索引里选 ID”，只保留索引存在与刷新节奏，`promptText()` 也不再读取 `CLM_INDEX_HEAD`/`CLM_INDEX_MIDDLE`（尺寸仍由 `optionsFor()` 决定）。

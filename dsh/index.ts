@@ -125,10 +125,7 @@ The DSH bridge mirrors the current session surface to \`${mirrorTemplate}\`.
 - For a broader context rewrite, use one ordinary host-side script that completes its read and write before returning. Use a local edit only when the complete old body is available; do not print the whole mirror.
 - The bridge observes a changed file after the enclosing DSH session event settles, then serializes the native mutation before the next model step. Do not keep rewriting the mirror in the background.
 - DSH file tools edit the host-side \`/tmp\`; sandboxed bash may have a different \`/tmp\` unless the host explicitly shares the session directory, so prefer the file tools for this mirror.
-- Legal edits are applied through DSH's public Session.append() surface-replacement seam: the bridge appends tool/result content replacements and developer/message replacements (empty for omission, text-bearing for rewritten assistant blocks) with surfaceOp replace metadata and the required sourceEventSeqs. DSH forbids assistant/message from carrying sourceEventSeqs, so an assistant block is never replaced in place by another assistant message.
-- Rewritten assistant content is intentionally not attributed back to the model; it becomes a model-visible developer message. Tool-result replacements preserve their original envelope and change only content.
-- The original events remain in DSH's append-only log, while the current surface and derived model history change immediately. This is DSH surface replacement, not Pi's branch-local context_edit; do not describe it as Pi branch semantics.
-- The bridge writes no proposal or receipt file and does not register a custom session event. If the host does not expose the verified append seam, the edit is rejected and the mirror is restored to the canonical projection.
+- The bridge validates every edit. An edit it cannot apply is rejected and the mirror is restored to the canonical projection before your next step; re-read the mirror after a rejection instead of retrying blindly.
 </oh-my-clm-dsh-live-context>`;
 }
 

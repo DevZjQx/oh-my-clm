@@ -263,7 +263,7 @@ section("2. system prompt section");
 	check("section name matches manifest contribution", sectionValue.name === "oh-my-clm:live-context", String(sectionValue.name));
 	check("section order falls back to 3240", sectionValue.order === 3240, String(sectionValue.order));
 	check("section names the mirror template", typeof sectionValue.text === "string" && sectionValue.text.includes("/tmp/clm-<session-id>/LIVE_CTX_MAIN.md"));
-	check("section describes the Session.append replacement seam", typeof sectionValue.text === "string" && sectionValue.text.includes("Session.append()") && sectionValue.text.includes("surface-replacement"));
+	check("section keeps internal persistence mechanics out of the prompt", typeof sectionValue.text === "string" && !/Session\.append|sourceEventSeqs|branch-local/.test(sectionValue.text));
 	check("cleanup tool is registered", host.tools.has("cleanup"));
 	check("/clm command is registered", host.commands.has("clm"));
 	const clmStatus = await host.commands.get("clm").handler({
@@ -278,7 +278,7 @@ section("2. system prompt section");
 		clmStatus.kind === "success" && /^oh-my-clm status \(DSH\)/.test(clmStatus.text) && clmStatus.text.includes("editable blocks: 3"),
 		clmStatus.text,
 	);
-	check("section says no proposal or receipt file is written", typeof sectionValue.text === "string" && /writes no proposal or receipt file/i.test(sectionValue.text));
+	check("section tells the model a rejected edit is restored", typeof sectionValue.text === "string" && /An edit it cannot apply is rejected and the mirror is restored/.test(sectionValue.text));
 	check("runtime block index context registered exactly once", host.contexts.length === 1, `got ${host.contexts.length}`);
 	check("runtime block index context name", host.contexts[0]?.name === "oh-my-clm:block-index", String(host.contexts[0]?.name));
 	check("runtime block index context sorts after host policy", host.contexts[0]?.order === 200, String(host.contexts[0]?.order));

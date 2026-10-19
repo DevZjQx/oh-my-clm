@@ -650,7 +650,8 @@ test("mock DSH host loads the entry, registers hooks, and mutates the active sur
 	assert.equal(root.listeners.has("session/event"), true);
 	assert.equal(root.sections[0]?.name, "oh-my-clm:live-context");
 	assert.match(root.sections[0]?.text ?? "", /cleanup\(\{ blockIds:/);
-	assert.match(root.sections[0]?.text ?? "", /Session\.append\(\).*surface-replacement seam/);
+	assert.match(root.sections[0]?.text ?? "", /An edit it cannot apply is rejected/);
+	assert.doesNotMatch(root.sections[0]?.text ?? "", /Session\.append\(\)|sourceEventSeqs|branch-local/);
 	assert.match(root.sections[0]?.text ?? "", /oh-my-clm-block-index/);
 	assert.equal(root.contexts[0]?.name, "oh-my-clm:block-index");
 	assert.equal(root.contexts[0]?.order, 200);
