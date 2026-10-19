@@ -262,7 +262,8 @@ section("2. system prompt section");
 	const sectionValue = host.sections[0] ?? {};
 	check("section name matches manifest contribution", sectionValue.name === "oh-my-clm:live-context", String(sectionValue.name));
 	check("section order falls back to 3240", sectionValue.order === 3240, String(sectionValue.order));
-	check("section names the mirror template", typeof sectionValue.text === "string" && sectionValue.text.includes("/tmp/clm-<session-id>/LIVE_CTX_MAIN.md"));
+	check("section names the runtime block index", typeof sectionValue.text === "string" && sectionValue.text.includes("<oh-my-clm-block-index>"));
+	check("section names the mirror path template", typeof sectionValue.text === "string" && sectionValue.text.includes("/tmp/clm-<session-id>/LIVE_CTX_MAIN.md"));
 	check("section keeps internal persistence mechanics out of the prompt", typeof sectionValue.text === "string" && !/Session\.append|sourceEventSeqs|branch-local/.test(sectionValue.text));
 	check("cleanup tool is registered", host.tools.has("cleanup"));
 	check("/clm command is registered", host.commands.has("clm"));
@@ -278,7 +279,7 @@ section("2. system prompt section");
 		clmStatus.kind === "success" && /^oh-my-clm status \(DSH\)/.test(clmStatus.text) && clmStatus.text.includes("editable blocks: 3"),
 		clmStatus.text,
 	);
-	check("section tells the model a rejected edit is restored", typeof sectionValue.text === "string" && /An edit it cannot apply is rejected and the mirror is restored/.test(sectionValue.text));
+	check("section stays a minimal contract", typeof sectionValue.text === "string" && sectionValue.text.length <= 800 && !/blockIds|skipRoles|CLM_CLEANUP_RESULT|CLM_INDEX_/.test(sectionValue.text), typeof sectionValue.text === "string" ? `${sectionValue.text.length} chars` : "no text");
 	check("runtime block index context registered exactly once", host.contexts.length === 1, `got ${host.contexts.length}`);
 	check("runtime block index context name", host.contexts[0]?.name === "oh-my-clm:block-index", String(host.contexts[0]?.name));
 	check("runtime block index context sorts after host policy", host.contexts[0]?.order === 200, String(host.contexts[0]?.order));
@@ -291,6 +292,7 @@ section("2. system prompt section");
 	else process.env.CLM_INDEX_MODE = previousIndexMode;
 	check("block index lists editable 1-based IDs", blockIndex.includes("1. assistant:") && blockIndex.includes("3. assistant:"), blockIndex);
 	check("block index excludes the protected initial task", !blockIndex.includes("PROTECTED INITIAL TASK"), blockIndex);
+	check("runtime context resolves the concrete mirror path", blockIndex.startsWith("Mirror: /tmp/clm-") && blockIndex.includes("LIVE_CTX_MAIN.md"), blockIndex.slice(0, 160));
 	check("section tells the model to use the runtime block index", typeof sectionValue.text === "string" && sectionValue.text.includes("<oh-my-clm-block-index>"));
 	host.disposeAll();
 

@@ -12,7 +12,6 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	buildMirrorRecords,
-	CLEANUP_DISCIPLINE,
 	DEFAULT_MAX_BLOCK_CHARS,
 	DEFAULT_MAX_MIRROR_CHARS,
 	estimateMessageTokens,
@@ -162,23 +161,24 @@ function syncMirror(ctx: ExtensionContext, force = false): MirrorSnapshot {
 	return snapshot;
 }
 
+/**
+ * Pi's live-context contract.
+ *
+ * Pi's interface is the mirror file itself, so the path and block markers are
+ * model-actionable and stay. Everything else follows the DSH standard: this
+ * text rides in every request, so it carries no API restatement
+ * (`cleanupParameters` owns that), no protocol internals, no env switches, and
+ * no instruction repeated elsewhere. The budget nudge adds the only
+ * turn-scoped line at runtime.
+ *
+ * `test/adapters/extension.test.ts` caps the length so a helpful-sounding
+ * addition cannot silently tax every request.
+ */
 function promptAppendix(ctx: ExtensionContext): string {
 	const filePath = mirrorPath(ctx);
 	return `${PROMPT_MARKER}
-When old conversation turns become noise, manage your own Pi context through \`${filePath}\`.
-- The file uses blocks like \`[[CLM_ENTRY id=1 role=assistant]]\` followed by a matching \`[[/CLM_ENTRY id=1]]\`; the id is an editable ordinal. Keep both markers exactly as written and do not reorder blocks.
-- Keep the \`CLM_SNAPSHOT\` line and protocol comments intact. It prevents stale edits from changing a newer projection.
-- Use the registered \`cleanup({ blockIds: [...] })\` tool for stale, redundant, or self-referential blocks; it works by ID, preserves load-bearing block 1, and does not read truncated bodies. \`cleanup({ list: \"A-B\" })\` is read-only: it returns the rows of a range (role and short preview) so you can inspect before deleting.
-- ${CLEANUP_DISCIPLINE}
-- For a \`rewrite\`, use one host-side script that completes its read and write before returning; preserve the protocol header, \`CLM_SNAPSHOT\`, and block 1.
-- For an \`edit\`, change the smallest necessary existing block body to a short, faithful summary only when the complete old body is available; never use a truncated preview as \`old_string\`.
-- Delete an editable block to omit stale history. To delete the last editable block, leave the \`<!-- CLM_EMPTY -->\` marker.
-- The initial task is protected and is intentionally not shown in the file.
-- User-authored blocks may be omitted when stale, but cannot be rewritten.
-- For a broader context change, use one ordinary host-side bash/edit/write operation during an agent turn. Do not read or cat the mirror as a separate step, and print no mirror contents. The extension persists an accepted edit as a branch-local context edit after the turn.
-- Tool-call assistant turns are kept structurally safe: rewriting or deleting one also removes its paired tool results.
-- A tool result that reads this live mirror is automatically replaced in future context with a short pointer; avoid reading it unless absolutely necessary.
-- When a ${CONTEXT_NUDGE_MARKER} appears, this is a context-only turn: edit the mirror now, do no task work, and stop after the one edit operation.
+Your Pi context is mirrored to \`${filePath}\`. To free context, shorten stale \`[[CLM_ENTRY id=N role=...]]\` bodies with one edit/write during an agent turn: keep the protocol header, the \`CLM_SNAPSHOT\` line, the markers and their order, and block 1 intact; rewrite only from a block's complete current body; do not read or print the file. The initial task is protected and not shown; user blocks may be omitted, never rewritten. To delete blocks use the \`cleanup\` tool (batch every target into one call); \`cleanup({ list: "A-B" })\` inspects a range first.
+When a ${CONTEXT_NUDGE_MARKER} appears, that turn is context-only: make the one edit, do no task work, and stop.
 ${PROMPT_MARKER}`;
 }
 
@@ -342,11 +342,9 @@ function contextBudgetNudge(ctx: ExtensionContext, messages: readonly unknown[])
 	const tokens = fixedRequestTokens(ctx) + messages.reduce<number>((total, message) => total + estimateMessageTokens(message), 0);
 	if (tokens < Math.floor(target * CONTEXT_NUDGE_FRACTION)) return undefined;
 
-	const filePath = mirrorPath(ctx);
 	const nudge = `${CONTEXT_NUDGE_MARKER}
-You are at approximately ${tokens}/${budget} context tokens. This is a context-only turn.
-Use \`cleanup({ ranges: [\"A-B\"] })\` or \`cleanup({ blockIds: [...] })\` to remove stale blocks; it completes the host-side mutation without a separate mirror read. For a broader change, use exactly one host-side rewrite/edit operation to shorten ${filePath}; do not read or print the mirror, do no task work, and stop after that operation.
-Preserve the CLM protocol and keep the facts needed for the current task.
+You are at approximately ${tokens}/${budget} context tokens; this is a context-only turn.
+Free context now: \`cleanup\` removes blocks in one call, or make exactly one mirror edit. Keep the facts the current task needs, then stop.
 ${CONTEXT_NUDGE_MARKER}`;
 	const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 	const nudgeTokens = estimateMessageTokens({ role: "user", content: nudge });
@@ -438,11 +436,8 @@ export default function (pi: ExtensionAPI) {
 		description: "Remove stale CLM context blocks by ID without reading or reconstructing their bodies, or list the rows of an ID range (read-only) to identify targets.",
 		promptSnippet: "Remove stale context blocks by ID",
 		promptGuidelines: [
-			"Use cleanup({ ranges: [\"A-B\"] }) for a whole turn, or cleanup({ blockIds: [...] }) for individual blocks.",
-			"Use cleanup({ list: \"A-B\" }) to read the rows of a range without removing anything; it cannot be combined with removal targets.",
-			"Block 1 is load-bearing and is always preserved.",
-			"Pass every target in one call; cleanup renumbers IDs after each removal. Paired tool results are reported separately.",
-			"Cleanup is sequential and completes its host-side mirror write before returning.",
+			"Remove stale CLM context blocks by ID; batch every target into one call because IDs renumber after each removal.",
+			"cleanup({ list: \"A-B\" }) inspects a range without removing anything.",
 		],
 		parameters: cleanupParameters,
 		outputSchema: cleanupOutputSchema,

@@ -702,10 +702,15 @@ test("mock DSH host loads the entry, registers hooks, and mutates the active sur
 	assert.equal(root.listeners.has("agent/created"), true);
 	assert.equal(root.listeners.has("session/event"), true);
 	assert.equal(root.sections[0]?.name, "oh-my-clm:live-context");
-	assert.match(root.sections[0]?.text ?? "", /cleanup\(\{ blockIds:/);
-	assert.match(root.sections[0]?.text ?? "", /An edit it cannot apply is rejected/);
-	assert.doesNotMatch(root.sections[0]?.text ?? "", /Session\.append\(\)|sourceEventSeqs|branch-local/);
-	assert.match(root.sections[0]?.text ?? "", /oh-my-clm-block-index/);
+	const promptSection = root.sections[0]?.text ?? "";
+	assert.match(promptSection, /oh-my-clm-block-index/);
+	assert.match(promptSection, /cleanup/);
+	// The mirror path and its editability are in scope because the mirror is the
+	// compression interface. The schema still owns the API, and bridge internals
+	// and env switches stay out of model-visible text.
+	assert.match(promptSection, /\/tmp\/clm-<session-id>\/LIVE_CTX_MAIN\.md/);
+	assert.doesNotMatch(promptSection, /blockIds|skipRoles|CLM_CLEANUP_RESULT|CLM_INDEX_|CLM_MAX_|Session\.append|sourceEventSeqs/);
+	assert.ok(promptSection.length <= 800, `live-context prompt grew to ${promptSection.length} chars`);
 	assert.equal(root.contexts[0]?.name, "oh-my-clm:block-index");
 	assert.equal(root.contexts[0]?.order, 200);
 	assert.equal(root.tools.definitions.has("cleanup"), true);
@@ -715,7 +720,6 @@ test("mock DSH host loads the entry, registers hooks, and mutates the active sur
 	const toolResult = await cleanupTool.execute({ blockIds: [3] }, { agent: { session: toolSession } });
 	assert.equal(toolResult.status, "applied");
 	assert.deepEqual(toolSession.surface.nodes, [0, 1, 2, 3, 7]);
-	assert.match(root.sections[0]?.text ?? "", /\/tmp\/clm-<session-id>\/LIVE_CTX_MAIN\.md/);
 	assert.equal(root.listeners.has("agent/disposed"), true);
 
 	const session = dshSession(cwd, "dsh-host-native");
@@ -725,6 +729,9 @@ test("mock DSH host loads the entry, registers hooks, and mutates the active sur
 	assert.equal(typeof indexText, "function");
 	const index = typeof indexText === "function" ? indexText({ agent }) : "";
 	assert.match(index, /<oh-my-clm-block-index>/);
+	// The section can only name the `<session-id>` template; the dynamic context
+	// must resolve it so the model has a path it can actually use.
+	assert.ok(index.startsWith(`Mirror: ${sessionMirrorPath(String(session.id))}\n`), index.slice(0, 160));
 	// The production default is the turn digest: one closed run plus the anchor.
 	assert.match(index, /\n1-2\. assistant\+toolResult ×2 \(\d+ tok\)/);
 	assert.match(index, /\nIDs 3\.\. \(current turn, not listed\): Keep this later request\./);

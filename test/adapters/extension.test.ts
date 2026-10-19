@@ -84,7 +84,11 @@ test("extension mirrors a projection and emits persistent context edits at turn_
 	await handlers.get("before_agent_start")?.(beforeStart, ctx);
 	const prompt = beforeStart.systemPromptOptions.appendSystemPrompt ?? "";
 	assert.ok(prompt.includes(sessionMirrorPath(sessionId)));
-	assert.match(prompt, /cleanup\(\{ blockIds:/);
+	assert.match(prompt, /cleanup/);
+	// Same standard as the DSH section: the schema owns the API, so parameter
+	// names, env switches, and repeated protocol detail stay out of the prompt.
+	assert.doesNotMatch(prompt, /blockIds|skipRoles|CLM_EMPTY|CLM_CONTEXT_BUDGET|CLM_MAX_BLOCK_CHARS|CLM_MAX_MIRROR_CHARS|patch\.json/);
+	assert.ok(prompt.length <= 900, `Pi live-context prompt grew to ${prompt.length} chars`);
 
 	await handlers.get("context")?.({}, ctx);
 	const mirrorPath = sessionMirrorPath(sessionId);
@@ -358,8 +362,13 @@ test("budget pressure uses an ephemeral nudge instead of a compact command", asy
 			ctx,
 		) as { messages?: Array<{ role: string; content: string }> } | undefined;
 		assert.equal(result?.messages?.length, 2);
-		assert.match(result?.messages?.at(-1)?.content ?? "", /<pi-clm-budget-nudge>/);
-		assert.ok(result?.messages?.at(-1)?.content.includes(sessionMirrorPath(sessionId)));
+		const nudgeText = result?.messages?.at(-1)?.content ?? "";
+		assert.match(nudgeText, /<pi-clm-budget-nudge>/);
+		assert.match(nudgeText, /context-only turn/);
+		// The nudge names the tool, not the mirror path or protocol the system
+		// prompt already carries; it is re-injected on every pressured request.
+		assert.ok(!nudgeText.includes(sessionMirrorPath(sessionId)));
+		assert.doesNotMatch(nudgeText, /CLM_SNAPSHOT|CLM_ENTRY/);
 	} finally {
 		if (previousBudget === undefined) delete process.env.CLM_CONTEXT_BUDGET;
 		else process.env.CLM_CONTEXT_BUDGET = previousBudget;

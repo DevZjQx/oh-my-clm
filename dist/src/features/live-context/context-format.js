@@ -33,19 +33,6 @@ export const DEFAULT_BLOCK_INDEX_TAIL = 40;
  * silently partial view.
  */
 export const DEFAULT_BLOCK_LIST_CHARS = 6_000;
-/**
- * The single cleanup habit that is both the most useful and the least likely to
- * remove something load-bearing. It is deliberately mechanical rather than
- * judgment-based, because the failure mode is a wrong ID, not a wrong opinion:
- * batch every target into one call (IDs renumber after each removal), name the
- * block by an identity the model can verify, and treat a skipped block as far
- * cheaper than a guessed one. Kept as one string so the Pi prompt, the DSH
- * block index, and the tool descriptions cannot drift apart.
- */
-export const CLEANUP_DISCIPLINE = "Batch every removal into one cleanup call using only IDs you can positively identify — IDs renumber after each removal, so never chain calls on stale IDs. " +
-    "Prefer one inclusive range per turn (`cleanup({ ranges: [\"3-16\"] })`) over a long list of individual IDs, and add `skipRoles: [\"user\"]` when a range should drop the tool noise but keep the human message. " +
-    "Delete a tool-call block together with its paired result, prefer assistant/tool-result noise over user turns, and leave any uncertain ID for a later pass: an unremoved block costs window, a wrong one costs correctness. " +
-    "If you are unsure what an unlisted range contains, read it with `cleanup({ list: \"A-B\" })` instead of guessing: guessing costs correctness, listing costs one cheap call.";
 const EMPTY_MARKER = "<!-- CLM_EMPTY -->";
 const SNAPSHOT_PATTERN = /^<!-- CLM_SNAPSHOT ([a-f0-9]{16}) -->$/;
 const BLOCK_START_PATTERN = /^\[\[CLM_ENTRY\s+id=([^\s\]]+)\s+role=([^\s\]]+)\]\]$/;

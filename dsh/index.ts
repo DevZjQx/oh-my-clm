@@ -17,7 +17,6 @@ import {
 	type DshSessionLike,
 } from "../src/features/live-context/dsh-bridge.ts";
 import {
-	CLEANUP_DISCIPLINE,
 	DEFAULT_BLOCK_INDEX_HEAD,
 	DEFAULT_BLOCK_INDEX_PREVIEW_CHARS,
 	DEFAULT_BLOCK_INDEX_TAIL,
@@ -128,32 +127,35 @@ function indexMode(): "blocks" | "digest" {
 }
 
 /**
- * The prompt contract is deliberately mode-neutral. The system prompt section
- * is registered once, so a `/clm mode` switch must not leave a description of
- * the previous shape behind; the dynamic index line inside the runtime context
- * names the actual layout.
+ * The model-visible contract for the live-context index.
+ *
+ * This section is injected into every request of every session, so each line
+ * here is a standing tax on the model's attention. It carries only facts the
+ * model cannot get anywhere else: what the index is, that `cleanup` is the
+ * preferred way to free window, that the mirror is editable for compression,
+ * and what is protected.
+ *
+ * The mirror path and its editability are in scope because the mirror is the
+ * compression interface. Everything else stays out, however useful it sounds:
+ * - the `cleanup` API itself (parameters, `ranges`, `skipRoles`, `list`, result
+ *   copy). `cleanupParameters` below is the single source of truth; repeating
+ *   it here is what previously pushed this section to ~4 KB and made a rare
+ *   maintenance tool compete with the user's actual task;
+ * - the mirror file format, edit validation, refresh cadence, host-vs-sandbox
+ *   `/tmp` differences, and session event ordering: the model has no action for
+ *   any of them;
+ * - environment variables or operational switches.
+ *
+ * `test/features/live-context/dsh-bridge.test.ts` caps the rendered length, so
+ * growth fails the suite instead of silently taxing every request.
  */
-function indexContract(refreshSteps: number): string {
-	return `The live runtime context includes an \`<oh-my-clm-block-index>\` with 1-based cleanup IDs. It lists either individual blocks or one line per completed turn (inclusive ID ranges with an estimated token cost), always as a head run plus a recency run, and names every unlisted stretch with an omission line giving its ID range. The turn still in progress may appear only as a start anchor (\`IDs N..\`) and is not a safe cleanup target while its tool pairs may still be settling. The index is refreshed immediately after a cleanup or mirror edit and at most every ${refreshSteps} step(s) otherwise, so blocks created since the last refresh are not listed. When a range is only named by an omission line, read its rows with \`cleanup({ list: "A-B" })\` instead of opening the mirror.`;
-}
-
 function promptText(): string {
 	const mirrorTemplate = `${CLM_TEMP_ROOT}/clm-<session-id>/${CLM_MIRROR_FILENAME}`;
-	const refreshSteps = positiveEnv("CLM_INDEX_REFRESH_STEPS", 4);
 	return `<oh-my-clm-dsh-live-context>
-The DSH bridge mirrors the current session surface to \`${mirrorTemplate}\`.
-- ${indexContract(refreshSteps)}
-- ${CLEANUP_DISCIPLINE}
-- Block 1 is load-bearing and is always preserved. The protected initial task has no block ID and is not listed.
-- Use the registered \`cleanup\` tool for stale, redundant, or self-referential blocks: \`cleanup({ ranges: [\"3-16\"] })\` removes a whole turn, \`cleanup({ blockIds: [...] })\` removes individual blocks, and \`skipRoles: [\"user\"]\` keeps human messages inside a range. \`cleanup({ list: \"3-16\" })\` is read-only: it returns the rows of that range and changes nothing, which is how you inspect a range the index named but did not list. It works by ID and does not read truncated bodies; paired tool results are removed with their owner and reported separately. By default the result is a one-line confirmation; the refreshed index appears after the next refresh. Set CLM_CLEANUP_RESULT=full to append the refreshed index immediately, or =none to suppress the result text.
-- Read LIVE_CTX_MAIN.md only when you need the full, untruncated body for a rewrite. Edit only the bodies of existing CLM_ENTRY blocks; keep the protocol header, CLM_SNAPSHOT, IDs, roles, and closing markers unchanged.
-- Shorten an existing block or delete it to request omitting stale history. Keep CLM_EMPTY when deleting every editable block.
-- The initial user task is protected. User-authored blocks may be omitted but cannot be rewritten.
-- Keep assistant tool-call/result pairs structurally safe; the bridge rejects orphan pairs.
-- For a broader context rewrite, use one ordinary host-side script that completes its read and write before returning. Use a local edit only when the complete old body is available; do not print the whole mirror.
-- The bridge observes a changed file after the enclosing DSH session event settles, then serializes the native mutation before the next model step. Do not keep rewriting the mirror in the background.
-- DSH file tools edit the host-side \`/tmp\`; sandboxed bash may have a different \`/tmp\` unless the host explicitly shares the session directory, so prefer the file tools for this mirror.
-- The bridge validates every edit. An edit it cannot apply is rejected and the mirror is restored to the canonical projection before your next step; re-read the mirror after a rejection instead of retrying blindly.
+\`<oh-my-clm-block-index>\` lists compacted-away history as 1-based IDs; a turn's range is inclusive.
+Prefer \`cleanup\` to free window: whole-turn ranges (e.g. \`["3-16"]\`) remove in one call, and \`cleanup({ list: "A-B" })\` inspects a range without removing anything.
+To compress instead, edit the session mirror at \`${mirrorTemplate}\` (the exact path is above the block index): read just the block you are shortening, shorten its body, and keep the protocol header, the \`CLM_SNAPSHOT\` line, IDs, roles, and markers unchanged.
+Block 1 and the initial task are protected. Nothing else is required of you.
 </oh-my-clm-dsh-live-context>`;
 }
 
@@ -194,6 +196,11 @@ function optionsFor(session: DshSessionLike): DshBridgeOptions {
  * DSH appends this snapshot as a sourced user message, so the same 1-based IDs
  * that `cleanup` accepts are visible in chat context without a mirror read. A
  * failure returns empty text rather than breaking prompt assembly.
+ *
+ * The concrete mirror path belongs here rather than in the static section: the
+ * section is registered once per process and could only show the
+ * `<session-id>` template, which the model cannot resolve. Keep this prefix to
+ * the path alone, so the snapshot stays a stable, cache-friendly header.
  */
 function blockIndexContextText(
 	context: { agent?: DshAgent },
@@ -202,12 +209,15 @@ function blockIndexContextText(
 	const session = context.agent?.session;
 	if (!session) return "";
 	try {
-		return dshBlockIndexText(
+		const options = optionsFor(session);
+		const index = dshBlockIndexText(
 			session,
-			optionsFor(session),
+			options,
 			states.get(String(session.id)),
 			positiveEnv("CLM_INDEX_REFRESH_STEPS", 4),
 		);
+		if (!index) return "";
+		return `Mirror: ${options.mirrorPath}\n${index}`;
 	} catch {
 		return "";
 	}

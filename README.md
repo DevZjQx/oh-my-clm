@@ -145,7 +145,7 @@ token 计数使用共享格式层的 provider-independent `estimateMessageTokens
 - DSH 生命周期使用官方 Harness 的 Cordis `agent/created`、`agent/pre-step`、`session/event`、`systemPrompt.section()`、`systemPrompt.context()` 和 `tools.register()` 扩展点；cleanup 直接对当前 session surface 执行按 ID 的 native replacement，不读取 mirror 文件。
 - `systemPrompt.context()` 负责把 block index 放进模型可见的 runtime context；DSH 自己的 runtime-context snapshot 也会从 mirror records 中排除，避免 index 递归列出自身。
 - 普通 mirror 编辑的 `session/event` 只排队 reconcile，实际 mutation 延迟到 `Session.append()` 发布完成、且 `step/start` 打开新 step 之后执行；`agent/pre-step` 只等待已排队的收敛，不执行 mutation。session projection 仍由 DSH 提供，session log 仍是事实来源。
-- DSH 会按当前 session ID 生成 `/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md`。DSH 文件工具可以直接编辑这个 host-side mirror；sandboxed bash 可能拥有不同的 `/tmp`，除非宿主显式共享该 session 目录。
+- DSH 会按当前 session ID 生成 `/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md`。系统提示给出 mirror 路径模板并说明可编辑（用于压缩），但删除操作明确指向 `cleanup`；runtime context 还会在 block index 上方给出一行 `Mirror:`，写的是当前 session 的具体路径——系统提示段是进程级静态文本，无法填 `<session-id>`。sandboxed bash 可能拥有不同的 `/tmp`，除非宿主显式共享该 session 目录。
 
 ### 编辑语义：与 Pi 的差异
 
@@ -176,7 +176,7 @@ node scripts/build-dsh-plugin.mjs --output ./out/oh-my-clm.tgz
 
 这个脚本会先编译并检查 host entry，再生成只包含 DSH host、运行时 `dist`、manifest、bundle patch、locale、icon 的 npm tgz；Pi extension、TypeScript 源码、测试文件和开发依赖不会进入该专用包。`@deepseek-ai/dsh-tools` 仅作为可选 peer 声明用于兼容性检查，不产生运行时依赖，也不得改回 `dependencies`（原因见 [changelog.md](./changelog.md) 的 0.1.1 说明）。普通 `npm pack` 仍用于构建同时包含 Pi 与 DSH 内容的完整包。
 
-`npm run build:dsh` 会从 `src/features/live-context/dsh-bridge.ts` 和共享格式层生成 `dist/`；`npm pack` 的 `prepack` 也会执行这一步。仓库测试主要是 mock host 和契约/包检查；外部 DSH 验证报告另外覆盖了真实 CLI 安装、bundle activation、system prompt 和 mirror/file-tool 生成。DSH 文件工具运行在宿主侧时可以访问 `/tmp/clm-*`；sandbox 内的 bash 不一定共享同一个 `/tmp`，应按提示使用文件工具编辑 mirror。`Session.append()` 的 replacement 会走正常 `session/event` 发布路径；需要立即验证后端崩溃持久性的部署应由宿主使用官方 `session/flush` 检查点，插件本身不猜测或注册额外的 flush API。
+`npm run build:dsh` 会从 `src/features/live-context/dsh-bridge.ts` 和共享格式层生成 `dist/`；`npm pack` 的 `prepack` 也会执行这一步。仓库测试主要是 mock host 和契约/包检查；外部 DSH 验证报告另外覆盖了真实 CLI 安装、bundle activation、system prompt 和 mirror/file-tool 生成。DSH 文件工具运行在宿主侧时可以访问 `/tmp/clm-*`；sandbox 内的 bash 不一定共享同一个 `/tmp`，因此 mirror 相关操作应以文件工具或 `cleanup` 为准，不要假设两个 `/tmp` 是同一个。`Session.append()` 的 replacement 会走正常 `session/event` 发布路径；需要立即验证后端崩溃持久性的部署应由宿主使用官方 `session/flush` 检查点，插件本身不猜测或注册额外的 flush API。
 
 ### 配置项
 
