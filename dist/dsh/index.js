@@ -25,12 +25,10 @@ function readText(filePath) {
 const fileSystem = { readText, writeText: writePrivateText };
 function promptText() {
     const mirrorTemplate = `${CLM_TEMP_ROOT}/clm-<session-id>/${CLM_MIRROR_FILENAME}`;
-    const indexHead = positiveEnv("CLM_INDEX_HEAD", DEFAULT_BLOCK_INDEX_HEAD);
-    const indexMiddle = positiveEnv("CLM_INDEX_MIDDLE", DEFAULT_BLOCK_INDEX_MIDDLE);
     const refreshSteps = positiveEnv("CLM_INDEX_REFRESH_STEPS", 4);
     return `<oh-my-clm-dsh-live-context>
 The DSH bridge mirrors the current session surface to \`${mirrorTemplate}\`.
-- The live runtime context includes an \`<oh-my-clm-block-index>\` with 1-based IDs, roles, and short previews for the first ${indexHead} editable blocks and a window of ${indexMiddle} centered on the session midpoint (for 200 blocks: 1-40 and 88-112); the blocks between the head and that window, and everything after it, are intentionally not listed, so read LIVE_CTX_MAIN.md if you need their IDs. Choose cleanup IDs from that index. The index is refreshed no more often than once every ${refreshSteps} step(s) and immediately after a cleanup or mirror edit, so blocks created since the last refresh may only be discoverable by reading LIVE_CTX_MAIN.md.
+- The live runtime context includes an \`<oh-my-clm-block-index>\` with 1-based cleanup IDs, roles, and short previews; omitted ranges are marked inline with their IDs. The index is refreshed no more often than once every ${refreshSteps} step(s) and immediately after a cleanup or mirror edit, so blocks created since the last refresh may only be discoverable by reading LIVE_CTX_MAIN.md.
 - ${CLEANUP_DISCIPLINE}
 - Block 1 is load-bearing and is always preserved. The protected initial task has no block ID and is not listed.
 - Use the registered \`cleanup({ blockIds: [...] })\` tool for stale, redundant, or self-referential blocks; it works by ID and does not read truncated bodies. By default the result is a one-line confirmation; the refreshed index appears after the next refresh. Set CLM_CLEANUP_RESULT=full to append the refreshed index immediately, or =none to suppress the result text.

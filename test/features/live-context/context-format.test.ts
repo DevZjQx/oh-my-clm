@@ -340,14 +340,16 @@ test("the block index shows the first 40 plus a 25-block window at the midpoint"
 		toolCallIds: [],
 	}));
 	const index = renderBlockIndex(many, { maxPreviewChars: 32 });
-	assert.match(index, /\n1\. assistant: content 1\n/);
-	assert.match(index, /\n40\. assistant: content 40\n/);
-	assert.doesNotMatch(index, /\n41\. assistant:/);
-	assert.match(index, /\n88\. assistant: content 88\n/);
-	assert.match(index, /\n112\. assistant: content 112\n/);
-	assert.doesNotMatch(index, /\n87\. assistant:/);
-	assert.doesNotMatch(index, /\n113\. assistant:/);
-	assert.doesNotMatch(index, /omitted from this index/);
+	const listed = index.split("\n");
+	const at = (line: string) => listed.findIndex((value) => value === line);
+	assert.ok(at("1. assistant: content 1") >= 0);
+	assert.ok(at("88. assistant: content 88") > at("40. assistant: content 40"));
+	assert.ok(at("112. assistant: content 112") > at("88. assistant: content 88"));
+	// Both skipped runs are named, so an ID jump is never mistaken for a gap.
+	assert.equal(at("... 47 editable block(s) omitted (IDs 41-87)."), at("40. assistant: content 40") + 1);
+	assert.equal(at("... 88 editable block(s) omitted (IDs 113-200)."), at("112. assistant: content 112") + 1);
+	// 65 listed blocks, 2 omission lines, 2 wrapper lines, 1 caption line.
+	assert.equal(listed.length, 70);
 });
 
 test("the centered middle window slides to sit after the head on a short session", () => {
@@ -363,6 +365,9 @@ test("the centered middle window slides to sit after the head on a short session
 	assert.match(index, /\n41\. assistant: content 41\n/);
 	assert.match(index, /\n65\. assistant: content 65\n/);
 	assert.doesNotMatch(index, /\n66\. assistant:/);
+	// The window abuts the head, so only the tail needs an omission line.
+	assert.doesNotMatch(index, /omitted \(IDs 41-/);
+	assert.match(index, /\n\.\.\. 15 editable block\(s\) omitted \(IDs 66-80\)\.\n/);
 });
 
 test("the block index head and middle stay configurable", () => {
@@ -376,7 +381,48 @@ test("the block index head and middle stay configurable", () => {
 	const index = renderBlockIndex(many, { maxPreviewChars: 32, headBlocks: 40, middleBlocks: 40 });
 	assert.match(index, /\n80\. assistant: content 80\n/);
 	assert.doesNotMatch(index, /\n81\. assistant:/);
-	assert.doesNotMatch(index, /omitted from this index/);
+	assert.match(index, /\n\.\.\. 40 editable block\(s\) omitted \(IDs 81-120\)\.\n/);
+});
+
+test("the block index adds no omission line when every block is listed", () => {
+	const many: MirrorRecord[] = Array.from({ length: 40 }, (_, index) => ({
+		id: `block-${index + 1}`,
+		role: "assistant",
+		text: `content ${index + 1}`,
+		protected: false,
+		toolCallIds: [],
+	}));
+	const index = renderBlockIndex(many, { maxPreviewChars: 32 });
+	assert.match(index, /\n40\. assistant: content 40\n/);
+	assert.doesNotMatch(index, /omitted/);
+});
+
+test("the block index names everything it omits when the middle window is disabled", () => {
+	const many: MirrorRecord[] = Array.from({ length: 60 }, (_, index) => ({
+		id: `block-${index + 1}`,
+		role: "assistant",
+		text: `content ${index + 1}`,
+		protected: false,
+		toolCallIds: [],
+	}));
+	const single = renderBlockIndex(many, { maxPreviewChars: 32, headBlocks: 10, middleBlocks: 0 });
+	assert.match(single, /\n\.\.\. 50 editable block\(s\) omitted \(IDs 11-60\)\.\n/);
+	const none = renderBlockIndex(many, { maxPreviewChars: 32, headBlocks: 0, middleBlocks: 0 });
+	assert.match(none, /\n\.\.\. 60 editable block\(s\) omitted \(IDs 1-60\)\.\n/);
+	assert.doesNotMatch(none, /\n1\. assistant:/);
+});
+
+test("a single omitted block gets a singular ID in the omission line", () => {
+	const many: MirrorRecord[] = Array.from({ length: 66 }, (_, index) => ({
+		id: `block-${index + 1}`,
+		role: "assistant",
+		text: `content ${index + 1}`,
+		protected: false,
+		toolCallIds: [],
+	}));
+	const index = renderBlockIndex(many, { maxPreviewChars: 32 });
+	assert.match(index, /\n\.\.\. 1 editable block\(s\) omitted \(ID 66\)\.\n/);
+	assert.doesNotMatch(index, /ID 66-66/);
 });
 
 test("the block index preview defaults to 64 characters", () => {

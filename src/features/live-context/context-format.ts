@@ -17,7 +17,8 @@ export const DEFAULT_BLOCK_INDEX_HEAD = 40;
 /**
  * Size of the middle window. The window is centered on the session midpoint, so
  * 200 editable blocks with this default list 88-112: the head covers 1-40, and
- * blocks 41-87 plus 113-200 stay out of the index.
+ * blocks 41-87 plus 113-200 stay out of the index but are named by omission
+ * lines giving their ID ranges.
  */
 export const DEFAULT_BLOCK_INDEX_MIDDLE = 25;
 
@@ -345,10 +346,12 @@ function blockPreview(text: string, maxChars: number): string {
  * every runtime-context snapshot.
  *
  * The index lists two runs: the first `headBlocks` editable blocks, then a
- * window of `middleBlocks` centered on the session midpoint. Blocks between the
- * head and that window, and everything after it, are omitted without a summary;
- * their IDs have to be discovered from the mirror. With the defaults, 200
- * editable blocks list 1-40 and 88-112.
+ * window of `middleBlocks` centered on the session midpoint. Every block left
+ * out of those runs is accounted for by an omission line naming its ID range, so
+ * a jump in the listed IDs is never ambiguous and the end of the list is never
+ * mistaken for the end of the session. With the defaults, 200 editable blocks
+ * list 1-40, an omission line for 41-87, 88-112, and an omission line for
+ * 113-200.
  */
 export function renderBlockIndex(
 	records: readonly MirrorRecord[],
@@ -364,11 +367,30 @@ export function renderBlockIndex(
 		const blockId = displayIds.get(record.id) ?? record.id;
 		return `${blockId}. ${record.role}: ${blockPreview(record.text, maxPreviewChars)}`;
 	};
+	const omittedLine = (start: number, end: number): string => {
+		const count = end - start + 1;
+		const where = start === end ? `ID ${start}` : `IDs ${start}-${end}`;
+		return `... ${count} editable block(s) omitted (${where}).`;
+	};
+	const lines: string[] = [];
+	const appendRun = (start: number, end: number): void => {
+		if (start > end) return;
+		lines.push(...editable.slice(start - 1, end).map(lineFor));
+	};
+	const appendOmittedRun = (start: number, end: number): void => {
+		if (start > end) return;
+		lines.push(omittedLine(start, end));
+	};
 	const headEnd = Math.min(editable.length, headCount);
-	const selected = editable.slice(0, headEnd);
+	appendRun(1, headEnd);
 	const middle = selectMiddleWindow(editable.length, headEnd, middleCount);
-	if (middle) selected.push(...editable.slice(middle.start - 1, middle.end));
-	const lines = selected.map(lineFor);
+	if (middle) {
+		appendOmittedRun(headEnd + 1, middle.start - 1);
+		appendRun(middle.start, middle.end);
+		appendOmittedRun(middle.end + 1, editable.length);
+	} else {
+		appendOmittedRun(headEnd + 1, editable.length);
+	}
 	return [
 		"<oh-my-clm-block-index>",
 		"Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them.",
