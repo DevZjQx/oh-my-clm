@@ -1,6 +1,6 @@
 import { CLM_MIRROR_FILENAME } from "../../lib/clm-paths.js";
 import { cleanupMirrorForRecords, cleanupToolResult, planCleanup, } from "./context-cleanup.js";
-import { buildMirrorRecords, DEFAULT_MAX_BLOCK_CHARS, DEFAULT_MAX_MIRROR_CHARS, estimateMessageTokens, estimateMirrorTokens, mirrorSignature, parseMirror, planContextEdits, renderBlockIndex, renderMirror, } from "./context-format.js";
+import { buildMirrorRecords, DEFAULT_MAX_BLOCK_CHARS, DEFAULT_MAX_MIRROR_CHARS, estimateMessageTokens, estimateMirrorTokens, mirrorSignature, parseMirror, planContextEdits, renderBlockDigest, renderBlockIndex, renderMirror, } from "./context-format.js";
 /** The DSH-facing mirror filename deliberately matches the Pi adapter. */
 export const DSH_MIRROR_FILENAME = CLM_MIRROR_FILENAME;
 function isRecord(value) {
@@ -66,33 +66,70 @@ export function buildDshMirrorRecords(session, options) {
  * mirror just to discover IDs or identify a block.
  */
 export function renderDshBlockIndex(session, options) {
-    return renderBlockIndex(buildDshMirrorRecords(session, options), options.blockIndex);
+    const records = buildDshMirrorRecords(session, options);
+    if (options.indexMode === "digest") {
+        return renderBlockDigest(records, options.blockIndex);
+    }
+    return renderBlockIndex(records, options.blockIndex);
 }
 /**
  * Render the block index at most once per `refreshSteps` inside one turn.
+ *
+ * DSH assembles the runtime context at `agent/pre-step`, which runs *before*
+ * the upcoming `step/start` is appended (and after the previous `step/end`).
+ * A cache keyed by the open turn/step therefore never matched: it was only
+ * written when a step happened to be open, which is never true at that
+ * moment, so the throttle silently rendered on every step. The key here is
+ * the count of completed steps plus the open turn, both observable at
+ * pre-step time.
  *
  * A cached index stays correct for the blocks it lists: appending new records
  * never renumbers the earlier editable ordinals. Only removal renumbers, and
  * every applied cleanup or mirror edit clears the cache, so a stale entry can
  * omit newer blocks but cannot point a listed ID at the wrong block.
- * `refreshSteps = 1` reproduces the previous per-step rendering.
+ * `refreshSteps = 1` reproduces the per-step rendering.
  */
 export function dshBlockIndexText(session, options, state, refreshSteps = 4) {
-    const coordinates = dshOpenTurnStep(session);
+    const epoch = dshBlockIndexEpoch(session);
     const cached = state?.blockIndex;
     const window = Math.max(1, Math.floor(refreshSteps));
-    if (coordinates
-        && cached
-        && cached.turn === coordinates.turn
-        && coordinates.step >= cached.step
-        && coordinates.step - cached.step < window) {
+    if (cached
+        && cached.turn === epoch.turn
+        && epoch.closedSteps >= cached.closedSteps
+        && epoch.closedSteps - cached.closedSteps < window) {
         return cached.text;
     }
     const text = renderDshBlockIndex(session, options);
-    if (state && coordinates) {
-        state.blockIndex = { turn: coordinates.turn, step: coordinates.step, text };
-    }
+    if (state)
+        state.blockIndex = { turn: epoch.turn, closedSteps: epoch.closedSteps, text };
     return text;
+}
+/**
+ * Fold the coordinates the index cache can observe at pre-step time: the open
+ * turn (set by `turn/start`, cleared by `turn/end`) and the number of steps
+ * that have already completed. The upcoming step is deliberately not part of
+ * the key because it does not exist yet when the runtime context is rendered.
+ */
+export function dshBlockIndexEpoch(session) {
+    if (!session || typeof session.snapshotEvents !== "function")
+        return { closedSteps: 0 };
+    let turn;
+    let closedSteps = 0;
+    for (const event of session.snapshotEvents()) {
+        if (!isRecord(event) || typeof event.type !== "string")
+            continue;
+        const data = isRecord(event.data) ? event.data : undefined;
+        if (event.type === "turn/start") {
+            turn = positiveSafeInteger(data?.turn) ? data.turn : turn;
+        }
+        else if (event.type === "turn/end") {
+            turn = undefined;
+        }
+        else if (event.type === "step/end") {
+            closedSteps += 1;
+        }
+    }
+    return { turn, closedSteps };
 }
 function sequenceFromRecordId(id) {
     if (!id.startsWith("dsh:"))
@@ -419,24 +456,23 @@ export function applyDshContextEdits(session, plan, records, options) {
  * The active session surface is the source of truth; the bridge will render a
  * fresh canonical mirror after the tool result settles.
  */
-export function executeDshCleanup(session, blockIds, options, io, state) {
+export function executeDshCleanup(session, targets, options, io, state) {
     const copy = options.cleanupResult ?? "compact";
     const records = buildDshMirrorRecords(session, options);
-    const plan = planCleanup(records, cleanupMirrorForRecords(records), blockIds, { fixedTokens: options.fixedTokens });
+    const plan = planCleanup(records, cleanupMirrorForRecords(records), targets, { fixedTokens: options.fixedTokens });
     if (plan.status !== "applied") {
-        const index = copy === "full" ? renderBlockIndex(records, options.blockIndex) : undefined;
+        const index = copy === "full" ? renderDshBlockIndex(session, options) : undefined;
         return cleanupToolResult(plan, index, copy);
     }
     try {
         const mutation = applyDshContextEdits(session, plan, records, options);
         if (mutation.status !== "applied") {
-            const index = copy === "full"
-                ? renderBlockIndex(buildDshMirrorRecords(session, options), options.blockIndex)
-                : undefined;
+            const index = copy === "full" ? renderDshBlockIndex(session, options) : undefined;
             return cleanupToolResult({
                 status: "rejected",
                 requestedBlockIds: [...plan.requestedBlockIds],
                 removedBlockIds: [],
+                pairedRemovalIds: [],
                 reason: mutation.reason ?? "The DSH session rejected the cleanup mutation.",
             }, index, copy);
         }
@@ -464,17 +500,16 @@ export function executeDshCleanup(session, blockIds, options, io, state) {
         }
         // The refreshed index is re-rendered in every step's runtime context, so
         // copy it into the tool result only on explicit opt-in.
-        const index = copy === "full" ? renderBlockIndex(nextRecords, options.blockIndex) : undefined;
+        const index = copy === "full" ? renderDshBlockIndex(session, options) : undefined;
         return cleanupToolResult(plan, index, copy);
     }
     catch (error) {
-        const index = copy === "full"
-            ? renderBlockIndex(buildDshMirrorRecords(session, options), options.blockIndex)
-            : undefined;
+        const index = copy === "full" ? renderDshBlockIndex(session, options) : undefined;
         return cleanupToolResult({
             status: "rejected",
             requestedBlockIds: [...plan.requestedBlockIds],
             removedBlockIds: [],
+            pairedRemovalIds: [],
             reason: `DSH cleanup mutation failed: ${error instanceof Error ? error.message : String(error)}`,
         }, index, copy);
     }

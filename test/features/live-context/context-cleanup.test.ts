@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	cleanupToolResult,
+	formatBlockIdRuns,
 	formatCleanupToolResult,
 	parseCleanupArgs,
 	parseCleanupMirror,
@@ -74,8 +75,9 @@ test("cleanup validates IDs and removes whole spans without reconstructing bodie
 		status: "applied",
 		requestedBlockIds: [2, 3],
 		removedBlockIds: [2, 3],
+		pairedRemovalIds: [],
 		reason: "",
-	}), /removed block\(s\): 2, 3/);
+	}), /removed 2 block\(s\): 2-3/);
 });
 
 test("cleanup works when a retained preview is truncated", () => {
@@ -182,13 +184,140 @@ test("cleanup result formatting honors compact, full, and none copies", () => {
 	};
 	const compact = cleanupToolResult(plan, "1. assistant: anchor");
 	assert.equal(compact.copy, "compact");
-	assert.equal(formatCleanupToolResult(compact), "cleanup applied; removed block(s): 2.");
+	assert.equal(formatCleanupToolResult(compact), "cleanup applied; removed 1 block(s): 2.");
 	const full = cleanupToolResult(plan, "1. assistant: anchor", "full");
-	assert.equal(formatCleanupToolResult(full), "cleanup applied; removed block(s): 2.\n\n1. assistant: anchor");
+	assert.equal(formatCleanupToolResult(full), "cleanup applied; removed 1 block(s): 2.\n\n1. assistant: anchor");
 	const none = cleanupToolResult(plan, "1. assistant: anchor", "none");
 	assert.equal(formatCleanupToolResult(none), "");
 	assert.equal(parseCleanupResultCopy(undefined), "compact");
 	assert.equal(parseCleanupResultCopy("full"), "full");
 	assert.equal(parseCleanupResultCopy("none"), "none");
 	assert.equal(parseCleanupResultCopy("verbose"), "compact");
+});
+
+test("cleanup args accept inclusive ranges and a role filter", () => {
+	const ranges = parseCleanupArgs({ ranges: ["3-5", "8"] });
+	assert.equal(ranges.ok, true);
+	if (!ranges.ok) return;
+	assert.deepEqual(ranges.args.blockIds, [3, 4, 5, 8]);
+	assert.deepEqual(ranges.args.explicitIds, []);
+	assert.deepEqual(ranges.args.rangedIds, [3, 4, 5, 8]);
+	assert.deepEqual(ranges.args.skipRoles, []);
+
+	const mixed = parseCleanupArgs({ blockIds: [9], ranges: ["3-5"], skipRoles: ["user"] });
+	assert.equal(mixed.ok, true);
+	if (!mixed.ok) return;
+	assert.deepEqual(mixed.args.blockIds, [3, 4, 5, 9]);
+	assert.deepEqual(mixed.args.explicitIds, [9]);
+	assert.deepEqual(mixed.args.skipRoles, ["user"]);
+	// An ID named explicitly wins over the same ID produced by a range, so it
+	// keeps the strict unknown-ID behavior.
+	const overlapping = parseCleanupArgs({ blockIds: [4], ranges: ["3-5"] });
+	assert.equal(overlapping.ok, true);
+	if (!overlapping.ok) return;
+	assert.deepEqual(overlapping.args.explicitIds, [4]);
+	assert.deepEqual(overlapping.args.blockIds, [3, 4, 5]);
+});
+
+test("cleanup args reject malformed ranges, empty targets, and unknown fields", () => {
+	for (const bad of [
+		{ ranges: ["5-3"] },
+		{ ranges: ["abc"] },
+		{ ranges: ["0-2"] },
+		{ ranges: ["1-100000"] },
+		{ ranges: [3] },
+		{ blockIds: [] },
+		{ blockIds: [], ranges: [] },
+		{ blockIds: [1], extra: true },
+		{ blockIds: [1], skipRoles: ["system"] },
+	]) {
+		assert.equal(parseCleanupArgs(bad).ok, false, JSON.stringify(bad));
+	}
+});
+
+test("a range deletes a whole turn, clamps at the end, and preserves block 1", () => {
+	const records = cleanupRecords();
+	const structural = parseCleanupMirror(renderMirror(records));
+	const parsed = parseCleanupArgs({ ranges: ["1-4"] });
+	assert.equal(parsed.ok, true);
+	if (!parsed.ok) return;
+	const plan = planCleanup(records, structural, parsed.args);
+	assert.equal(plan.status, "applied");
+	// Block 1 is load-bearing, so a range that covers it keeps it; IDs past the
+	// last block are clamped instead of rejecting the whole call.
+	assert.deepEqual(plan.requestedBlockIds, [1, 2, 3, 4]);
+	assert.deepEqual(plan.removedBlockIds, [2, 3, 4]);
+	assert.deepEqual(plan.pairedRemovalIds, []);
+
+	const beyond = parseCleanupArgs({ ranges: ["2-99"] });
+	assert.equal(beyond.ok, true);
+	if (!beyond.ok) return;
+	const clamped = planCleanup(records, structural, beyond.args);
+	assert.equal(clamped.status, "applied");
+	assert.deepEqual(clamped.removedBlockIds, [2, 3, 4]);
+
+	// A mistyped explicit ID is still rejected instead of silently ignored.
+	assert.equal(planCleanup(records, structural, [99]).status, "rejected");
+});
+
+test("skipRoles keeps user blocks inside a requested range", () => {
+	const records = cleanupRecords();
+	const structural = parseCleanupMirror(renderMirror(records));
+	const parsed = parseCleanupArgs({ ranges: ["2-4"], skipRoles: ["user"] });
+	assert.equal(parsed.ok, true);
+	if (!parsed.ok) return;
+	const plan = planCleanup(records, structural, parsed.args);
+	assert.equal(plan.status, "applied");
+	// Block 4 is the later user turn and survives the range.
+	assert.deepEqual(plan.removedBlockIds, [2, 3]);
+});
+
+test("paired removals are reported separately from the requested targets", () => {
+	const records: MirrorRecord[] = [
+		{ id: "task", role: "user", text: "Keep the task.", protected: true, toolCallIds: [] },
+		{ id: "anchor", role: "assistant", text: "Anchor.", protected: false, toolCallIds: [] },
+		{ id: "call", role: "assistant", text: "Running a command.", protected: false, toolCallIds: ["call-1"] },
+		{ id: "result", role: "toolResult", text: "Command output.", protected: false, toolCallIds: [], toolCallId: "call-1" },
+		{ id: "later", role: "user", text: "Later.", protected: false, toolCallIds: [] },
+	];
+	const structural = parseCleanupMirror(renderMirror(records));
+	// Editable ordinals: anchor=1, call=2, result=3, later=4. Requesting the
+	// assistant tool call also removes its result, which was never requested.
+	const plan = planCleanup(records, structural, [2]);
+	assert.equal(plan.status, "applied");
+	assert.deepEqual(plan.requestedBlockIds, [2]);
+	assert.deepEqual(plan.removedBlockIds, [2, 3]);
+	assert.deepEqual(plan.pairedRemovalIds, [3]);
+	const text = formatCleanupToolResult(cleanupToolResult(plan));
+	assert.equal(text, "cleanup applied; removed 2 block(s): 2-3. Paired (not requested): 3.");
+});
+
+test("formatBlockIdRuns compresses sorted runs", () => {
+	assert.equal(formatBlockIdRuns([3, 4, 5, 7, 9, 10]), "3-5, 7, 9-10");
+	assert.equal(formatBlockIdRuns([]), "");
+	assert.equal(formatBlockIdRuns([5, 4, 4, 6]), "4-6");
+});
+
+test("a range that covers block 1 keeps its paired tool result instead of rejecting", () => {
+	const records: MirrorRecord[] = [
+		{ id: "task", role: "user", text: "Task.", protected: true, toolCallIds: [] },
+		{ id: "call", role: "assistant", text: "First tool call.", protected: false, toolCallIds: ["call-1"] },
+		{ id: "result", role: "toolResult", text: "First output.", protected: false, toolCallIds: [], toolCallId: "call-1" },
+		{ id: "later", role: "user", text: "Later turn.", protected: false, toolCallIds: [] },
+	];
+	const structural = parseCleanupMirror(renderMirror(records));
+	const onlyPair = parseCleanupArgs({ ranges: ["1-2"] });
+	assert.equal(onlyPair.ok, true);
+	if (!onlyPair.ok) return;
+	const nothing = planCleanup(records, structural, onlyPair.args);
+	assert.equal(nothing.status, "rejected");
+	assert.match(nothing.reason ?? "", /Nothing in the requested targets is removable/);
+
+	// The same range plus the later turn removes only what is safe.
+	const withLater = parseCleanupArgs({ ranges: ["1-3"] });
+	assert.equal(withLater.ok, true);
+	if (!withLater.ok) return;
+	const plan = planCleanup(records, structural, withLater.args);
+	assert.equal(plan.status, "applied");
+	assert.deepEqual(plan.removedBlockIds, [3]);
 });

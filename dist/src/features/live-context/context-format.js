@@ -30,6 +30,7 @@ export const DEFAULT_BLOCK_INDEX_MIDDLE = 25;
  * block index, and the tool descriptions cannot drift apart.
  */
 export const CLEANUP_DISCIPLINE = "Batch every removal into one cleanup call using only IDs you can positively identify — IDs renumber after each removal, so never chain calls on stale IDs. " +
+    "Prefer one inclusive range per turn (`cleanup({ ranges: [\"3-16\"] })`) over a long list of individual IDs, and add `skipRoles: [\"user\"]` when a range should drop the tool noise but keep the human message. " +
     "Delete a tool-call block together with its paired result, prefer assistant/tool-result noise over user turns, and leave any uncertain ID for a later pass: an unremoved block costs window, a wrong one costs correctness.";
 const EMPTY_MARKER = "<!-- CLM_EMPTY -->";
 const SNAPSHOT_PATTERN = /^<!-- CLM_SNAPSHOT ([a-f0-9]{16}) -->$/;
@@ -302,6 +303,137 @@ export function selectMiddleWindow(total, headEnd, count) {
     const centered = Math.floor(total / 2) - Math.floor(span / 2);
     const start = Math.max(headEnd + 1, Math.min(centered, total - span + 1));
     return { start, end: start + span - 1 };
+}
+export const DEFAULT_DIGEST_MAX_LINES = 40;
+function compactTokens(tokens) {
+    if (tokens < 1_000)
+        return `${tokens} tok`;
+    const thousands = tokens / 1_000;
+    return `${thousands >= 10 ? Math.round(thousands) : thousands.toFixed(1)}k tok`;
+}
+function unitTokens(unit) {
+    return estimateMirrorTokens(unit.records);
+}
+function runRoleLabel(records) {
+    const roles = new Set(records.map((record) => record.role));
+    if (roles.size === 1)
+        return [...roles][0] ?? "block";
+    return "assistant+toolResult";
+}
+/**
+ * Group editable blocks into the units a cleanup decision actually uses: one
+ * turn is the unit between two user messages. Turn boundaries come from the
+ * projected roles alone, so both hosts produce the same grouping without
+ * passing turn/step metadata, and a deletable range never includes a later
+ * user block.
+ *
+ * The final turn is marked open: it is still growing as the turn continues, so
+ * keeping its contents out of the listing is what makes the digest text stable
+ * across steps (and is also the safer deletion boundary, because its tool
+ * pairs may not be settled yet).
+ */
+export function buildBlockDigestUnits(records) {
+    const displayIds = editableDisplayIds(records);
+    const units = [];
+    for (const record of records) {
+        if (record.protected)
+            continue;
+        const ordinal = Number(displayIds.get(record.id));
+        if (!Number.isFinite(ordinal))
+            continue;
+        const last = units[units.length - 1];
+        if (record.role === "user" || !last) {
+            units.push({ kind: record.role === "user" ? "user" : "run", start: ordinal, end: ordinal, records: [record] });
+            continue;
+        }
+        last.end = ordinal;
+        last.records.push(record);
+    }
+    const last = units[units.length - 1];
+    if (last)
+        last.open = true;
+    return units;
+}
+/**
+ * Render the turn-shaped digest of editable blocks.
+ *
+ * The static protocol lives in the host's system-prompt section; this payload
+ * only carries addresses. Its unit is the cleanup unit rather than the
+ * message: one line per turn, giving the ID range, the block count and the
+ * estimated token cost of that stretch. That is the mapping the model cannot
+ * derive from its own transcript — it can see the content of recent turns, but
+ * not which range and how many tokens each stretch costs, and not where its
+ * own recollection of "that failed attempt a few turns ago" sits.
+ *
+ * The text is deliberately invariant while a turn appends ordinary messages:
+ * only completed turns are listed and the growing turn is represented by its
+ * stable start ID. DSH dedupes identical runtime-context snapshots, so the
+ * digest is appended once per turn instead of once per step.
+ */
+export function renderBlockDigest(records, options = {}) {
+    const editable = records.filter((record) => !record.protected);
+    if (editable.length === 0)
+        return "";
+    const maxPreviewChars = Math.max(24, Math.floor(options.maxPreviewChars ?? DEFAULT_BLOCK_INDEX_PREVIEW_CHARS));
+    const maxLines = Math.max(1, Math.floor(options.maxLines ?? DEFAULT_DIGEST_MAX_LINES));
+    const units = buildBlockDigestUnits(records);
+    const open = units.find((unit) => unit.open);
+    // Only completed turns are listed; the growing turn is always represented by
+    // its stable start anchor below, so the payload is never empty and never
+    // changes while ordinary messages are appended.
+    const visible = units.filter((unit) => !unit.open);
+    const lines = [];
+    const lineFor = (unit) => {
+        const tokens = compactTokens(unitTokens(unit));
+        const first = unit.records[0];
+        const preview = first ? blockPreview(first.text, maxPreviewChars) : "(empty)";
+        const load = unit.records.length;
+        const count = load > 1 ? ` ×${load}` : "";
+        const where = unit.start === unit.end ? `${unit.start}` : `${unit.start}-${unit.end}`;
+        if (unit.kind === "run") {
+            return `${where}. ${runRoleLabel(unit.records)}${count} (${tokens}): ${blockPreview(first?.text ?? "", maxPreviewChars)}`;
+        }
+        if (load === 1) {
+            // A turn that is just the user message needs no "turn/user" double label.
+            return `${where}. user (${tokens}): ${preview}`;
+        }
+        const userTokens = first ? compactTokens(estimateMirrorTokens([first])) : "0 tok";
+        const noise = load - 1;
+        const noiseNote = noise > 0 ? ` + ${noise} noise` : "";
+        return `${where}. turn${count} (${tokens}): user (${userTokens})${noiseNote}: ${preview}`;
+    };
+    const omittedLine = (start, end) => {
+        const count = end - start + 1;
+        const where = start === end ? `ID ${start}` : `IDs ${start}-${end}`;
+        return `... ${count} editable block(s) omitted (${where}).`;
+    };
+    const head = Math.min(visible.length, Math.max(0, Math.floor(maxLines / 2)));
+    const tail = Math.max(0, maxLines - head);
+    const selected = visible.length <= maxLines
+        ? visible
+        : [...visible.slice(0, head), ...visible.slice(visible.length - tail)];
+    let previousEnd = 0;
+    for (const unit of selected) {
+        if (unit.start > previousEnd + 1)
+            lines.push(omittedLine(previousEnd + 1, unit.start - 1));
+        lines.push(lineFor(unit));
+        previousEnd = unit.end;
+    }
+    const lastVisible = visible[visible.length - 1];
+    if (lastVisible && lastVisible.end > previousEnd) {
+        lines.push(omittedLine(previousEnd + 1, lastVisible.end));
+    }
+    if (open) {
+        // Only the start is stable while the turn grows; the end is deliberately
+        // omitted so appending ordinary messages cannot change this text.
+        lines.push(`IDs ${open.start}.. (current turn, not listed): ${blockPreview(open.records[0]?.text ?? "", maxPreviewChars)}`);
+    }
+    return [
+        "<oh-my-clm-block-index>",
+        "Editable blocks by cleanup ID; ranges are inclusive. One line per turn; call cleanup({ ranges: [\"A-B\"] }) or cleanup({ blockIds: [...] }) to omit them.",
+        ...lines,
+        "</oh-my-clm-block-index>",
+    ].join("\n");
 }
 export function renderMirror(records, options = {}) {
     const header = [

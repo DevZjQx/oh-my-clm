@@ -4,6 +4,14 @@
 
 ## 未发布
 
+### 新增
+
+- **Turn digest 索引现在是默认（`CLM_INDEX_MODE=blocks` 可回退）。** 索引不再只能逐个列 block：digest 模式每个已完成 turn 一行，给出包含式 ID 区间、块数、估算 token 成本和该 turn 的第一条 user 消息；正在进行的 turn 只给稳定锚点 `IDs N..`。文本在一个 turn 内字节不变，DSH 的快照去重因此命中，索引只在 turn 边界追加。用 `CLM_INDEX_LINES`（默认 40）限制列出的 turn 数。在 7 个真实会话上回放：blocks 模式 224 条快照 / 1.09MB，digest 预测 40 条 / 约 36KB（约 30 倍），见 E-028。真实会话里已经实测：切换后 2 条 digest 快照分别是 684 B 与 749 B，当前渲染与线上文本逐字节一致；同一 turn 内继续追加 block 不再产生新快照。`CLM_INDEX_MODE=blocks` 或 `/clm mode blocks` 可随时回到旧索引。
+- **`cleanup` 支持区间和角色过滤。** 新增 `ranges: ["3-16"]`（包含式）与 `skipRoles: ["user"]`，可以直接删掉一个 turn 的 tool 噪声而保留人类消息。显式 `blockIds` 仍然严格校验未知 ID；range 越界夹取，range 覆盖 block 1 时保留 block 1。两个宿主（Pi / DSH）的 schema、prompt 与结果格式同步更新。
+- **配对级联删除单独上报。** 工具结果新增 `pairedRemovalIds`，文本结果写成 `Paired (not requested): 42`，不再把“没请求却被删”的 ID 混进 `removed`。这正是 `session-08a1d65f` 里 42 被误认为索引错误的来源（E-028）。
+- **`/clm mode [blocks|digest|auto]`（DSH）。** 进程环境只在启动时读取，无法在运行中 A/B；新增命令在当前进程里切换索引形状（`indexModeOverride`），并清空所有缓存的索引文本，从下一步生效；`auto` 撤销会话内覆盖、回到 `CLM_INDEX_MODE`（默认 `digest`）。系统提示里的索引说明改为模式中立，因此切换后不会残留旧形状的描述；`/clm status` 会显示当前模式。
+- **`scripts/measure-session-index.mjs`。** 只读脚本，从 `~/.dsh/sessions` 的真实日志统计索引快照数、字节、步间隔、cleanup 调用形态，并给出 blocks/digest 对比；`--project .` 只看当前项目，`--json` 输出结构化结果。
+
 ### 调整
 
 - **DSH 系统提示不再解释宿主内部持久化机制。** 移除了 `Session.append()` 的 surface-replacement seam、`sourceEventSeqs` 约束、`developer/message` 归因，以及“这是 DSH surface replacement，不是 Pi 的 branch-local `context_edit`”等说明——它们只关系到 bridge 实现，和模型该做什么无关，只会分散注意力。只保留一条可执行规则：bridge 会校验每次编辑，无法应用的编辑会被拒绝并恢复 canonical mirror，重新读取 mirror 而不是盲目重试。两个测试改为断言提示词不含这些实现细节，防止再次漏回。
@@ -18,6 +26,8 @@
 
 ### 修复
 
+- **K=4 索引节流此前从未生效。** DSH 在 `agent/pre-step` 组装 runtime context，然后才追加 `step/start`；上一步的 `step/end` 已经写入，所以渲染时没有打开的 step，旧缓存键 `{turn, step}` 永远写不进去，索引每步都重新渲染。7 个真实会话的 224 条快照间隔全部是 1 步（223 次）或 2 步（1 次），从没出现过 4。缓存键改为“打开中的 turn + 已关闭 step 数”，108 步模拟从 108 段不同文本降到 27 段（E-027）。
+- **README 的索引说明纠正。** 此前写作“没有 tail 或省略摘要”，实际从 0.1.6 起每个未列出的连续区间都有省略行；现已按 blocks/digest 两种模式重写。
 - **DSH bridge state 统一按 session id 键。** `agent/created` 之前按 agent id 保存，而 `cleanup` 工具按 session id 读取；两者不同时 cleanup 拿不到 state，索引缓存也不会在删除后失效。现在 `agent/created`、`session/event`、`agent/disposed` 和 cleanup 查找都使用 session id。
 
 ## 0.1.6（当前版本）

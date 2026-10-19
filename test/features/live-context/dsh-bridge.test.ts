@@ -163,7 +163,7 @@ test("DSH bridge mirrors the host surface and applies edits through Session.appe
 		.replace("I inspected the repository.\nread {\"path\":\"README.md\"}", "The repository is small and TypeScript-based.")
 		.replace(/\n\n\[\[CLM_ENTRY id=2 role=toolResult\]\][\s\S]*?(?=\n\n\[\[CLM_ENTRY id=3)/, "\n");
 	files.writeText(bridgeOptions(String(session.id)).mirrorPath, edited);
-	state.blockIndex = { turn: 1, step: 1, text: "stale index" };
+	state.blockIndex = { turn: 1, closedSteps: 1, text: "stale index" };
 	const result = reconcileDshMirror(state, session, files, bridgeOptions(String(session.id)));
 	assert.equal(result.status, "applied");
 	// An applied mirror edit renumbers IDs and must clear the cached index.
@@ -222,7 +222,7 @@ test("DSH cleanup removes selected blocks directly from the active surface", () 
 	// Default copy is compact: the refreshed index is already re-rendered in
 	// each step's runtime context, so the result carries only the confirmation.
 	assert.equal(result.blockIndex, undefined);
-	assert.match(formatCleanupToolResult(result), /^cleanup applied; removed block\(s\): 3\.$/);
+	assert.match(formatCleanupToolResult(result), /^cleanup applied; removed 1 block\(s\): 3\.$/);
 	assert.deepEqual(session.surface.nodes, [0, 1, 2, 3, 7]);
 	assert.doesNotMatch(files.readText(options.mirrorPath) ?? "", /CLM_ENTRY id=3 role=user/);
 	assert.match(files.readText(options.mirrorPath) ?? "", /CLM_ENTRY id=1 role=assistant/);
@@ -258,7 +258,7 @@ test("DSH cleanup result copy is compact by default with opt-in full and none", 
 	assert.match(full.blockIndex ?? "", /\n1\. assistant: I inspected the repository/);
 	assert.match(full.blockIndex ?? "", /\n2\. toolResult: Large output that can be omitted\./);
 	assert.doesNotMatch(full.blockIndex ?? "", /Keep this later request/);
-	assert.match(formatCleanupToolResult(full), /removed block\(s\): 3\.[\s\S]*\n1\. assistant/);
+	assert.match(formatCleanupToolResult(full), /removed 1 block\(s\): 3\.[\s\S]*\n1\. assistant/);
 
 	const noneSession = dshSession();
 	const none = executeDshCleanup(noneSession, [3], {
@@ -313,7 +313,13 @@ test("DSH block index honors the compact host options", () => {
 });
 
 test("DSH block index refreshes every N steps and invalidates after cleanup", () => {
-	const session = dshSession("/workspace/index-throttle", "dsh-index-throttle");
+	// Production timing: DSH renders the runtime context at agent/pre-step,
+	// before the upcoming step/start is appended and after the previous
+	// step/end. The fixture therefore has no open step when the index renders,
+	// which is exactly the case the old turn/step cache key could not match.
+	const session = dshSession("/workspace/index-throttle", "dsh-index-throttle", undefined, [
+		{ type: "turn/start", data: { turn: 1 } },
+	]);
 	const options = bridgeOptions(String(session.id));
 	const state: DshBridgeState = {};
 	const appendUser = (id: string, text: string) =>
@@ -330,25 +336,37 @@ test("DSH block index refreshes every N steps and invalidates after cleanup", ()
 	assert.equal(dshBlockIndexText(session, options, state, 4), first);
 	assert.doesNotMatch(first, /New block within the window/);
 
-	session.record("step/end", { turn: 1, step: 1 });
-	session.record("step/start", { turn: 1, step: 2 });
-	assert.equal(dshBlockIndexText(session, options, state, 4), first);
-
-	for (let step = 3; step <= 5; step += 1) {
-		session.record("step/end", { turn: 1, step: step - 1 });
-		session.record("step/start", { turn: 1, step });
+	// Steps 1-3 close inside the window; the cached text stays in use.
+	for (let step = 1; step <= 3; step += 1) {
+		session.record("step/end", { turn: 1, step });
+		assert.equal(dshBlockIndexText(session, options, state, 4), first);
 	}
+
+	// Step 4 closes: four completed steps have accumulated, so it re-renders.
+	session.record("step/end", { turn: 1, step: 4 });
 	const refreshed = dshBlockIndexText(session, options, state, 4);
 	assert.notEqual(refreshed, first);
 	assert.match(refreshed, /New block within the window/);
 
+	// A new turn always refreshes even when the step window has not elapsed.
+	session.record("step/end", { turn: 1, step: 5 });
+	assert.equal(dshBlockIndexText(session, options, state, 4), refreshed);
+	session.record("turn/end", { turn: 1 });
+	session.record("turn/start", { turn: 2 });
+	appendUser("user-cache-2", "A new turn starts");
+	const turnTwo = dshBlockIndexText(session, options, state, 4);
+	assert.notEqual(turnTwo, refreshed);
+	assert.match(turnTwo, /A new turn starts/);
+
 	// Removal renumbers IDs, so an applied cleanup must force a fresh render.
+	// The mutation itself needs an open turn/step, which DSH opens after pre-step.
+	session.record("step/start", { turn: 2, step: 6 });
 	// Block 1 is load-bearing for cleanup, so remove block 3 (the later user turn).
 	const cleanup = executeDshCleanup(session, [3], options, undefined, state);
 	assert.equal(cleanup.status, "applied", cleanup.reason);
 	assert.equal(state.blockIndex, undefined);
 	const afterCleanup = dshBlockIndexText(session, options, state, 4);
-	assert.notEqual(afterCleanup, refreshed);
+	assert.notEqual(afterCleanup, turnTwo);
 	assert.doesNotMatch(afterCleanup, /Keep this later request/);
 	assert.match(afterCleanup, /New block within the window/);
 	assert.match(afterCleanup, /\n1\. assistant: I inspected the repository/);
@@ -618,7 +636,7 @@ test("DSH cleanup tool value passes the declared output schema", async () => {
 		delete process.env.CLM_CLEANUP_RESULT;
 		const compact = await run("dsh-output-tool");
 		assert.deepEqual(validateJsonSchemaValue(tool.output.schema, compact.value, "value"), []);
-		assert.deepEqual(compact.rendered, [{ type: "text", text: "cleanup applied; removed block(s): 3." }]);
+		assert.deepEqual(compact.rendered, [{ type: "text", text: "cleanup applied; removed 1 block(s): 3." }]);
 
 		process.env.CLM_CLEANUP_RESULT = "none";
 		const silent = await run("dsh-output-tool-none");
@@ -629,7 +647,7 @@ test("DSH cleanup tool value passes the declared output schema", async () => {
 		const full = await run("dsh-output-tool-full");
 		assert.deepEqual(validateJsonSchemaValue(tool.output.schema, full.value, "value"), []);
 		const fullText = full.rendered[0]?.text ?? "";
-		assert.match(fullText, /^cleanup applied; removed block\(s\): 3\.\n\n<oh-my-clm-block-index>/);
+		assert.match(fullText, /^cleanup applied; removed 1 block\(s\): 3\.\n\n<oh-my-clm-block-index>/);
 	} finally {
 		if (previous === undefined) delete process.env.CLM_CLEANUP_RESULT;
 		else process.env.CLM_CLEANUP_RESULT = previous;
@@ -672,9 +690,9 @@ test("mock DSH host loads the entry, registers hooks, and mutates the active sur
 	assert.equal(typeof indexText, "function");
 	const index = typeof indexText === "function" ? indexText({ agent }) : "";
 	assert.match(index, /<oh-my-clm-block-index>/);
-	assert.match(index, /\n1\. assistant: I inspected the repository/);
-	assert.match(index, /\n2\. toolResult: Large output/);
-	assert.match(index, /\n3\. user: Keep this later request\./);
+	// The production default is the turn digest: one closed run plus the anchor.
+	assert.match(index, /\n1-2\. assistant\+toolResult ×2 \(\d+ tok\)/);
+	assert.match(index, /\nIDs 3\.\. \(current turn, not listed\): Keep this later request\./);
 	const next = () => Promise.resolve({ kind: "enter", messages: [] });
 	await agentContext.emit("agent/pre-step", { agent, turn: 1, step: 1, messages: [], signal: new AbortController().signal }, next);
 	const mirrorPath = sessionMirrorPath(String(session.id));
@@ -694,6 +712,10 @@ test("mock DSH host loads the entry, registers hooks, and mutates the active sur
 });
 
 test("DSH host caches the block index across steps and invalidates on compaction", async () => {
+	// This covers the blocks-mode text, which changes on every appended block.
+	// The digest default is covered by the turn-digest tests.
+	const previousMode = process.env.CLM_INDEX_MODE;
+	process.env.CLM_INDEX_MODE = "blocks";
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-index-cache-"));
 	const root = listenerContext();
 	const agentContext = listenerContext();
@@ -717,8 +739,13 @@ test("DSH host caches the block index across steps and invalidates on compaction
 		assert.equal(text({ agent }), first);
 		assert.doesNotMatch(first, /New block within the window/);
 
+		// Production timing has no open step when the index renders; a single
+		// completed step is inside the window and must keep the cached text.
 		session.record("step/end", { turn: 1, step: 1 });
-		session.record("step/start", { turn: 1, step: 5 });
+		session.record("step/start", { turn: 1, step: 2 });
+		assert.equal(text({ agent }), first);
+		// Four completed steps reach the refresh window.
+		for (let step = 2; step <= 4; step += 1) session.record("step/end", { turn: 1, step });
 		const refreshed = text({ agent });
 		assert.notEqual(refreshed, first);
 		assert.match(refreshed, /New block within the window/);
@@ -728,6 +755,8 @@ test("DSH host caches the block index across steps and invalidates on compaction
 		await root.emit("session/event", session, { seq: 999, type: "compaction/summary", data: {} });
 		assert.match(text({ agent }), /Post compaction block/);
 	} finally {
+		if (previousMode === undefined) delete process.env.CLM_INDEX_MODE;
+		else process.env.CLM_INDEX_MODE = previousMode;
 		fs.rmSync(cwd, { recursive: true, force: true });
 		fs.rmSync(path.dirname(sessionMirrorPath(String(session.id))), { recursive: true, force: true });
 	}
@@ -844,7 +873,7 @@ test("DSH /clm command reports the live mirror status and validates arguments", 
 	const command = root.commands.definitions.get("clm");
 	assert.ok(command, "/clm was not registered");
 	assert.equal(command.name, "clm");
-	assert.equal(command.description, "Show the oh-my-clm live context status");
+	assert.equal(command.description, "Show the oh-my-clm live context status or switch the index mode");
 
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-dsh-clm-command-"));
 	const sessionId = `dsh-clm-command-${process.pid}-${Date.now()}`;
@@ -879,9 +908,125 @@ test("DSH /clm command reports the live mirror status and validates arguments", 
 
 		const rejected = await command.handler(invocation("refresh"));
 		assert.equal(rejected.kind, "error");
-		assert.match(rejected.text, /Usage: \/clm \[status\]/);
+		assert.match(rejected.text, /Usage: \/clm \[status \| mode/);
 	} finally {
 		fs.rmSync(path.dirname(mirrorPath), { recursive: true, force: true });
 		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("DSH digest index collapses a turn and stays byte-stable while it grows", () => {
+	const session = dshSession("/workspace/index-digest", "dsh-index-digest");
+	// user/message carries the message as its own data; tool/result nests it.
+	const append = (type: string, message: unknown) =>
+		(session.append as (type: string, data: unknown, options: unknown) => unknown)(
+			type,
+			type === "user/message" ? message : { message },
+			{ surfaceOp: { op: "append" } },
+		);
+	const options = { ...bridgeOptions(String(session.id)), indexMode: "digest" as const };
+	const first = renderDshBlockIndex(session, options);
+	assert.match(first, /\n1-2\. assistant\+toolResult ×2 \(\d+ tok\): I inspected the repository/);
+	assert.match(first, /\nIDs 3\.\. \(current turn, not listed\): Keep this later request\./);
+	assert.doesNotMatch(first, /omitted/);
+
+	// A tool result appended inside the growing turn belongs to the live run,
+	// whose line is an anchor only, so the runtime-context text must not change.
+	append("tool/result", {
+		id: "tool-live",
+		role: "toolResult",
+		content: [{ type: "text", text: "live output" }],
+		toolCallId: "call-live",
+		source: { kind: "tool" },
+	});
+	assert.equal(renderDshBlockIndex(session, options), first);
+
+	// A new user message closes the previous turn, which is the one point where
+	// the digest has to be re-rendered.
+	append("user/message", {
+		id: "user-next",
+		role: "user",
+		content: [{ type: "text", text: "Next turn" }],
+		source: { kind: "user" },
+	});
+	const next = renderDshBlockIndex(session, options);
+	assert.notEqual(next, first);
+	assert.match(next, /\n3-4\. turn ×2 \(\d+ tok\): user \(\d+ tok\) \+ 1 noise: Keep this later request\./);
+	assert.match(next, /\nIDs 5\.\. \(current turn, not listed\): Next turn/);
+});
+
+test("DSH digest mode renders turn ranges and the cleanup tool accepts a range", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-digest-mode-"));
+	const root = listenerContext();
+	const agentContext = listenerContext();
+	dshHost({ ...root } as any);
+	const session = dshSession(cwd, "dsh-digest-mode");
+	const agent = { id: "agent-digest-mode", session, ctx: agentContext };
+	const previous = process.env.CLM_INDEX_MODE;
+	process.env.CLM_INDEX_MODE = "digest";
+	try {
+		await root.emit("agent/created", { agent });
+		const text = root.contexts[0]?.text as (context: { agent: unknown }) => string;
+		const digest = text({ agent });
+		assert.match(digest, /\n1-2\. assistant\+toolResult ×2 \(\d+ tok\)/);
+		assert.match(digest, /\nIDs 3\.\. \(current turn, not listed\)/);
+		// The production options path (not a per-test option object) selected it.
+		const status = root.commands.definitions.get("clm");
+		const response = status.handler({ agent, rawInput: "status" });
+		assert.match(response.text, /block index: digest/);
+
+		const tool = root.tools.definitions.get("cleanup");
+		const output = await tool.execute({ ranges: ["3-3"] }, { agent });
+		assert.equal(output.status, "applied");
+		assert.deepEqual(output.requestedBlockIds, [3]);
+		assert.deepEqual(output.removedBlockIds, [3]);
+		assert.deepEqual(output.pairedRemovalIds, []);
+	} finally {
+		if (previous === undefined) delete process.env.CLM_INDEX_MODE;
+		else process.env.CLM_INDEX_MODE = previous;
+		fs.rmSync(cwd, { recursive: true, force: true });
+		fs.rmSync(path.dirname(sessionMirrorPath(String(session.id))), { recursive: true, force: true });
+	}
+});
+
+test("DSH /clm mode switches the index shape live and clears the cached preview", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-dsh-clm-mode-"));
+	const root = listenerContext();
+	const agentContext = listenerContext();
+	dshHost({ ...root } as any);
+	const session = dshSession(cwd, `dsh-clm-mode-${process.pid}-${Date.now()}`);
+	const agent = { id: `${String(session.id)}-agent`, session, ctx: agentContext };
+	const command = root.commands.definitions.get("clm");
+	const invocation = (rawInput: string) => ({ agent, commandId: "command-mode", rawInput, attachments: [], signal: new AbortController().signal });
+	try {
+		await root.emit("agent/created", { agent });
+		const text = root.contexts[0]?.text as (context: { agent: unknown }) => string;
+		// The process default is the turn digest; render once so it is cached.
+		assert.match(text({ agent }), /\n1-2\. assistant\+toolResult ×2 \(\d+ tok\)/);
+
+		const switched = await command.handler(invocation("mode blocks"));
+		assert.equal(switched.kind, "success", switched.text);
+		assert.match(text({ agent }), /\n1\. assistant: I inspected the repository/);
+
+		const status = await command.handler(invocation("status"));
+		assert.match(status.text, /block index: blocks/);
+		const current = await command.handler(invocation("mode"));
+		assert.match(current.text, /index mode: blocks/);
+
+		const back = await command.handler(invocation("mode digest"));
+		assert.equal(back.kind, "success", back.text);
+		assert.match(text({ agent }), /\n1-2\. assistant\+toolResult ×2 \(\d+ tok\)/);
+
+		const invalid = await command.handler(invocation("mode compact"));
+		assert.equal(invalid.kind, "error");
+		const auto = await command.handler(invocation("mode auto"));
+		assert.equal(auto.kind, "success", auto.text);
+		// Without CLM_INDEX_MODE the process default is the digest.
+		assert.match(text({ agent }), /\n1-2\. assistant\+toolResult ×2/);
+	} finally {
+		// The override is module state: reset it so later tests see the default.
+		await command.handler(invocation("mode auto"));
+		fs.rmSync(cwd, { recursive: true, force: true });
+		fs.rmSync(path.dirname(sessionMirrorPath(String(session.id))), { recursive: true, force: true });
 	}
 });

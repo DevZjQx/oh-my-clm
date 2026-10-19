@@ -256,16 +256,25 @@ const state: {
 } = {};
 
 const cleanupParameters = Type.Object({
-	blockIds: Type.Array(
+	blockIds: Type.Optional(Type.Array(
 		Type.Integer({ minimum: 1 }),
-		{ minItems: 1, uniqueItems: true, description: "1-based editable block IDs, batched into one call because IDs renumber after each removal; block 1 is always preserved." },
-	),
+		{ uniqueItems: true, description: "1-based editable block IDs. Use this for individual blocks; IDs renumber after each removal, so batch every target into one call." },
+	)),
+	ranges: Type.Optional(Type.Array(
+		Type.String({ pattern: "^\\d+(\\s*-\\s*\\d+)?$" }),
+		{ description: "Inclusive ID ranges such as \"3-16\" or \"42\". Prefer one range for a whole turn; the range clamps to the current surface and block 1 is preserved." },
+	)),
+	skipRoles: Type.Optional(Type.Array(
+		Type.Union([Type.Literal("user"), Type.Literal("assistant"), Type.Literal("toolResult"), Type.Literal("custom")]),
+		{ uniqueItems: true, description: "Roles to keep even when a requested range covers them; use [\"user\"] to drop a turn's tool noise but keep the human message." },
+	)),
 }, { additionalProperties: false });
 
 const cleanupOutputSchema = Type.Object({
 	status: Type.Union([Type.Literal("applied"), Type.Literal("rejected")]),
 	requestedBlockIds: Type.Array(Type.Integer({ minimum: 1 })),
 	removedBlockIds: Type.Array(Type.Integer({ minimum: 1 })),
+	pairedRemovalIds: Type.Array(Type.Integer({ minimum: 1 })),
 	reason: Type.String(),
 }, { additionalProperties: false });
 
@@ -274,6 +283,7 @@ function rejectedCleanupResult(requestedBlockIds: readonly number[], reason: str
 		status: "rejected",
 		requestedBlockIds: [...requestedBlockIds],
 		removedBlockIds: [],
+		pairedRemovalIds: [],
 		reason,
 	};
 }
@@ -295,7 +305,7 @@ function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolRe
 	const plan = planCleanup(
 		records,
 		parseCleanupMirror(text),
-		parsedArgs.args.blockIds,
+		parsedArgs.args,
 		{ fixedTokens: fixedRequestTokens(ctx) },
 	);
 	if (plan.status !== "applied") return cleanupToolResult(plan);
@@ -325,7 +335,7 @@ function contextBudgetNudge(ctx: ExtensionContext, messages: readonly unknown[])
 	const filePath = mirrorPath(ctx);
 	const nudge = `${CONTEXT_NUDGE_MARKER}
 You are at approximately ${tokens}/${budget} context tokens. This is a context-only turn.
-Use \`cleanup({ blockIds: [...] })\` to remove stale blocks by ID; it completes the host-side mutation without a separate mirror read. For a broader change, use exactly one host-side rewrite/edit operation to shorten ${filePath}; do not read or print the mirror, do no task work, and stop after that operation.
+Use \`cleanup({ ranges: [\"A-B\"] })\` or \`cleanup({ blockIds: [...] })\` to remove stale blocks; it completes the host-side mutation without a separate mirror read. For a broader change, use exactly one host-side rewrite/edit operation to shorten ${filePath}; do not read or print the mirror, do no task work, and stop after that operation.
 Preserve the CLM protocol and keep the facts needed for the current task.
 ${CONTEXT_NUDGE_MARKER}`;
 	const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow ?? 0;
@@ -418,9 +428,9 @@ export default function (pi: ExtensionAPI) {
 		description: "Remove stale CLM context blocks by ID without reading or reconstructing their bodies.",
 		promptSnippet: "Remove stale context blocks by ID",
 		promptGuidelines: [
-			"Use cleanup({ blockIds: [...] }) to remove stale blocks by ID.",
+			"Use cleanup({ ranges: [\"A-B\"] }) for a whole turn, or cleanup({ blockIds: [...] }) for individual blocks.",
 			"Block 1 is load-bearing and is always preserved.",
-			"Pass every target in one call; cleanup renumbers IDs after each removal.",
+			"Pass every target in one call; cleanup renumbers IDs after each removal. Paired tool results are reported separately.",
 			"Cleanup is sequential and completes its host-side mirror write before returning.",
 		],
 		parameters: cleanupParameters,
@@ -436,6 +446,7 @@ export default function (pi: ExtensionAPI) {
 						status: result.status,
 						requestedBlockIds: result.requestedBlockIds,
 						removedBlockIds: result.removedBlockIds,
+						pairedRemovalIds: result.pairedRemovalIds,
 						reason: result.reason,
 					},
 					isError: true,
@@ -449,6 +460,7 @@ export default function (pi: ExtensionAPI) {
 					status: result.status,
 					requestedBlockIds: result.requestedBlockIds,
 					removedBlockIds: result.removedBlockIds,
+					pairedRemovalIds: result.pairedRemovalIds,
 					reason: result.reason,
 				},
 				isError: result.status === "rejected",

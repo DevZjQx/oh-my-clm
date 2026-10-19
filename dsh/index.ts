@@ -21,6 +21,7 @@ import {
 	DEFAULT_BLOCK_INDEX_HEAD,
 	DEFAULT_BLOCK_INDEX_MIDDLE,
 	DEFAULT_BLOCK_INDEX_PREVIEW_CHARS,
+	DEFAULT_DIGEST_MAX_LINES,
 	estimateMirrorTokens,
 	renderMirror,
 } from "../src/features/live-context/context-format.ts";
@@ -109,15 +110,42 @@ function readText(filePath: string): string | undefined {
 
 const fileSystem: DshFileSystem = { readText, writeText: writePrivateText };
 
+/**
+ * Live mode override set by `/clm mode`. The DSH process reads its environment
+ * once at launch, so an environment-only switch cannot be A/B tested inside a
+ * running session; this field keeps that experiment possible without a restart.
+ */
+const indexModeOverride: { value?: "blocks" | "digest" } = {};
+
+/**
+ * `digest` lists one line per closed turn and is the default; `blocks` lists
+ * individual blocks. `CLM_INDEX_MODE` selects the process default, and
+ * `/clm mode` selects it for the lifetime of the running process.
+ */
+function indexMode(): "blocks" | "digest" {
+	if (indexModeOverride.value) return indexModeOverride.value;
+	return process.env.CLM_INDEX_MODE === "blocks" ? "blocks" : "digest";
+}
+
+/**
+ * The prompt contract is deliberately mode-neutral. The system prompt section
+ * is registered once, so a `/clm mode` switch must not leave a description of
+ * the previous shape behind; the dynamic index line inside the runtime context
+ * names the actual layout.
+ */
+function indexContract(refreshSteps: number): string {
+	return `The live runtime context includes an \`<oh-my-clm-block-index>\` with 1-based cleanup IDs. It lists either individual blocks or one line per completed turn (inclusive ID ranges with an estimated token cost). The turn still in progress may appear only as a start anchor (\`IDs N..\`) and is not a safe cleanup target while its tool pairs may still be settling. The index is refreshed immediately after a cleanup or mirror edit and at most every ${refreshSteps} step(s) otherwise, so blocks created since the last refresh may only be discoverable by reading LIVE_CTX_MAIN.md.`;
+}
+
 function promptText(): string {
 	const mirrorTemplate = `${CLM_TEMP_ROOT}/clm-<session-id>/${CLM_MIRROR_FILENAME}`;
 	const refreshSteps = positiveEnv("CLM_INDEX_REFRESH_STEPS", 4);
 	return `<oh-my-clm-dsh-live-context>
 The DSH bridge mirrors the current session surface to \`${mirrorTemplate}\`.
-- The live runtime context includes an \`<oh-my-clm-block-index>\` with 1-based cleanup IDs, roles, and short previews; omitted ranges are marked inline with their IDs. The index is refreshed no more often than once every ${refreshSteps} step(s) and immediately after a cleanup or mirror edit, so blocks created since the last refresh may only be discoverable by reading LIVE_CTX_MAIN.md.
+- ${indexContract(refreshSteps)}
 - ${CLEANUP_DISCIPLINE}
 - Block 1 is load-bearing and is always preserved. The protected initial task has no block ID and is not listed.
-- Use the registered \`cleanup({ blockIds: [...] })\` tool for stale, redundant, or self-referential blocks; it works by ID and does not read truncated bodies. By default the result is a one-line confirmation; the refreshed index appears after the next refresh. Set CLM_CLEANUP_RESULT=full to append the refreshed index immediately, or =none to suppress the result text.
+- Use the registered \`cleanup\` tool for stale, redundant, or self-referential blocks: \`cleanup({ ranges: [\"3-16\"] })\` removes a whole turn, \`cleanup({ blockIds: [...] })\` removes individual blocks, and \`skipRoles: [\"user\"]\` keeps human messages inside a range. It works by ID and does not read truncated bodies; paired tool results are removed with their owner and reported separately. By default the result is a one-line confirmation; the refreshed index appears after the next refresh. Set CLM_CLEANUP_RESULT=full to append the refreshed index immediately, or =none to suppress the result text.
 - Read LIVE_CTX_MAIN.md only when you need the full, untruncated body for a rewrite. Edit only the bodies of existing CLM_ENTRY blocks; keep the protocol header, CLM_SNAPSHOT, IDs, roles, and closing markers unchanged.
 - Shorten an existing block or delete it to request omitting stale history. Keep CLM_EMPTY when deleting every editable block.
 - The initial user task is protected. User-authored blocks may be omitted but cannot be rewritten.
@@ -149,10 +177,12 @@ function optionsFor(session: DshSessionLike): DshBridgeOptions {
 		maxMirrorChars: positiveEnv("CLM_MAX_MIRROR_CHARS", 96_000),
 		fixedTokens: positiveEnv("CLM_CONTEXT_FIXED_TOKENS", 0),
 		cleanupResult: cleanupResultCopy(),
+		indexMode: indexMode(),
 		blockIndex: {
 			maxPreviewChars: positiveEnv("CLM_INDEX_PREVIEW", DEFAULT_BLOCK_INDEX_PREVIEW_CHARS),
 			headBlocks: positiveEnv("CLM_INDEX_HEAD", DEFAULT_BLOCK_INDEX_HEAD),
 			middleBlocks: positiveEnv("CLM_INDEX_MIDDLE", DEFAULT_BLOCK_INDEX_MIDDLE),
+			maxLines: positiveEnv("CLM_INDEX_LINES", DEFAULT_DIGEST_MAX_LINES),
 		},
 	};
 }
@@ -194,10 +224,20 @@ const cleanupParameters = {
 		blockIds: {
 			type: "array",
 			items: { type: "integer" },
-			description: "1-based editable block IDs from the live block index; pass every target in one call (IDs renumber after each removal); IDs must be positive and unique; block 1 is always preserved.",
+			description: "1-based editable block IDs from the live block index. Use this for individual blocks; IDs renumber after each removal, so pass every target in one call.",
+		},
+		ranges: {
+			type: "array",
+			items: { type: "string" },
+			description: "Inclusive ID ranges such as \"3-16\" or \"42\". Prefer one range for a whole turn. A range that runs past the current surface clamps, and block 1 is preserved.",
+		},
+		skipRoles: {
+			type: "array",
+			items: { type: "string", enum: ["user", "assistant", "toolResult", "custom"] },
+			description: "Roles to keep even when a requested range covers them; use [\"user\"] to drop a turn's tool noise but keep the human message.",
 		},
 	},
-	required: ["blockIds"],
+	additionalProperties: false,
 } as const;
 
 /**
@@ -212,17 +252,18 @@ const cleanupOutputSchema = {
 		status: { type: "string", enum: ["applied", "rejected"] },
 		requestedBlockIds: { type: "array", items: { type: "integer" } },
 		removedBlockIds: { type: "array", items: { type: "integer" } },
+		pairedRemovalIds: { type: "array", items: { type: "integer" } },
 		reason: { type: "string" },
 		blockIndex: { type: "string" },
 	},
-	required: ["status", "requestedBlockIds", "removedBlockIds", "reason"],
+	required: ["status", "requestedBlockIds", "removedBlockIds", "pairedRemovalIds", "reason"],
 	additionalProperties: false,
 } as const;
 
 function createDshCleanupTool(getState: (sessionId: string) => DshBridgeState | undefined) {
 	return {
 		name: "cleanup",
-		description: "Remove stale CLM context blocks by ID from the live block index without reading or reconstructing their bodies.",
+		description: "Remove stale CLM context blocks by ID range or by individual ID from the live block index without reading or reconstructing their bodies.",
 		parameters: cleanupParameters,
 		output: {
 			schema: cleanupOutputSchema,
@@ -244,7 +285,7 @@ function createDshCleanupTool(getState: (sessionId: string) => DshBridgeState | 
 			if (!session) throw new Error("cleanup requires an active DSH agent session.");
 			const result = await executeDshCleanup(
 				session,
-				parsed.args.blockIds,
+				parsed.args,
 				optionsFor(session),
 				fileSystem,
 				getState(String(session.id)),
@@ -258,7 +299,7 @@ function createDshCleanupTool(getState: (sessionId: string) => DshBridgeState | 
 	};
 }
 
-const CLM_COMMAND_USAGE = "Usage: /clm [status]";
+const CLM_COMMAND_USAGE = "Usage: /clm [status | mode [blocks|digest|auto]]";
 
 /** Compare the on-disk mirror with the projection the bridge would write now. */
 function mirrorStateText(current: string | undefined, canonical: string): string {
@@ -290,18 +331,38 @@ function dshStatusText(session: DshSessionLike, options: DshBridgeOptions): stri
 		`mirror preview: ~${previewTokens} tokens; canonical editable: ~${canonicalTokens} tokens`,
 		`estimated request: ~${fixedTokens + canonicalTokens} tokens (fixed request ~${fixedTokens} + editable mirror ~${canonicalTokens})`,
 		`DSH surface nodes: ${session.surface.nodes.length}`,
+		`block index: ${options.indexMode ?? "blocks"}`,
 		"edit policy: shrink-only",
 		`mirror limits: ${options.maxBlockChars ?? 12_000} chars/block, ${options.maxMirrorChars ?? 96_000} chars total`,
 	].join("\n");
 }
 
-function createDshClmCommand(): DshCommandDefinition {
+function createDshClmCommand(onModeChange: (mode: "blocks" | "digest") => void): DshCommandDefinition {
 	return {
 		name: "clm",
-		description: "Show the oh-my-clm live context status",
-		input: { hint: "status" },
+		description: "Show the oh-my-clm live context status or switch the index mode",
+		input: { hint: "status | mode [blocks|digest|auto]" },
 		handler: (invocation) => {
 			const input = invocation.rawInput.trim();
+			if (input.startsWith("mode")) {
+				const requested = input.slice(4).trim();
+				if (requested === "") {
+					const current = indexMode();
+					const source = indexModeOverride.value ? "session override" : `CLM_INDEX_MODE=${process.env.CLM_INDEX_MODE ?? "unset"}`;
+					return { kind: "success", text: `oh-my-clm index mode: ${current} (${source})` };
+				}
+				if (requested !== "blocks" && requested !== "digest" && requested !== "auto") {
+					return { kind: "error", text: CLM_COMMAND_USAGE };
+				}
+				indexModeOverride.value = requested === "auto" ? undefined : requested;
+				onModeChange(indexMode());
+				return {
+					kind: "success",
+					text: requested === "auto"
+						? `oh-my-clm index mode: ${indexMode()} (auto; follows CLM_INDEX_MODE, default digest).`
+						: `oh-my-clm index mode: ${requested}. The next step re-renders the block index; this override lasts until the process restarts (set CLM_INDEX_MODE to persist it, or /clm mode auto to drop it).`,
+				};
+			}
 			if (input.length > 0 && input !== "status") {
 				return { kind: "error", text: CLM_COMMAND_USAGE };
 			}
@@ -407,7 +468,10 @@ export function apply(ctx: DshContext): void {
 	if (ctx.commands) {
 		// `/clm` mirrors the Pi extension's status command. The command registry
 		// owns the definition as a Cordis effect, so it is removed with the plugin.
-		ctx.commands.register(createDshClmCommand());
+		ctx.commands.register(createDshClmCommand(() => {
+			// Mode changes the rendered index; every cached preview is now wrong.
+			for (const state of states.values()) state.blockIndex = undefined;
+		}));
 	} else {
 		ctx.logger?.warn?.("oh-my-clm: DSH commands runtime unavailable; /clm was not registered");
 	}

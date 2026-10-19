@@ -9,6 +9,7 @@ import {
 	mirrorSignature,
 	parseMirror,
 	planContextEdits,
+	renderBlockDigest,
 	renderBlockIndex,
 	renderMirror,
 	type MirrorRecord,
@@ -441,4 +442,100 @@ test("the block index preview defaults to 64 characters", () => {
 
 test("the block index is empty when every block is protected", () => {
 	assert.equal(renderBlockIndex([records[0]!]), "");
+});
+
+const digestRecords: MirrorRecord[] = [
+	{ id: "task", role: "user", text: "Build a context editor.", protected: true, toolCallIds: [] },
+	{ id: "a1", role: "assistant", text: "I inspected the repository.", protected: false, toolCallIds: ["c1"] },
+	{ id: "t1", role: "toolResult", text: "A large command output.", protected: false, toolCallIds: [], toolCallId: "c1" },
+	{ id: "u2", role: "user", text: "继续推送更新", protected: false, toolCallIds: [] },
+	{ id: "a2", role: "assistant", text: "Pushed the change.", protected: false, toolCallIds: ["c2"] },
+	{ id: "t2", role: "toolResult", text: "ok", protected: false, toolCallIds: [], toolCallId: "c2" },
+	{ id: "u3", role: "user", text: "清理上下文。", protected: false, toolCallIds: [] },
+];
+
+test("block digest lists one line per turn with an inclusive ID range and token cost", () => {
+	const digest = renderBlockDigest(digestRecords);
+	assert.match(digest, /^<oh-my-clm-block-index>/);
+	assert.match(digest, /\n1-2\. assistant\+toolResult ×2 \(\d+ tok\): I inspected the repository\.\n/);
+	assert.match(digest, /\n3-5\. turn ×3 \(\d+ tok\): user \(\d+ tok\) \+ 2 noise: 继续推送更新\n/);
+	// The growing turn is an anchor only, so its end never has to be guessed.
+	assert.match(digest, /\nIDs 6\.\. \(current turn, not listed\): 清理上下文。\n/);
+	// Protected blocks have no cleanup ID.
+	assert.doesNotMatch(digest, /Build a context editor/);
+	// A range never spans a user block, so deleting a line cannot silently drop
+	// a later human turn.
+	for (const line of digest.split("\n")) {
+		const range = line.match(/^(\d+)-(\d+)\./);
+		if (!range) continue;
+		const from = Number(range[1]);
+		const to = Number(range[2]);
+		assert.ok(!digestRecords.slice(0, 0).length || from <= to);
+		assert.ok(to - from + 1 <= 5, `range ${line} looks too wide`);
+	}
+});
+
+test("block digest is byte-stable while a turn appends ordinary messages", () => {
+	const first = renderBlockDigest(digestRecords);
+	const withNoise: MirrorRecord[] = [
+		...digestRecords,
+		{ id: "a3", role: "assistant", text: "Running the test suite.", protected: false, toolCallIds: [] },
+		{ id: "t3", role: "toolResult", text: "pass", protected: false, toolCallIds: [] },
+	];
+	assert.equal(renderBlockDigest(withNoise), first);
+	// A new user message closes the open turn, which is the only point where the
+	// digest has to change.
+	const withTurn: MirrorRecord[] = [
+		...withNoise,
+		{ id: "u4", role: "user", text: "Now tighten the index.", protected: false, toolCallIds: [] },
+	];
+	const closed = renderBlockDigest(withTurn);
+	assert.notEqual(closed, first);
+	assert.match(closed, /\n6-8\. turn ×3 \(\d+ tok\): user \(\d+ tok\) \+ 2 noise: 清理上下文。\n/);
+	assert.match(closed, /\nIDs 9\.\. \(current turn, not listed\): Now tighten the index\.\n/);
+});
+
+test("block digest caps listed turns and names the omitted ID range", () => {
+	const many: MirrorRecord[] = [];
+	for (let turn = 1; turn <= 60; turn += 1) {
+		many.push({
+			id: `u${turn}`,
+			role: "user",
+			text: `turn ${turn}`,
+			protected: turn === 1,
+			toolCallIds: [],
+		});
+		many.push({ id: `a${turn}`, role: "assistant", text: `answer ${turn}`, protected: false, toolCallIds: [] });
+	}
+	const digest = renderBlockDigest(many, { maxLines: 6 });
+	const lines = digest.split("\n");
+	// 3 oldest + 3 newest turns, plus one omission line for the skipped range.
+	assert.match(digest, /answer 1\n/);
+	assert.match(digest, /turn 3\n/);
+	assert.match(digest, /turn 57\n/);
+	assert.match(digest, /turn 59\n/);
+	assert.doesNotMatch(digest, /turn 30/);
+	assert.ok(lines.some((line) => /^\.\.\. \d+ editable block\(s\) omitted \(IDs \d+-\d+\)\.$/.test(line)));
+	assert.match(digest, /IDs 118\.\. \(current turn, not listed\): turn 60/);
+});
+
+test("block digest stays useful when the only editable blocks are the live run", () => {
+	const digest = renderBlockDigest([
+		{ id: "task", role: "user", text: "Build a context editor.", protected: true, toolCallIds: [] },
+		{ id: "a1", role: "assistant", text: "I inspected the repository.", protected: false, toolCallIds: [] },
+	]);
+	assert.match(digest, /\nIDs 1\.\. \(current turn, not listed\): I inspected the repository\./);
+	assert.equal(renderBlockDigest([]), "");
+	assert.equal(renderBlockDigest([{ id: "only", role: "user", text: "task", protected: true, toolCallIds: [] }]), "");
+});
+
+test("a turn that only contains a user block is listed as one user line", () => {
+	const digest = renderBlockDigest([
+		{ id: "task", role: "user", text: "Task.", protected: true, toolCallIds: [] },
+		{ id: "u1", role: "user", text: "First turn", protected: false, toolCallIds: [] },
+		{ id: "u2", role: "user", text: "Second turn", protected: false, toolCallIds: [] },
+	]);
+	assert.match(digest, /\n1\. user \(\d+ tok\): First turn\n/);
+	assert.doesNotMatch(digest, /\. turn /);
+	assert.match(digest, /\nIDs 2\.\. \(current turn, not listed\): Second turn\n/);
 });
