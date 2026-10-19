@@ -50,7 +50,7 @@ mirror 的结构如下：
 - `id` 是从 `1` 开始的可读编辑序号；不要改 ID，也不要重排 block。扩展内部仍用 Pi 的 opaque entry ID。
 - 删除一个可编辑 block 会从后续 projection 中省略该消息；删除最后一个 block 时保留 `<!-- CLM_EMPTY -->`。
 - 初始用户任务受到保护，不会出现在可编辑区域中；user-authored block 可以被省略，但不能被模型改写。
-- mirror preview 有固定的单 block 和总大小上限；截断只影响显示，不改变 canonical source。
+- Pi 侧的 mirror preview 有固定的单 block 和总大小上限；DSH 默认相同，但可用 `CLM_MAX_BLOCK_CHARS` / `CLM_MAX_MIRROR_CHARS` 覆盖。截断只影响显示，不改变 canonical source。
 - `cleanup({ blockIds: [...] })` 按当前 1-based editable ID 删除 block；load-bearing block 1 始终保留，assistant/tool-result 配对也会整体处理。未知、重复、过期或协议损坏的 ID 会整体拒绝。
 - 如果工具结果读取了 `LIVE_CTX_MAIN.md`，该结果会在未来 projection 中替换成短指针，避免 mirror 自我复制。
 - 改写或删除 assistant tool turn 时，配对的 tool result 也会一起处理，避免孤立的 tool message。
@@ -59,7 +59,7 @@ mirror 的结构如下：
 
 DSH 的 runtime context 会包含 `<oh-my-clm-block-index>`，有两种模式（`CLM_INDEX_MODE`）：
 
-- `digest`（默认）：每个已完成的 turn 一行，给出包含式 ID 区间、块数、估算 token 成本和该 turn 的第一条 user 消息；正在进行的 turn 只给稳定的起始锚点（`IDs N..`），不列出。因为文本在一个 turn 内不变，DSH 只会在 turn 边界追加一条快照，而不是每步一条。
+- `digest`（默认）：每个已完成的 turn 一行，给出包含式 ID 区间、块数、估算 token 成本和该 turn 的第一条 user 消息；正在进行的 turn 只给稳定的起始锚点（`IDs N..`），不列出。正常追加时文本在一个 turn 内不变，DSH 只在 turn 边界追加一条快照，而不是每步一条；`cleanup`、mirror edit 或 compaction 会清空缓存并在同一 turn 内重渲染（见下文 DSH 配置项）。
 - `blocks`（`CLM_INDEX_MODE=blocks`）：逐个列出可编辑 block，给出 cleanup 使用的 1-based ID、role 和短 preview。列表较长时显示前 12 个可编辑 block（“别动”锚点）加**最近 40 个**；两者之间的每个连续区间都用一行 `... N editable block(s) omitted (IDs A-B).` 标出，所以 ID 跳段不会被误读成空洞。
 
 `cleanup` 接受 `ranges: ["3-16"]`（包含式区间）或 `blockIds: [...]`（单块），还可以用 `skipRoles: ["user"]` 在一个 turn 区间里保留人类消息。配对级联删除（assistant tool call 与结果）会单独报告为 `paired`，不会混进你请求的 ID。显式单块 ID 仍然严格校验，range 越界会夹取，range 覆盖 block 1 时保留 block 1。`cleanup({ list: "3-16" })` 是只读的展开：返回该区间的行（role + 短 preview），不做任何删除，因此“索引只给了省略行、但我想先看清楚”不需要读整个 mirror；它不能和删除目标同时出现。只有需要完整、未截断的正文做 rewrite 时才需要读 mirror。
@@ -94,19 +94,19 @@ pi -e .
 /clm mode [blocks|digest|auto]   # 仅 DSH
 ```
 
-`/clm` 与 `/clm status` 等价，Pi 扩展和 DSH 插件都提供。DSH 另有 `/clm mode`：不带参数显示当前模式，带 `blocks` / `digest` 则在当前进程里切换索引形状并清空缓存的索引文本，从下一步开始生效，直到进程重启；`auto` 撤销会话内覆盖、回到 `CLM_INDEX_MODE`（默认 `digest`）。进程环境只在启动时读取一次，所以这是不重启就做 A/B 验证的方式；要跨重启保持，使用 `CLM_INDEX_MODE`。
+`/clm` 与 `/clm status` 等价，Pi 扩展和 DSH 插件都提供。DSH 另有 `/clm mode`：不带参数显示当前模式，带 `blocks` / `digest` 则在当前进程里切换索引形状并清空缓存的索引文本，从下一步开始生效，直到进程重启；`auto` 撤销进程级覆盖、回到 `CLM_INDEX_MODE`（默认 `digest`）。这是进程级覆盖：切换会影响当前进程中的所有 session。进程环境只在启动时读取一次，所以这是不重启就做 A/B 验证的方式；要跨重启保持，使用 `CLM_INDEX_MODE`。
 
 - **Pi 侧**显示 mirror 路径、字节数、可编辑/保护 block 数、preview/canonical 估算 token、Pi context usage、目标预算、shrink-only 策略和 branch 上已持久化的 context edit 数量。
 - **DSH 侧**显示当前 session 的 mirror 路径、mirror 与 canonical projection 是否一致、字节数、可编辑/保护 block 数、preview/canonical token 估算、DSH surface 节点数、shrink-only 策略和 mirror 限制。命令只读，不修改 session、不写 mirror、不追加 session event，也不缓存状态，因此在第一次 bridge pass 之前也能给出准确结果。
 - 两个宿主都不提供 `/clm refresh`。
 
-扩展会在 session start、branch 切换和请求前自动刷新 mirror。在 agent turn 之外直接修改 mirror，会在下一次同步时被恢复为 canonical projection，避免未经校验的内容进入 session。
+扩展会在 session start 和请求前自动刷新 mirror；branch 切换只标记待刷新，真正的刷新发生在下一次 `context` hook 的 `syncMirror`。在 agent turn 之外直接修改 mirror，会在下一次同步时被恢复为 canonical projection，避免未经校验的内容进入 session。
 
 ## 预算与生命周期
 
 ### 预算与 nudge
 
-`CLM_CONTEXT_BUDGET` 是一个近似的目标预算，不是第二个 context window，也不会阻止已经过大的请求。接近目标时，扩展会在 `context` hook 返回一条临时 nudge，要求模型只做一次 mirror 编辑；该 nudge 不写入 session history。没有设置预算时不发送 nudge。
+`CLM_CONTEXT_BUDGET` 是一个近似的目标预算，不是第二个 context window，也不会阻止已经过大的请求。当估算 token 达到约 `0.75 × max(1, budget - 2048)` 时，扩展会在 `context` hook 返回一条临时 nudge，允许模型做一次 `cleanup` 或一次 mirror 编辑；该 nudge 不写入 session history。没有设置预算时不发送 nudge。
 
 ```bash
 CLM_CONTEXT_BUDGET=32000 pi --extension ./extensions/clm.ts
@@ -120,11 +120,11 @@ CLM_CONTEXT_BUDGET=32000 pi --extension ./extensions/clm.ts
 
 ### 显示上限
 
-mirror 的显示上限是固定的：单 block 约 `12000` 字符，总 mirror 约 `96000` 字符。
+Pi 侧的 mirror 显示上限是固定的：单 block 约 `12000` 字符，总 mirror 约 `96000` 字符。DSH 默认使用相同值，但可用 `CLM_MAX_BLOCK_CHARS` / `CLM_MAX_MIRROR_CHARS` 覆盖。
 
 ### token 估算
 
-token 计数使用共享格式层的 provider-independent `estimateMessageTokens(message)`，按消息分别估算。对当前 Pi 支持的 text、thinking、tool call、图片、system sections 和 tool declarations，它采用与 Pi host 一致的 `3.5 chars/token` 近似及 rounding。共享层不导入 Pi runtime，所以 DSH 的 `reasoning`、`tool-call`、`tool` 和其他自有消息形状仍走 fallback 估算。
+token 计数使用共享格式层的 provider-independent `estimateMessageTokens(message)`，按消息分别估算。对当前 Pi 支持的 text、thinking、tool call、图片、system sections 和 tool declarations，它采用与 Pi host 一致的 `3.5 chars/token` 近似及 rounding。共享层不导入 Pi runtime，但会显式处理 DSH 的 `reasoning`、`tool-call`、`tool` 等形状；只有未识别的其他自有消息形状才走 fallback 估算。
 
 当前 Pi extension 的公开 `ExtensionContext` 只提供 effective system prompt，`fixedRequestTokens` 因此只计该 prompt；tool declaration overhead 只有在 host 传入结构化 system message 时才会被计入，否则这个估算就不完整。它不是 provider 的精确 tokenizer；Pi/DSH 自身的 context window 仍是最终约束。
 
@@ -144,14 +144,14 @@ token 计数使用共享格式层的 provider-independent `estimateMessageTokens
 - 社区插件发现入口是 [`dsh-plugin.json`](./dsh-plugin.json)，host entry 为构建后的 `dist/dsh/index.js`；官方 bundle 安装元数据位于 `package.json` 的 `dsh.bundle.patch` 和 [`cordis.patch.yml`](./cordis.patch.yml)。在 DSH 0.2.0-rc.2 中，实际生效的是 bundle 元数据；`dsh-plugin.json` 的 Community permissions 目前不应被描述为运行时强制隔离。
 - DSH 生命周期使用官方 Harness 的 Cordis `agent/created`、`agent/pre-step`、`session/event`、`systemPrompt.section()`、`systemPrompt.context()` 和 `tools.register()` 扩展点；cleanup 直接对当前 session surface 执行按 ID 的 native replacement，不读取 mirror 文件。
 - `systemPrompt.context()` 负责把 block index 放进模型可见的 runtime context；DSH 自己的 runtime-context snapshot 也会从 mirror records 中排除，避免 index 递归列出自身。
-- 普通 mirror 编辑的 `session/event` 只排队 reconcile，实际 mutation 延迟到 `Session.append()` 发布完成、且 `step/start` 打开新 step 之后执行；`agent/pre-step` 只等待已排队的收敛，不执行 mutation。session projection 仍由 DSH 提供，session log 仍是事实来源。
+- 普通 mirror 编辑的 `session/event` 只排队 reconcile；当编辑由 `tool/result` 或 `user/message` 触发时，mutation 在该事件的 `Session.append()` 发布完成后、当前仍打开的 step 内执行。`agent/pre-step` 不执行 mutation；它只在 session 仍有 open turn/step 时等待已排队的收敛，否则直接返回，把待处理编辑留给随后的 `step/start`。session projection 仍由 DSH 提供，session log 仍是事实来源。
 - DSH 会按当前 session ID 生成 `/tmp/clm-${sessionId}/LIVE_CTX_MAIN.md`。系统提示给出 mirror 路径模板并说明可编辑（用于压缩），但删除操作明确指向 `cleanup`；runtime context 还会在 block index 上方给出一行 `Mirror:`，写的是当前 session 的具体路径——系统提示段是进程级静态文本，无法填 `<session-id>`。sandboxed bash 可能拥有不同的 `/tmp`，除非宿主显式共享该 session 目录。
 
 ### 编辑语义：与 Pi 的差异
 
 bridge 会对 mirror 编辑执行与 Pi 侧相同的 snapshot、结构安全和 shrink-only 校验；合法编辑通过 DSH 原生 `Session.append()` 的 `surfaceOp: { op: "replace" }` seam 写入当前 session，处理后再把 mirror 重写为新的 canonical DSH projection。
 
-当前 bridge 会改变 DSH active surface，这与 Pi 的 branch-local `context_edit` 不是一回事：cleanup 和普通编辑会追加 `tool/result` content replacement 或 `developer/message` replacement（omission 用空 content，assistant 改写用缩短后的文本），原始事件仍保留在 append-only session log 中，`deriveMessages()` 使用新的 surface。
+当前 bridge 会改变 DSH active surface，这与 Pi 的 branch-local `context_edit` 不是一回事：cleanup 的删除计划全部是 `replacement: null`，因此只追加空 `developer/message` omission；普通 mirror 编辑在改写 tool result 时追加 `tool/result` content replacement，在改写/删除 assistant 时追加 `developer/message`（assistant 改写用缩短后的文本，删除用空 content）。原始事件仍保留在 append-only session log 中，`deriveMessages()` 使用新的 surface。
 
 DSH 明确禁止 `assistant/message` 携带 `sourceEventSeqs`，而每个 replacement 又必须引用所有被遮蔽的节点，所以 assistant block 不能原地替换成另一个 assistant message。改写后的文本以 developer 身份进入模型可见历史，不再归属原模型回复。
 
@@ -180,7 +180,7 @@ node scripts/build-dsh-plugin.mjs --output ./out/oh-my-clm.tgz
 
 ### 配置项
 
-DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 `CLM_CONTEXT_FIXED_TOKENS`；它们只影响 mirror preview 或 shrink-only safety gate 的近似估算，不改变 DSH 的 context window。`CLM_CLEANUP_RESULT` 控制 cleanup 工具结果的拷贝量：默认 `compact` 只返回一行确认（刷新后的 block index 会在下一次索引刷新后出现），`full` 会在结果后附带刷新后的索引，`none` 则不产生结果文本；它只影响模型可见的结果，不改变工具调用记录本身。
+DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 `CLM_CONTEXT_FIXED_TOKENS`；它们只影响 mirror preview 或 shrink-only safety gate 的近似估算，不改变 DSH 的 context window。`CLM_CLEANUP_RESULT` 只在 DSH host bridge 中读取（Pi 侧固定为 `full` 语义）：默认 `compact` 只返回一行确认（刷新后的 block index 会在下一次索引刷新后出现），`full` 会在结果后附带刷新后的索引，`none` 只抑制删除/拒绝确认；`cleanup({ list: "A-B" })` 的只读 listing 在任何 copy 模式下都返回行内容。它只影响模型可见的结果，不改变工具调用记录本身。
 
 Block index 的模式与尺寸开关：`CLM_INDEX_MODE`（`digest` 默认 / `blocks`）、`CLM_INDEX_PREVIEW`（默认 64，preview 字符数）、`CLM_INDEX_HEAD`（默认 12）、`CLM_INDEX_TAIL`（默认 40，尾部窗口宽度；旧名 `CLM_INDEX_MIDDLE` 仍作为回退别名读取）、`CLM_INDEX_LINES`（digest 模式最多列出多少个 turn，默认 40）、`CLM_INDEX_REFRESH_STEPS`（默认 4，同一个 turn 内最多每几步重渲染一次）。
 
@@ -210,14 +210,14 @@ test/{lib,features,adapters,package,harness}
 
 ## 文档
 
-版本更新说明（0.1.0–0.1.6）已移至 [changelog.md](./changelog.md)。
+版本更新说明（0.1.0–0.1.7）已移至 [changelog.md](./changelog.md)。
 
 - [工作原理](./docs/how-it-works.md)：说明 live context mirror、生命周期、编辑校验和限制。
 - [项目结构](./docs/project-structure.md)：说明分层目录、单向依赖规则、测试布局和边界检查。
 - [CLM 技术分析表](./docs/CLM技术分析表.md)：整理 Context Language Models 论文、官方实现和工程取舍。
 - [DSH 证据与 harness](./docs/reports/README.md)：mock host harness 的运行方式和历史验证报告。
 - [DSH 缓存机制](./docs/dsh-cache-explained.md)：整理服务端前缀 KV 缓存、dsh 侧架构对齐和逐请求命中率可观测性。
-- [更新日志](./changelog.md)：0.1.0–0.1.6 各版本的修复与调整说明。
+- [更新日志](./changelog.md)：0.1.0–0.1.7 各版本的修复与调整说明。
 
 ## 开发检查
 
@@ -230,7 +230,7 @@ npm run typecheck
 npm pack --dry-run
 ```
 
-Pi 入口只依赖 Pi 在运行时提供的 host packages；DSH host entry 只依赖 DSH/Cordis 提供的公开生命周期对象。开发依赖用于类型检查和生成 `dist/`。发布白名单包含 `dsh-plugin.json`、`cordis.patch.yml`、`extensions/clm.ts`、`src/lib/`、`src/features/live-context/`、`dsh/`、`dist/`、`locale/` 和 `icon.svg`，不包含本地 session 生成物、`artifacts/` 打包输出或 `/tmp/clm-*` mirror 文件。
+Pi 入口只依赖 Pi 在运行时提供的 host packages；DSH host entry 只依赖 DSH/Cordis 提供的公开生命周期对象。开发依赖用于类型检查和生成 `dist/`。发布白名单包含 `README.md`、`changelog.md`、`docs/` 下的公开文档与 `docs/reports/`（不含 `docs/reckless/` 和本地 `fact-check-2026-10-20.md`）、`dsh-plugin.json`、`cordis.patch.yml`、`extensions/clm.ts`、`src/lib/`、`src/features/live-context/`、`dsh/`、`dist/`、`locale/` 和 `icon.svg`，不包含本地 session 生成物、`artifacts/` 打包输出或 `/tmp/clm-*` mirror 文件。
 
 ## 关键要点
 

@@ -2,14 +2,14 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/how-it-works.md`](./docs/how-it-works.md)。
 
-## 未发布
+## 0.1.7（当前版本）
 
 ### 新增
 
 - **Turn digest 索引现在是默认（`CLM_INDEX_MODE=blocks` 可回退）。** 索引不再只能逐个列 block：digest 模式每个已完成 turn 一行，给出包含式 ID 区间、块数、估算 token 成本和该 turn 的第一条 user 消息；正在进行的 turn 只给稳定锚点 `IDs N..`。文本在一个 turn 内字节不变，DSH 的快照去重因此命中，索引只在 turn 边界追加。用 `CLM_INDEX_LINES`（默认 40）限制列出的 turn 数。在 7 个真实会话上回放：blocks 模式 224 条快照 / 1.09MB，digest 预测 40 条 / 约 36KB（约 30 倍），见 E-028。真实会话里已经实测：切换后 2 条 digest 快照分别是 684 B 与 749 B，当前渲染与线上文本逐字节一致；同一 turn 内继续追加 block 不再产生新快照。`CLM_INDEX_MODE=blocks` 或 `/clm mode blocks` 可随时回到旧索引。
 - **`cleanup` 支持区间和角色过滤。** 新增 `ranges: ["3-16"]`（包含式）与 `skipRoles: ["user"]`，可以直接删掉一个 turn 的 tool 噪声而保留人类消息。显式 `blockIds` 仍然严格校验未知 ID；range 越界夹取，range 覆盖 block 1 时保留 block 1。两个宿主（Pi / DSH）的 schema、prompt 与结果格式同步更新。
 - **配对级联删除单独上报。** 工具结果新增 `pairedRemovalIds`，文本结果写成 `Paired (not requested): 42`，不再把“没请求却被删”的 ID 混进 `removed`。这正是 `session-08a1d65f` 里 42 被误认为索引错误的来源（E-028）。
-- **`/clm mode [blocks|digest|auto]`（DSH）。** 进程环境只在启动时读取，无法在运行中 A/B；新增命令在当前进程里切换索引形状（`indexModeOverride`），并清空所有缓存的索引文本，从下一步生效；`auto` 撤销会话内覆盖、回到 `CLM_INDEX_MODE`（默认 `digest`）。系统提示里的索引说明改为模式中立，因此切换后不会残留旧形状的描述；`/clm status` 会显示当前模式。
+- **`/clm mode [blocks|digest|auto]`（DSH）。** 进程环境只在启动时读取，无法在运行中 A/B；新增命令在当前进程里切换索引形状（`indexModeOverride`），并清空所有缓存的索引文本，从下一步生效；`auto` 撤销进程级覆盖、回到 `CLM_INDEX_MODE`（默认 `digest`）。系统提示里的索引说明改为模式中立，因此切换后不会残留旧形状的描述；`/clm status` 会显示当前模式。
 - **`scripts/measure-session-index.mjs`。** 只读脚本，从 `~/.dsh/sessions` 的真实日志统计索引快照数、字节、步间隔、cleanup 调用形态，并给出 blocks/digest 对比；`--project .` 只看当前项目，`--json` 输出结构化结果。
 - **`cleanup({ list: "A-B" })` 只读展开。** 索引会命名被省略的区间，但看不到区间里是什么；新增的 `list` 参数返回该区间的逐块行（role + 短 preview），不删除、不写 mirror、不依赖 snapshot，两个宿主都支持。它只能单独使用，不能和 `blockIds`/`ranges`/`skipRoles` 混在一次调用里，避免“边看边删”。单次结果有约 6 KB 字符预算，截断时末尾给出继续读取的区间，而不是静默返回部分视图。`CLM_CLEANUP_RESULT=none` 不会吞掉 listing 内容（它只压缩删除确认）。
 - **Digest 增加最大省略 turn 一行。** turn 数超过 `CLM_INDEX_LINES` 时，被折叠的 turn 按估算 token 排序取前三，写成 `... largest omitted turns: 21-24 (4.1k tok), 31-33 (2.9k tok).`。它只读已完成 turn，所以仍然在一个 turn 内字节稳定；回答的是“看不见的那段里哪一段最值得回收”。
@@ -36,7 +36,7 @@
 - **README 的索引说明纠正。** 此前写作“没有 tail 或省略摘要”，实际从 0.1.6 起每个未列出的连续区间都有省略行；现已按 blocks/digest 两种模式重写。
 - **DSH bridge state 统一按 session id 键。** `agent/created` 之前按 agent id 保存，而 `cleanup` 工具按 session id 读取；两者不同时 cleanup 拿不到 state，索引缓存也不会在删除后失效。现在 `agent/created`、`session/event`、`agent/disposed` 和 cleanup 查找都使用 session id。
 
-## 0.1.6（当前版本）
+## 0.1.6
 
 ### 新增
 
@@ -46,7 +46,7 @@
 
 ### 新增
 
-- **`cleanup` 结果默认紧凑化，新增 `CLM_CLEANUP_RESULT`。** DSH 的 cleanup 工具结果默认只返回一行确认（状态 + 请求/移除 ID），不再附带刷新后的 block index——同一份索引已经由 `systemPrompt.context` 在每步动态重渲染，重复拷贝只是噪声。`CLM_CLEANUP_RESULT=full` 恢复附带索引的旧行为，`none` 则不返回结果文本；工具调用与结果事件本身仍完整保留在 session surface 中。Pi 扩展没有索引拷贝，行为不变。
+- **`cleanup` 结果默认紧凑化，新增 `CLM_CLEANUP_RESULT`。** DSH 的 cleanup 工具结果默认只返回一行确认（状态 + 请求/移除 ID），不再附带刷新后的 block index——同一份索引已经由 `systemPrompt.context` 在每步动态重渲染，重复拷贝只是噪声。`CLM_CLEANUP_RESULT=full` 恢复附带索引的旧行为，`none` 只压缩删除/拒绝确认（后续加入的 listing 不受影响）；工具调用与结果事件本身仍完整保留在 session surface 中。Pi 扩展没有索引拷贝，行为不变。
 - **`cleanup` 使用纪律进入模型可见上下文。** 新增导出常量 `CLEANUP_DISCIPLINE`（`src/features/live-context/context-format.ts`），同时用于 DSH 的 `<oh-my-clm-block-index>` 末尾和 Pi 的 system prompt，避免两侧措辞漂移。内容只有两条可机械执行的规则：把要删的 ID 合并在一次调用里（删完会重新编号，不要用旧 ID 连续调用）；tool-call block 与配对结果一起删、优先清理 assistant/tool-result 噪声而不是 user turn、拿不准的 ID 留到下次。两个 host 的 `blockIds` 参数说明也补上“一次调用传完”的提示。索引净增约一行。
 
 ### 修复

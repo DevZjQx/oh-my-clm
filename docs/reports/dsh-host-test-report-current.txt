@@ -12,15 +12,19 @@ node:  v26.11.1
   PASS  section registered exactly once
   PASS  section name matches manifest contribution
   PASS  section order falls back to 3240
-  PASS  section names the mirror template
-  PASS  section describes the Session.append replacement seam
+  PASS  section names the runtime block index
+  PASS  section names the mirror path template
+  PASS  section keeps internal persistence mechanics out of the prompt
   PASS  cleanup tool is registered
-  PASS  section says no proposal or receipt file is written
+  PASS  /clm command is registered
+  PASS  /clm reports the DSH live-context status
+  PASS  section stays a minimal contract
   PASS  runtime block index context registered exactly once
   PASS  runtime block index context name
   PASS  runtime block index context sorts after host policy
   PASS  block index lists editable 1-based IDs
   PASS  block index excludes the protected initial task
+  PASS  runtime context resolves the concrete mirror path
   PASS  section tells the model to use the runtime block index
   PASS  section order follows host TOOL_EDIT order
 
@@ -55,7 +59,7 @@ node:  v26.11.1
   PASS  the applied edit is not repeated on the next pre-step
 
 == 5b. direct cleanup tool ==
-  PASS  defineTool rejects malformed numeric IDs before execute
+  PASS  shared cleanup parser rejects malformed numeric IDs inside execute
   PASS  cleanup result copy is compact by default
   PASS  cleanup returns an applied canonical result
   PASS  cleanup removes the selected active-surface block
@@ -114,7 +118,7 @@ node:  v26.11.1
 == 9. session/event driven sync ==
   PASS  tool/result event refreshes the mirror
   PASS  non-surface events are ignored
-  NOTE  agent.id/session.id mismatch — session/event sync is silently skipped when agent.id !== session.id; DSH enforces equality so this is unreachable in-product
+  NOTE  agent.id/session.id mismatch — session/event sync still matched (state is session-scoped)
 
 == 10. disposal ==
   PASS  disposed agent is dropped from the state map (session/event does not reconcile)
@@ -122,7 +126,7 @@ node:  v26.11.1
   PASS  host listeners are removed on dispose
   PASS  tool registration is removed on dispose
 
-95 passed, 0 failed, 1 observation(s)
+99 passed, 0 failed, 1 observation(s)
 
 observations (measured behaviour, not asserted contract):
-  - agent.id/session.id mismatch: session/event sync is silently skipped when agent.id !== session.id; DSH enforces equality so this is unreachable in-product
+  - agent.id/session.id mismatch: session/event sync still matched (state is session-scoped)

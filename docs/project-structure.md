@@ -30,9 +30,14 @@ oh-my-clm
 │   ├── check-dsh-package.mjs    # 发布元数据检查
 │   └── check-boundaries.mjs     # 单向依赖检查
 ├── docs
+│   ├── README.md                # 文档索引
 │   ├── how-it-works.md          # 生命周期与协议说明
 │   ├── project-structure.md     # 本文
-│   └── reports                  # 历史验证报告 + 报告说明
+│   ├── CLM技术分析表.md          # 论文/官方实现的技术对照
+│   ├── dsh-cache-explained.md   # DSH 前缀缓存机制的资料整理
+│   ├── fact-check-2026-10-20.md # 本轮事实核查报告（本地，不随 npm 包发布）
+│   ├── reports                  # 历史验证报告 + 报告说明
+│   └── reckless                 # 内部决策记录/证据账本/路线图（不发布）
 ├── dist                         # tsc 构建产物（随仓库提交）
 ├── artifacts                    # DSH tgz 输出目录（构建生成，gitignore）
 ├── dsh-plugin.json              # DSH Community v0.15 manifest
@@ -89,7 +94,7 @@ Pi 和 DSH 都通过固定路径发现入口：`package.json` 的 `pi.extensions
 - `test/package/*.test.ts`：manifest / 发布元数据契约；
 - `test/harness/*.mjs`：需要手动运行、依赖构建产物 `dist/` 的 mock-host harness。
 
-`npm test` 运行 `node --test "test/**/*.test.ts"`，只发现 `*.test.ts`，不会把 `test/harness/` 下的手动脚本当成测试。
+`npm test` 运行 `node --experimental-strip-types --test "test/**/*.test.ts"`，只发现 `*.test.ts`，不会把 `test/harness/` 下的手动脚本当成测试。
 
 ## 生成物与证据
 

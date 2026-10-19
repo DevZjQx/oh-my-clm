@@ -261,7 +261,7 @@ function createDshClmCommand(onModeChange) {
                 const requested = input.slice(4).trim();
                 if (requested === "") {
                     const current = indexMode();
-                    const source = indexModeOverride.value ? "session override" : `CLM_INDEX_MODE=${process.env.CLM_INDEX_MODE ?? "unset"}`;
+                    const source = indexModeOverride.value ? "process override" : `CLM_INDEX_MODE=${process.env.CLM_INDEX_MODE ?? "unset"}`;
                     return { kind: "success", text: `oh-my-clm index mode: ${current} (${source})` };
                 }
                 if (requested !== "blocks" && requested !== "digest" && requested !== "auto") {

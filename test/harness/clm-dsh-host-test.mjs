@@ -388,7 +388,7 @@ section("5b. direct cleanup tool");
 	} catch {
 		invalidSchemaRejected = true;
 	}
-	check("defineTool rejects malformed numeric IDs before execute", invalidSchemaRejected && session.events.length === 8);
+	check("shared cleanup parser rejects malformed numeric IDs inside execute", invalidSchemaRejected && session.events.length === 8);
 	const rejected = await cleanupTool.execute({ blockIds: [1] }, { agent: { session } });
 	// `copy` is host-only render state and is stripped before DSH validates the
 	// declared output schema; compact mode is visible through the absent index.

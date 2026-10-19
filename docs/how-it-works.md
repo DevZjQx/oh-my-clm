@@ -73,7 +73,7 @@ Pi context_edit entry
 cleanup({ "blockIds": [2, 3, 4] })
 ```
 
-该工具在一次调用内读取当前 host 状态、按 block ID 完成删除并在返回前写完结果；它不依赖正文，也不会因为 preview 截断而构造错误的 `old_string`。load-bearing block 1、协议头和 `CLM_SNAPSHOT` 保留；assistant/tool-result 配对会一起处理。默认情况下工具结果只有一行确认，因为刷新后的 block index 会在下一次索引刷新后出现；设置 `CLM_CLEANUP_RESULT=full` 可在结果后附带索引，`none` 则不向模型返回结果文本。工具调用和结果事件本身仍完整保留在 session surface 中。
+该工具在一次调用内读取当前 host 状态、按 block ID 完成删除并在返回前写完结果；它不依赖正文，也不会因为 preview 截断而构造错误的 `old_string`。load-bearing block 1、协议头和 `CLM_SNAPSHOT` 保留；assistant/tool-result 配对会一起处理。在 DSH 侧，默认情况下工具结果只有一行确认，因为刷新后的 block index 会在下一次索引刷新后出现；设置 `CLM_CLEANUP_RESULT=full` 可在结果后附带索引，`none` 只抑制删除/拒绝确认，`cleanup({ list: "A-B" })` 的只读 listing 始终返回行内容。`CLM_CLEANUP_RESULT` 只在 DSH host bridge 中读取；Pi 侧固定为 `full` 语义。工具调用和结果事件本身仍完整保留在 session surface 中。
 
 DSH bridge 还会把当前可编辑 block 的索引放进模型可见的 runtime context。默认是 turn 摘要的 `digest` 模式；`CLM_INDEX_MODE=blocks` 切回逐个 block 的列表：
 
@@ -147,7 +147,7 @@ DSH session.surface + session.snapshotEvents()
                                       └─ canonical mirror（原始 log 保留）
 ```
 
-DSH 的 `Session` surface 是由官方框架从已提交事件增量投影出来的；bridge 只读取 `surface.nodes` 和事件快照来适配 `ProjectionEntryLike`。它通过 `systemPrompt.context()` 注册 `oh-my-clm:block-index`，DSH 会把该 contribution 作为 sourced user-role runtime-context snapshot 追加到模型历史；bridge 同时把 `source.kind === "runtime-context"` 的 snapshot 从 mirror records 中排除，因此它们既不会出现在可编辑 block 里，也不会让 index 列出自身。cleanup 工具通过官方 `ctx.tools.register(defineTool(...))` 注册，schema 会在 `execute` 前验证基础参数；共享 parser 再执行正整数、唯一性和 active-surface 约束。cleanup 直接基于当前 surface 的 canonical records 按 ID 执行，不经过 mirror 文件，并在工具返回前写完新的 canonical mirror。`session/event` 是 DSH 的 append-event 观察入口，但回调仍处于当前 `Session.append()` 的发布栈内，所以 bridge 只排队 reconcile，等事件发布完成后再串行检查文件。`agent/pre-step` 运行在 `step/start` 之前，此时 DSH 还没有打开新 step，因此它只等待已排队的收敛，不执行 mutation；真正的 mutation 由 `step/start`（或 `tool/result`、`user/message`）触发，确保下一次模型请求看到已经收敛的 projection。编辑通过 snapshot、结构安全和 shrink-only 校验后，bridge 使用官方 `Session.append()` 的 surface replacement seam：内容编辑追加 `assistant/message` 或 `tool/result` replacement，删除追加使用 append 时打开的 `turn`/`step`（正数）的空 `developer/message` replacement；assistant 改写同样使用这一对坐标，`tool/result` 则严格保持原事件 envelope、只改 `content`。若当前没有打开的 turn/step，bridge 拒绝 mutation 而不是写入坐标过期的事件。所有 replacement 都用 `{ op: "replace", startSeq, endSeq }`，非 assistant replacement 同时提供覆盖目标的 `sourceEventSeqs`。DSH 的 surface fold 会立即遮蔽旧节点，`deriveMessages()` 因而使用新内容；原始事件仍留在 append-only session log 中，mirror 随后重写为新的 canonical projection。DSH 文件工具可访问宿主侧的 `/tmp`，sandbox 内 bash 不应被假定能访问同一目录。
+DSH 的 `Session` surface 是由官方框架从已提交事件增量投影出来的；bridge 只读取 `surface.nodes` 和事件快照来适配 `ProjectionEntryLike`。它通过 `systemPrompt.context()` 注册 `oh-my-clm:block-index`，DSH 会把该 contribution 作为 sourced user-role runtime-context snapshot 追加到模型历史；bridge 同时把 `source.kind === "runtime-context"` 的 snapshot 从 mirror records 中排除，因此它们既不会出现在可编辑 block 里，也不会让 index 列出自身。cleanup 工具通过 `ctx.tools.register(<普通 tool definition>)` 注册；DSH 在返回阶段按声明的 output schema 校验结果，参数校验由共享 `parseCleanupArgs` 在 `execute` 内完成（正整数、唯一性和 active-surface 约束）。cleanup 直接基于当前 surface 的 canonical records 按 ID 执行，不经过 mirror 文件，并在工具返回前写完新的 canonical mirror。`session/event` 是 DSH 的 append-event 观察入口，但回调仍处于当前 `Session.append()` 的发布栈内，所以 bridge 只排队 reconcile，等事件发布完成后再串行检查文件。`agent/pre-step` 运行在 `step/start` 之前，此时 DSH 还没有打开新 step，因此它不执行 mutation；只有 session 仍有 open turn/step 时才等待已排队的收敛，否则直接返回，把待处理编辑留给 `step/start`。真正的 mutation 由 `tool/result`、`user/message`（当前 step 内）或 `step/start`（pre-step 推迟的编辑）触发，确保下一次模型请求看到已经收敛的 projection。编辑通过 snapshot、结构安全和 shrink-only 校验后，bridge 使用官方 `Session.append()` 的 surface replacement seam：assistant 内容编辑追加缩短文本的 `developer/message` replacement，tool result 追加 content-only `tool/result` replacement；删除追加使用 append 时打开的 `turn`/`step`（正数）的空 `developer/message` replacement；assistant 改写同样使用这一对坐标，`tool/result` 则严格保持原事件 envelope、只改 `content`。`assistant/message` 从不作为 replacement 追加，因为 DSH 禁止它携带 `sourceEventSeqs`，而 replacement 又必须引用所有被遮蔽节点。若当前没有打开的 turn/step，bridge 拒绝 mutation 而不是写入坐标过期的事件。所有 replacement 都用 `{ op: "replace", startSeq, endSeq }`，非 assistant replacement 同时提供覆盖目标的 `sourceEventSeqs`。DSH 的 surface fold 会立即遮蔽旧节点，`deriveMessages()` 因而使用新内容；原始事件仍留在 append-only session log 中，mirror 随后重写为新的 canonical projection。DSH 文件工具可访问宿主侧的 `/tmp`，sandbox 内 bash 不应被假定能访问同一目录。
 
 这不是 Pi 的 branch-local `context_edit`：DSH 采用当前 `Session` 的 append-only surface replacement 和它自己的 fork/persistence 语义。它也不需要 proposal、receipt 或自定义 session event。若运行时对象没有已验证的 `Session.append()` owner，bridge 会拒绝编辑并恢复 canonical mirror，而不是退回“看似应用”的 mirror-only 状态。DSH 文件工具运行在宿主侧；sandboxed bash 可能看见隔离的 `/tmp`，因此脚本只有在实际写到了 host-side mirror、且在工具返回前完成写入时才会被 bridge 采纳。
 
@@ -210,7 +210,7 @@ DSH 的 `Session` surface 是由官方框架从已提交事件增量投影出来
 
 ### 4.2 Preview 和 canonical source
 
-为避免大 tool output 撑爆镜像，当前固定限制为：
+为避免大 tool output 撑爆镜像，Pi 侧的固定限制为（DSH 默认相同，可用 `CLM_MAX_BLOCK_CHARS` / `CLM_MAX_MIRROR_CHARS` 覆盖）：
 
 - 单个 block 最多显示约 12,000 字符；
 - 所有可编辑 preview 最多约 96,000 字符；
@@ -339,4 +339,4 @@ npm pack --dry-run
 - Pi 的近似 token estimator，而不是 provider tokenizer；
 - 原始 session JSONL 作为审计和重放来源。
 
-它没有实现独立 Bash agent loop、rollback/retry harness、trajectory export、持久化 receipt、可调 mirror limit 或 user rewrite 开关。DSH 使用宿主 `Session.append()` 的 surface replacement，而不是 Pi 的 branch-local `context_edit`；append-only 原始日志仍是事实来源，session persistence 的即时 flush 由宿主负责。临时 mirror 可能包含 reasoning 和 tool output，虽然写入使用私有权限，仍应由宿主负责生命周期清理。模型生成的摘要仍可能误删事实、引入错误或携带 prompt injection；保护 header、初始任务和 shrink gate 不能替代内容审计。
+它没有实现独立 Bash agent loop、rollback/retry harness、trajectory export、持久化 receipt、Pi 侧可调 mirror limit 或 user rewrite 开关（DSH 侧可用 `CLM_MAX_BLOCK_CHARS` / `CLM_MAX_MIRROR_CHARS` 覆盖默认上限）。DSH 使用宿主 `Session.append()` 的 surface replacement，而不是 Pi 的 branch-local `context_edit`；append-only 原始日志仍是事实来源，session persistence 的即时 flush 由宿主负责。临时 mirror 可能包含 reasoning 和 tool output，虽然写入使用私有权限，仍应由宿主负责生命周期清理。模型生成的摘要仍可能误删事实、引入错误或携带 prompt injection；保护 header、初始任务和 shrink gate 不能替代内容审计。
