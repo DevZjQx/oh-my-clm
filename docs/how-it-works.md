@@ -73,21 +73,22 @@ Pi context_edit entry
 cleanup({ "blockIds": [2, 3, 4] })
 ```
 
-该工具在一次调用内读取当前 host 状态、按 block ID 完成删除并在返回前写完结果；它不依赖正文，也不会因为 preview 截断而构造错误的 `old_string`。load-bearing block 1、协议头和 `CLM_SNAPSHOT` 保留；assistant/tool-result 配对会一起处理。默认情况下工具结果只有一行确认，因为刷新后的 block index 已经在下一步的 runtime context 中重渲染；设置 `CLM_CLEANUP_RESULT=full` 可在结果后附带索引，`none` 则不向模型返回结果文本。工具调用和结果事件本身仍完整保留在 session surface 中。
+该工具在一次调用内读取当前 host 状态、按 block ID 完成删除并在返回前写完结果；它不依赖正文，也不会因为 preview 截断而构造错误的 `old_string`。load-bearing block 1、协议头和 `CLM_SNAPSHOT` 保留；assistant/tool-result 配对会一起处理。默认情况下工具结果只有一行确认，因为刷新后的 block index 会在下一次索引刷新后出现；设置 `CLM_CLEANUP_RESULT=full` 可在结果后附带索引，`none` 则不向模型返回结果文本。工具调用和结果事件本身仍完整保留在 session surface 中。
 
 DSH bridge 还会把当前可编辑 block 的索引放进模型可见的 runtime context：
 
 ```text
 <oh-my-clm-block-index>
-Editable context blocks, in cleanup ID order.
-When the list is longer, this index shows the first 40 and last 40 blocks and summarizes the omitted ID range.
+Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them.
 1. assistant: I inspected the repository and found a small TypeScript project.
 2. toolResult: A very large command output that is no longer useful.
 ...
 </oh-my-clm-block-index>
 ```
 
-索引使用与 `cleanup` 完全相同的 1-based ordinal，并附带 role 和单行短 preview，因此模型不需要为了确认“哪个 ID 对应哪段内容”而读取 mirror。列表超过 80 个 block 时，只显示头部 40 个和尾部 40 个，中间用一行 `... N editable block(s) omitted ... (IDs A-B)` 标出区间；这样长会话仍能看到最新 block 的 ID，同时避免索引无限增长。`cleanup` 的 tool result 也会返回执行后的新索引，避免同一步内连续清理时继续使用已经移位的旧 ID。索引末尾固定附一条 `cleanup` 使用纪律（Pi 侧放在 system prompt 里）：把要删的 ID 合并在**一次**调用里，因为删完会重新编号；tool-call block 必须和它的配对结果一起删；优先清理 assistant/tool-result 噪声而不是 user turn；拿不准的 ID 留到下次——少删一个 block 只花窗口，删错一个要花正确性。只有需要完整、未截断的正文做 rewrite 时，才需要打开 mirror。
+索引使用与 `cleanup` 完全相同的 1-based ordinal，并附带 role 和单行短 preview，因此模型不需要为了确认“哪个 ID 对应哪段内容”而读取 mirror。默认单块 preview 48 字符，列表超过 56 个 block 时只显示头部 40 个和尾部 16 个，中间用一行 `... N editable block(s) omitted ... (IDs A-B)` 标出区间；三个尺寸可用 `CLM_INDEX_PREVIEW`、`CLM_INDEX_HEAD`、`CLM_INDEX_TAIL` 调整。
+
+索引的静态协议（tag 含义、cleanup 使用纪律、block 1 与 protected block 规则）放在系统提示词里，随 system prompt 一起缓存；runtime-context 只携带动态块行。同一个 turn 内索引最多每 `CLM_INDEX_REFRESH_STEPS`（默认 4）步重渲染一次，因此 DSH 不会在每一步都因为索引文本变化而追加新的 runtime-context 快照。追加新 block 不会重编号，所以缓存索引里列出的 ID 始终有效；删除会重编号，`cleanup` 或 mirror edit 生效后会立即清空缓存并重渲染，compaction 事件也会保守失效。`CLM_INDEX_REFRESH_STEPS=1` 恢复每步刷新。只有需要完整、未截断的正文做 rewrite 时，才需要打开 mirror。
 
 需要改写时，模型可以使用一次短 rewrite 脚本完成 read+write；普通 edit 只适用于完整、未截断的 body。模型只能修改已有 block 的 body 或删除已有 block，不能通过添加 block 注入新的上下文消息。ID 是当前 mirror 中从 `1` 开始的可读编辑序号；扩展内部仍映射到 Pi 的 opaque entry ID。
 

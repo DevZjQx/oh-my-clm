@@ -127,7 +127,9 @@ node scripts/build-dsh-plugin.mjs --output ./out/oh-my-clm.tgz
 
 `npm run build:dsh` 会从 `src/features/live-context/dsh-bridge.ts` 和共享格式层生成 `dist/`；`npm pack` 的 `prepack` 也会执行这一步。仓库测试主要是 mock host 和契约/包检查；外部 DSH 验证报告另外覆盖了真实 CLI 安装、bundle activation、system prompt 和 mirror/file-tool 生成。DSH 文件工具运行在宿主侧时可以访问 `/tmp/clm-*`；sandbox 内的 bash 不一定共享同一个 `/tmp`，应按提示使用文件工具编辑 mirror。`Session.append()` 的 replacement 会走正常 `session/event` 发布路径；需要立即验证后端崩溃持久性的部署应由宿主使用官方 `session/flush` 检查点，插件本身不猜测或注册额外的 flush API。
 
-DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 `CLM_CONTEXT_FIXED_TOKENS`；它们只影响 mirror preview 或 shrink-only safety gate 的近似估算，不改变 DSH 的 context window。`CLM_CLEANUP_RESULT` 控制 cleanup 工具结果的拷贝量：默认 `compact` 只返回一行确认（刷新后的 block index 已经在每步的 runtime context 中重渲染），`full` 会在结果后附带刷新后的索引，`none` 则不产生结果文本；它只影响模型可见的结果，不改变工具调用记录本身。
+DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 `CLM_CONTEXT_FIXED_TOKENS`；它们只影响 mirror preview 或 shrink-only safety gate 的近似估算，不改变 DSH 的 context window。`CLM_CLEANUP_RESULT` 控制 cleanup 工具结果的拷贝量：默认 `compact` 只返回一行确认（刷新后的 block index 会在下一次索引刷新后出现），`full` 会在结果后附带刷新后的索引，`none` 则不产生结果文本；它只影响模型可见的结果，不改变工具调用记录本身。
+
+Block index 另有三个尺寸开关和一个节流开关：`CLM_INDEX_PREVIEW`（默认 48，单块 preview 字符数）、`CLM_INDEX_HEAD`（默认 40）、`CLM_INDEX_TAIL`（默认 16）、`CLM_INDEX_REFRESH_STEPS`（默认 4，同一个 turn 内最多每几步重渲染一次）。DSH 只在 runtime-context 快照文本变化时追加新快照，因此节流能减少每步重复注入；`cleanup` 或 mirror edit 生效后会立即失效并重渲染，设为 `1` 可恢复每步刷新。
 
 ## 项目结构
 
@@ -153,6 +155,7 @@ test/{lib,features,adapters,package,harness}
 - [项目结构](./docs/project-structure.md)：说明分层目录、单向依赖规则、测试布局和边界检查。
 - [CLM 技术分析表](./docs/CLM技术分析表.md)：整理 Context Language Models 论文、官方实现和工程取舍。
 - [DSH 证据与 harness](./docs/reports/README.md)：mock host harness 的运行方式和历史验证报告。
+- [DSH 缓存机制](./docs/dsh-cache-explained.md)：整理服务端前缀 KV 缓存、dsh 侧架构对齐和逐请求命中率可观测性。
 - [更新日志](./changelog.md)：0.1.0–0.1.6 各版本的修复与调整说明。
 
 ## 开发检查
