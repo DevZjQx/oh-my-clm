@@ -37,7 +37,6 @@ import {
 	type CleanupToolResult,
 } from "../src/features/live-context/context-cleanup.ts";
 import { sessionMirrorPath } from "../src/lib/clm-paths.ts";
-const STATUS_KEY = "oh-my-clm";
 const PROMPT_MARKER = "<pi-clm-live-context>";
 const CONTEXT_NUDGE_MARKER = "<pi-clm-budget-nudge>";
 const CONTEXT_RESERVE_TOKENS = 2_048;
@@ -97,24 +96,6 @@ function editPlanOptions(ctx: ExtensionContext): EditPlanOptions {
 	return { allowGrowth: false, fixedTokens: fixedRequestTokens(ctx) };
 }
 
-function updateStatus(ctx: ExtensionContext, records: readonly MirrorRecord[], filePath: string, note?: string): void {
-	if (!ctx.hasUI) return;
-	const settings = config();
-	const estimated = fixedRequestTokens(ctx) + estimateMirrorTokens(records);
-	const usage = ctx.getContextUsage();
-	const current = usage?.tokens ?? estimated;
-	const window = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-	const budget = settings.budgetTokens > 0
-		? ` · target ${settings.budgetTokens} ${current > settings.budgetTokens ? "OVER" : "FIT"}`
-		: "";
-	const context = window > 0 ? `ctx ~${current}/${window}` : `ctx ~${current}`;
-	const suffix = note ? ` · ${note}` : "";
-	ctx.ui.setStatus(
-		STATUS_KEY,
-		ctx.ui.theme.fg("accent", `CLM ${context}${budget} · ${records.length} blocks · ${filePath}${suffix}`),
-	);
-}
-
 function notify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error" = "info"): void {
 	if (ctx.hasUI) ctx.ui.notify(message, type);
 }
@@ -144,20 +125,11 @@ function syncMirror(ctx: ExtensionContext, force = false): MirrorSnapshot {
 		// not silently apply it or leave the model looking at stale, untracked data.
 		// Restore the canonical projection; model-issued edits are reconciled in
 		// turn_end, where Pi accepts context_edit entries.
-		const parsed = parseMirror(current);
-		const pending = planContextEdits(previous.records, parsed, editPlanOptions(ctx));
-		if (pending.status !== "noop") {
-			writePrivateText(filePath, rendered);
-			state.lastNotice = "mirror edit restored; edit it during an agent turn";
-		} else {
-			writePrivateText(filePath, rendered);
-		}
+		writePrivateText(filePath, rendered);
 	}
 
 	const snapshot = { filePath, records, rendered, signature };
 	state.snapshot = snapshot;
-	updateStatus(ctx, records, filePath, state.lastNotice);
-	state.lastNotice = undefined;
 	return snapshot;
 }
 
@@ -253,7 +225,6 @@ function mirrorReadContextEdits(event: TurnEndEvent, ctx: ExtensionContext, file
 
 const state: {
 	snapshot?: MirrorSnapshot;
-	lastNotice?: string;
 } = {};
 
 const cleanupParameters = Type.Object({
@@ -300,15 +271,26 @@ function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolRe
 
 	const filePath = mirrorPath(ctx);
 	const settings = config();
-	const records = buildMirrorRecords(getProjection(ctx).entries, {
+	const buildRecords = () => buildMirrorRecords(getProjection(ctx).entries, {
 		mirrorPath: filePath,
 		maxBlockChars: settings.maxBlockChars,
 		maxMirrorChars: settings.maxMirrorChars,
 	});
 	// A listing is answered from the projection and never touches the mirror, so
 	// it works even while the mirror file is missing or stale.
-	if (parsedArgs.args.list) return describeCleanupList(records, parsedArgs.args.list);
+	if (parsedArgs.args.list) return describeCleanupList(buildRecords(), parsedArgs.args.list);
 
+	// Pi appends the assistant message carrying this very tool call after the
+	// request-time mirror write, so an in-turn cleanup usually finds the file one
+	// message behind the projection and would always fail the snapshot check.
+	// Re-render the canonical projection when the file still holds exactly the
+	// text this extension last wrote. A file changed outside the mirror flow is
+	// left alone, so the staleness rejection still protects uncommitted edits.
+	const previous = state.snapshot;
+	const onDisk = readText(filePath);
+	if (!previous || onDisk === undefined || onDisk === previous.rendered) syncMirror(ctx);
+
+	const records = buildRecords();
 	const text = readText(filePath);
 	if (text === undefined) return rejectedCleanupResult(parsedArgs.args.blockIds, `The live mirror is unavailable at ${filePath}.`);
 
@@ -362,7 +344,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		state.snapshot = undefined;
-		state.lastNotice = undefined;
 		// A session switch (including `/resume`) does not necessarily trigger a
 		// model request immediately. Rebuild the external mirror here, after Pi
 		// has bound the new SessionManager, so it cannot retain the previous
@@ -370,14 +351,11 @@ export default function (pi: ExtensionAPI) {
 		syncMirror(ctx);
 	});
 
-	pi.on("session_tree", async (_event, ctx) => {
+	pi.on("session_tree", async () => {
 		state.snapshot = undefined;
-		state.lastNotice = "branch changed";
-		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("dim", "CLM branch changed; mirror will refresh"));
 	});
 
-	pi.on("session_shutdown", async (_event, ctx) => {
-		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
+	pi.on("session_shutdown", async () => {
 		state.snapshot = undefined;
 	});
 
@@ -421,11 +399,6 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (selfReadEntries.length > 0) newEntries.push(...selfReadEntries);
 		if (plan.warnings.length > 0 && ctx.hasUI) ctx.ui.notify(plan.warnings.join("; "), "warning");
-		state.lastNotice = selfReadEntries.length > 0
-			? "self-referential mirror read omitted"
-			: plan.status === "applied"
-				? "edit persisted"
-				: "edit rejected";
 		if (newEntries.length === 0) return;
 		return { entries: [...event.entries, ...newEntries] };
 	});

@@ -1,6 +1,6 @@
 {
   "name": "oh-my-clm",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "A Pi extension and minimal DSH bridge for self-editable live context inspired by the Facebook Research CLM harness.",
   "icon": "./icon.svg",
   "repository": {

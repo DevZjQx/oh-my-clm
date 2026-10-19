@@ -2,7 +2,17 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/how-it-works.md`](./docs/how-it-works.md)。
 
-## 0.1.8（当前版本）
+## 0.1.9（当前版本）
+
+### 调整
+
+- **移除 Pi 扩展底部状态栏。** 不再通过 `ctx.ui.setStatus` 在 footer 持续显示 `CLM ctx … · N blocks · mirror path`，也不再为 branch 切换或会话关闭写状态。`/clm status` 命令保留，状态信息仍通过通知按需查看；仅服务于状态栏的内部提示状态一并删除。
+
+### 修复
+
+- **Pi 会话内 `cleanup` 不再恒被 stale 快照拒绝。** Pi 在请求时写 mirror（`context` 钩子 → `syncMirror`），随后才把带本次 `cleanup` 调用的 assistant 消息追加进 projection，因此工具执行时 records 总比文件多一条，`planCleanup` 的 `CLM_SNAPSHOT` 指纹校验必然失败——实测同一会话连续 4 次删除都返回 `The mirror snapshot is stale; refresh it before cleanup.`，只有 `list` 可用。现在 `executePiCleanup` 会在计划删除前重新同步 mirror，但仅当磁盘内容仍逐字节等于本扩展上次渲染的文本（即没有未合并的模型编辑），否则保持原有的 stale 拒绝，避免覆盖尚未应用到 session 的编辑。新增两条回归测试：一条让 projection 在 sync 之后继续增长并断言删除成功，一条断言磁盘上的未提交编辑不会被重新渲染冲掉。
+
+## 0.1.8
 
 ### 修复
 

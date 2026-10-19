@@ -61,7 +61,7 @@ test("extension mirrors a projection and emits persistent context edits at turn_
 		...projection.entries.map((entry) => entry.sourceEntry),
 	];
 	const sessionId = "test-session";
-	let status = "";
+	let notified = "";
 	const ctx = {
 		cwd,
 		hasUI: true,
@@ -69,9 +69,7 @@ test("extension mirrors a projection and emits persistent context edits at turn_
 		model: undefined,
 		getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
 		ui: {
-			theme: { fg: (_name: string, value: string) => value },
-			setStatus: (_key: string, value: string | undefined) => { status = value ?? ""; },
-			notify: () => undefined,
+			notify: (message: string) => { notified = message; },
 		},
 		sessionManager: {
 			buildSessionProjection: () => projection,
@@ -112,7 +110,7 @@ test("extension mirrors a projection and emits persistent context edits at turn_
 	assert.ok(tools.has("cleanup"));
 	assert.equal(tools.get("cleanup")?.executionMode, "sequential");
 	await commands.get("clm")?.handler("status", ctx);
-	assert.ok(status.includes(mirrorPath));
+	assert.ok(notified.includes(mirrorPath));
 });
 
 test("Pi cleanup removes selected mirror spans in one tool execution", async () => {
@@ -144,7 +142,7 @@ test("Pi cleanup removes selected mirror spans in one tool execution", async () 
 		mode: "print",
 		model: undefined,
 		getContextUsage: () => undefined,
-		ui: { theme: { fg: (_name: string, value: string) => value }, setStatus: () => undefined, notify: () => undefined },
+		ui: { notify: () => undefined },
 		sessionManager: {
 			buildSessionProjection: () => projection,
 			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
@@ -175,6 +173,118 @@ test("Pi cleanup removes selected mirror spans in one tool execution", async () 
 
 	const turnEnd = await handlers.get("turn_end")?.({ entries: [] }, ctx) as { entries: Array<Record<string, unknown>> };
 	assert.ok(turnEnd.entries.some((entry) => entry.type === "context_edit" && entry.targetId === "noise" && entry.replacement === null));
+});
+
+test("Pi cleanup refreshes a mirror that predates the current assistant message", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-cleanup-refresh-"));
+	const sessionId = "cleanup-refresh-session";
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "anchor", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "Anchor block." }] }] },
+			{ sourceEntry: { id: "noise", type: "message" }, messages: [{ role: "user", content: "Stale tool noise." }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const tools = new Map<string, any>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerTool(tool: any) { tools.set(tool.name, tool); },
+		registerCommand: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: false,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: () => undefined },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => sessionId,
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+	const mirrorPath = sessionMirrorPath(sessionId);
+	assert.doesNotMatch(fs.readFileSync(mirrorPath, "utf8"), /Cleaning up the noise/);
+
+	// Pi appends the assistant message that carries the cleanup tool call after
+	// the request-time mirror write. The file is therefore one message behind the
+	// projection when the tool runs; cleanup must re-render instead of rejecting.
+	projection.entries.push({
+		sourceEntry: { id: "assistant-now", type: "message" },
+		messages: [{ role: "assistant", content: [{ type: "text", text: "Cleaning up the noise now." }] }],
+	});
+
+	const tool = tools.get("cleanup");
+	const result = await tool.execute("cleanup-refresh-1", { blockIds: [2] }, undefined, undefined, ctx);
+	assert.equal(result.isError, false);
+	assert.equal(result.structuredContent?.status, "applied");
+	assert.deepEqual(result.structuredContent?.removedBlockIds, [2]);
+	const mirror = fs.readFileSync(mirrorPath, "utf8");
+	assert.doesNotMatch(mirror, /Stale tool noise/);
+	assert.match(mirror, /Cleaning up the noise now/);
+});
+
+test("Pi cleanup keeps an uncommitted mirror edit instead of re-rendering over it", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-cleanup-guard-"));
+	const sessionId = "cleanup-guard-session";
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "anchor", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "Anchor block." }] }] },
+			{ sourceEntry: { id: "noise", type: "message" }, messages: [{ role: "user", content: "Stale tool noise." }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const tools = new Map<string, any>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerTool(tool: any) { tools.set(tool.name, tool); },
+		registerCommand: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: false,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: () => undefined },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => sessionId,
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+	const mirrorPath = sessionMirrorPath(sessionId);
+	const mirror = fs.readFileSync(mirrorPath, "utf8");
+	const edited = mirror.replace("Anchor block.", "Anchor block, model-edited.");
+	assert.notEqual(edited, mirror);
+	fs.writeFileSync(mirrorPath, edited);
+
+	// The file no longer equals the last render, so cleanup must plan against the
+	// on-disk text instead of refreshing the mirror and dropping the edit.
+	const result = await tools.get("cleanup").execute("cleanup-guard-1", { blockIds: [2] }, undefined, undefined, ctx);
+	assert.equal(result.structuredContent?.status, "applied");
+	const after = fs.readFileSync(mirrorPath, "utf8");
+	assert.doesNotMatch(after, /Stale tool noise/);
+	assert.match(after, /Anchor block, model-edited\./);
 });
 
 test("session resume rebuilds the live mirror before the next model request", async () => {
@@ -209,7 +319,7 @@ test("session resume rebuilds the live mirror before the next model request", as
 		mode: "tui",
 		model: undefined,
 		getContextUsage: () => undefined,
-		ui: { theme: { fg: (_name: string, value: string) => value }, setStatus: () => undefined, notify: () => undefined },
+		ui: { notify: () => undefined },
 		sessionManager: {
 			buildSessionProjection: () => projection,
 			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
@@ -273,7 +383,7 @@ test("turn_end replaces a tool result that read the live mirror", async () => {
 		mode: "print",
 		model: undefined,
 		getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
-		ui: { theme: { fg: (_name: string, value: string) => value }, setStatus: () => undefined, notify: () => undefined },
+		ui: { notify: () => undefined },
 		sessionManager: {
 			buildSessionProjection: () => projection,
 			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
@@ -347,7 +457,7 @@ test("budget pressure uses an ephemeral nudge instead of a compact command", asy
 			mode: "print",
 			model: undefined,
 			getContextUsage: () => undefined,
-			ui: { theme: { fg: (_name: string, value: string) => value }, setStatus: () => undefined, notify: () => undefined },
+			ui: { notify: () => undefined },
 			sessionManager: {
 				buildSessionProjection: () => projection,
 				getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
