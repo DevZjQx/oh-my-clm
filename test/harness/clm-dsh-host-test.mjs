@@ -229,9 +229,8 @@ async function boot(plugin, { sessionId, session, order, agentId }) {
 	const host = createCtx({ sectionOrder: order });
 	plugin.apply(host.ctx);
 	const agentCtx = createCtx();
-	// Real DSH enforces `agent.id === agent.session.id` (dsh-agent/lib/index.js throws
-	// on mismatch), and the bridge keys its state map by agent id while session/event
-	// looks it up by session id — so the harness must honour that invariant.
+	// The bridge keys its state map by session id, so a mismatched agent id is
+	// tolerated here. Real DSH also enforces `agent.id === agent.session.id`.
 	const agent = { id: agentId ?? String(session.id), session, ctx: agentCtx.ctx };
 	await host.emit("agent/created", { agent, source: { kind: "new" } });
 	const preStep = async (payload = {}) => {
@@ -383,7 +382,9 @@ section("5b. direct cleanup tool");
 	}
 	check("defineTool rejects malformed numeric IDs before execute", invalidSchemaRejected && session.events.length === 8);
 	const rejected = await cleanupTool.execute({ blockIds: [1] }, { agent: { session } });
-	check("cleanup result copy is compact by default", rejected?.status === "rejected" && rejected.blockIndex === undefined && rejected.copy === "compact", JSON.stringify(rejected));
+	// `copy` is host-only render state and is stripped before DSH validates the
+	// declared output schema; compact mode is visible through the absent index.
+	check("cleanup result copy is compact by default", rejected?.status === "rejected" && rejected.blockIndex === undefined && !("copy" in rejected), JSON.stringify(rejected));
 	process.env.CLM_CLEANUP_RESULT = "full";
 	const result = await cleanupTool.execute({ blockIds: [3] }, { agent: { session } });
 	delete process.env.CLM_CLEANUP_RESULT;
@@ -533,19 +534,20 @@ section("9. session/event driven sync");
 	cleanup(session.id);
 }
 {
-	// The state map is written under `agent.id` but read under `session.id`;
-	// DSH guarantees these are equal, so the mismatch case is recorded, not asserted.
+	// State is session-scoped, so this mismatch should still sync; DSH also
+	// enforces equality in-product. Recorded rather than asserted.
 	const session = sessionWithHistory("t-id-mismatch");
 	const { host, preStep } = await boot(plugin, { sessionId: session.id, session, agentId: "agent-other-id" });
 	await preStep();
 	const appended = session.append("tool/result", { turn: 1, step: 9, message: toolResultMessage("call_7", "orphan sync probe") });
 	const seq = appended.seq;
 	await host.emit("session/event", session, { type: "tool/result", seq, data: appended.data });
+	await new Promise((resolve) => setImmediate(resolve));
 	observe(
 		"agent.id/session.id mismatch",
 		(readIfExists(mirrorPath(session.id)) ?? "").includes("orphan sync probe")
-			? "session/event sync still matched (keying is tolerant)"
-			: "session/event sync is silently skipped when agent.id !== session.id; DSH enforces equality so this is unreachable in-product",
+			? "session/event sync still matched (state is session-scoped)"
+			: "session/event sync did not refresh the mirror in this run",
 	);
 	host.disposeAll();
 	cleanup(session.id);

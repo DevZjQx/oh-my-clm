@@ -17,6 +17,7 @@ import {
 	planContextEdits,
 	renderBlockIndex,
 	renderMirror,
+	type BlockIndexOptions,
 	type ContextEditDraft,
 	type EditPlan,
 	type MirrorRecord,
@@ -73,6 +74,8 @@ export interface DshBridgeOptions {
 	fixedTokens?: number;
 	/** How much of the cleanup tool result is copied into model context. */
 	cleanupResult?: CleanupResultCopy;
+	/** Preview/head/tail budget for the model-facing block index. */
+	blockIndex?: BlockIndexOptions;
 }
 
 export interface DshMirrorSnapshot {
@@ -86,6 +89,18 @@ export interface DshBridgeState {
 	snapshot?: DshMirrorSnapshot;
 	/** Avoid revalidating the same rejected/validated file on every pre-step. */
 	lastProcessedMirror?: string;
+	/**
+	 * Last block index rendered for the model, keyed by the open turn/step.
+	 * Reusing it keeps the runtime-context snapshot text stable, so DSH does not
+	 * append a duplicate snapshot on every step.
+	 */
+	blockIndex?: DshBlockIndexCache;
+}
+
+export interface DshBlockIndexCache {
+	turn: number;
+	step: number;
+	text: string;
 }
 
 export interface DshReconcileResult {
@@ -172,7 +187,41 @@ export function renderDshBlockIndex(
 	session: DshSessionLike,
 	options: DshBridgeOptions,
 ): string {
-	return renderBlockIndex(buildDshMirrorRecords(session, options));
+	return renderBlockIndex(buildDshMirrorRecords(session, options), options.blockIndex);
+}
+
+/**
+ * Render the block index at most once per `refreshSteps` inside one turn.
+ *
+ * A cached index stays correct for the blocks it lists: appending new records
+ * never renumbers the earlier editable ordinals. Only removal renumbers, and
+ * every applied cleanup or mirror edit clears the cache, so a stale entry can
+ * omit newer blocks but cannot point a listed ID at the wrong block.
+ * `refreshSteps = 1` reproduces the previous per-step rendering.
+ */
+export function dshBlockIndexText(
+	session: DshSessionLike,
+	options: DshBridgeOptions,
+	state: DshBridgeState | undefined,
+	refreshSteps = 4,
+): string {
+	const coordinates = dshOpenTurnStep(session);
+	const cached = state?.blockIndex;
+	const window = Math.max(1, Math.floor(refreshSteps));
+	if (
+		coordinates
+		&& cached
+		&& cached.turn === coordinates.turn
+		&& coordinates.step >= cached.step
+		&& coordinates.step - cached.step < window
+	) {
+		return cached.text;
+	}
+	const text = renderDshBlockIndex(session, options);
+	if (state && coordinates) {
+		state.blockIndex = { turn: coordinates.turn, step: coordinates.step, text };
+	}
+	return text;
 }
 
 function sequenceFromRecordId(id: string): number | undefined {
@@ -539,7 +588,7 @@ export function executeDshCleanup(
 	const records = buildDshMirrorRecords(session, options);
 	const plan = planCleanup(records, cleanupMirrorForRecords(records), blockIds, { fixedTokens: options.fixedTokens });
 	if (plan.status !== "applied") {
-		const index = copy === "full" ? renderBlockIndex(records) : undefined;
+		const index = copy === "full" ? renderBlockIndex(records, options.blockIndex) : undefined;
 		return cleanupToolResult(plan, index, copy);
 	}
 
@@ -547,7 +596,7 @@ export function executeDshCleanup(
 		const mutation = applyDshContextEdits(session, plan, records, options);
 		if (mutation.status !== "applied") {
 			const index = copy === "full"
-				? renderBlockIndex(buildDshMirrorRecords(session, options))
+				? renderBlockIndex(buildDshMirrorRecords(session, options), options.blockIndex)
 				: undefined;
 			return cleanupToolResult({
 				status: "rejected",
@@ -556,6 +605,9 @@ export function executeDshCleanup(
 				reason: mutation.reason ?? "The DSH session rejected the cleanup mutation.",
 			}, index, copy);
 		}
+		// Removal renumbers the editable IDs, so the next render must not reuse
+		// the cached index even when this call did not write the mirror.
+		if (state) state.blockIndex = undefined;
 		const nextRecords = buildDshMirrorRecords(session, options);
 		if (io) {
 			// Session.append() has already settled the active surface by the time
@@ -576,11 +628,11 @@ export function executeDshCleanup(
 		}
 		// The refreshed index is re-rendered in every step's runtime context, so
 		// copy it into the tool result only on explicit opt-in.
-		const index = copy === "full" ? renderBlockIndex(nextRecords) : undefined;
+		const index = copy === "full" ? renderBlockIndex(nextRecords, options.blockIndex) : undefined;
 		return cleanupToolResult(plan, index, copy);
 	} catch (error) {
 		const index = copy === "full"
-			? renderBlockIndex(buildDshMirrorRecords(session, options))
+			? renderBlockIndex(buildDshMirrorRecords(session, options), options.blockIndex)
 			: undefined;
 		return cleanupToolResult({
 			status: "rejected",
@@ -635,6 +687,7 @@ export function reconcileDshMirror(
 		// Session.append() synchronously changes the host projection. Rebuild
 		// from the session log instead of deriving a mirror from the plan.
 		records = buildDshMirrorRecords(session, options);
+		if (mutation?.status === "applied") state.blockIndex = undefined;
 	}
 
 	const rendered = renderMirror(records);

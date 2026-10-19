@@ -2,6 +2,20 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/how-it-works.md`](./docs/how-it-works.md)。
 
+## 未发布
+
+### 调整
+
+- **Block index 按 turn 节流并瘦身。** DSH 只在 runtime-context 快照文本变化时追加新快照；此前索引每步都随新 block 变化，导致每步一条完整快照，长会话持续累积重复索引。现在：
+  - 静态协议（tag 含义、cleanup 纪律、block 1/protected 规则）移入 `oh-my-clm:live-context` 系统提示段，索引只保留 tag、一行提示和块行。
+  - 单块 preview 默认 48 字符，默认展示前 40、后 16；新增 `CLM_INDEX_PREVIEW`、`CLM_INDEX_HEAD`、`CLM_INDEX_TAIL`。
+  - 同一 turn 内最多每 `CLM_INDEX_REFRESH_STEPS`（默认 4）步重渲染一次；`cleanup`/mirror edit 生效后立即失效，compaction 事件保守失效；`CLM_INDEX_REFRESH_STEPS=1` 恢复每步刷新。
+  - 预期：80 块索引从约 9.9KB 降到约 3.9KB（200 字符 fixture）；100 步 turn 的索引快照从 100 条降到约 25 条。
+
+### 修复
+
+- **DSH bridge state 统一按 session id 键。** `agent/created` 之前按 agent id 保存，而 `cleanup` 工具按 session id 读取；两者不同时 cleanup 拿不到 state，索引缓存也不会在删除后失效。现在 `agent/created`、`session/event`、`agent/disposed` 和 cleanup 查找都使用 session id。
+
 ## 0.1.6（当前版本）
 
 ### 新增

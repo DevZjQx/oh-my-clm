@@ -11,6 +11,7 @@ import { validateJsonSchemaValue } from "@deepseek-ai/dsh-tools";
 import { sessionMirrorPath } from "../../../src/lib/clm-paths.ts";
 import {
 	buildDshMirrorRecords,
+	dshBlockIndexText,
 	executeDshCleanup,
 	reconcileDshMirror,
 	renderDshBlockIndex,
@@ -162,8 +163,11 @@ test("DSH bridge mirrors the host surface and applies edits through Session.appe
 		.replace("I inspected the repository.\nread {\"path\":\"README.md\"}", "The repository is small and TypeScript-based.")
 		.replace(/\n\n\[\[CLM_ENTRY id=2 role=toolResult\]\][\s\S]*?(?=\n\n\[\[CLM_ENTRY id=3)/, "\n");
 	files.writeText(bridgeOptions(String(session.id)).mirrorPath, edited);
+	state.blockIndex = { turn: 1, step: 1, text: "stale index" };
 	const result = reconcileDshMirror(state, session, files, bridgeOptions(String(session.id)));
 	assert.equal(result.status, "applied");
+	// An applied mirror edit renumbers IDs and must clear the cached index.
+	assert.equal(state.blockIndex, undefined);
 	assert.equal([...files.files.keys()].some((filePath) => filePath.endsWith(".patch.json")), false);
 	assert.deepEqual(session.surface.nodes, [0, 1, 7, 8, 4]);
 	assert.doesNotMatch(files.readText(bridgeOptions(String(session.id)).mirrorPath) ?? "", /Large output that can be omitted/);
@@ -293,6 +297,61 @@ test("DSH runtime-context snapshots are not editable blocks", () => {
 	assert.match(index, /\n1\. assistant: I inspected the repository/);
 	assert.match(index, /\n3\. user: Keep this later request\./);
 	assert.doesNotMatch(index, /runtime context/i);
+});
+
+test("DSH block index honors the compact host options", () => {
+	const session = dshSession("/workspace/index-options", "dsh-index-options");
+	const options = {
+		...bridgeOptions(String(session.id)),
+		blockIndex: { maxPreviewChars: 24, headBlocks: 1, tailBlocks: 1 },
+	};
+	const index = renderDshBlockIndex(session, options);
+	assert.match(index, /\n1\. assistant: I inspected the repo/);
+	assert.doesNotMatch(index, /\n2\. toolResult:/);
+	assert.match(index, /\.\.\. 1 editable block\(s\) omitted from this index \(IDs 2-2\)\./);
+	assert.match(index, /\n3\. user: Keep this later request\./);
+});
+
+test("DSH block index refreshes every N steps and invalidates after cleanup", () => {
+	const session = dshSession("/workspace/index-throttle", "dsh-index-throttle");
+	const options = bridgeOptions(String(session.id));
+	const state: DshBridgeState = {};
+	const appendUser = (id: string, text: string) =>
+		(session.append as (type: string, data: unknown, options: unknown) => unknown)("user/message", {
+			id,
+			role: "user",
+			source: { kind: "user" },
+			content: [{ type: "text", text }],
+		}, { surfaceOp: { op: "append" } });
+
+	const first = dshBlockIndexText(session, options, state, 4);
+	appendUser("user-cache-1", "New block within the window");
+	// Appending never renumbers listed IDs, so the same text stays valid.
+	assert.equal(dshBlockIndexText(session, options, state, 4), first);
+	assert.doesNotMatch(first, /New block within the window/);
+
+	session.record("step/end", { turn: 1, step: 1 });
+	session.record("step/start", { turn: 1, step: 2 });
+	assert.equal(dshBlockIndexText(session, options, state, 4), first);
+
+	for (let step = 3; step <= 5; step += 1) {
+		session.record("step/end", { turn: 1, step: step - 1 });
+		session.record("step/start", { turn: 1, step });
+	}
+	const refreshed = dshBlockIndexText(session, options, state, 4);
+	assert.notEqual(refreshed, first);
+	assert.match(refreshed, /New block within the window/);
+
+	// Removal renumbers IDs, so an applied cleanup must force a fresh render.
+	// Block 1 is load-bearing for cleanup, so remove block 3 (the later user turn).
+	const cleanup = executeDshCleanup(session, [3], options, undefined, state);
+	assert.equal(cleanup.status, "applied", cleanup.reason);
+	assert.equal(state.blockIndex, undefined);
+	const afterCleanup = dshBlockIndexText(session, options, state, 4);
+	assert.notEqual(afterCleanup, refreshed);
+	assert.doesNotMatch(afterCleanup, /Keep this later request/);
+	assert.match(afterCleanup, /New block within the window/);
+	assert.match(afterCleanup, /\n1\. assistant: I inspected the repository/);
 });
 
 test("DSH replacements use the open step instead of the shadowed node's envelope", () => {
@@ -631,6 +690,46 @@ test("mock DSH host loads the entry, registers hooks, and mutates the active sur
 	assert.deepEqual(session.surface.nodes, [0, 1, 7, 8, 4]);
 	assert.equal(fs.readdirSync(path.dirname(mirrorPath)).some((name) => name.includes(".patch.")), false);
 	fs.rmSync(path.dirname(mirrorPath), { recursive: true, force: true });
+});
+
+test("DSH host caches the block index across steps and invalidates on compaction", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-index-cache-"));
+	const root = listenerContext();
+	const agentContext = listenerContext();
+	dshHost({ ...root } as any);
+	const session = dshSession(cwd, "dsh-index-cache");
+	// agent.id deliberately differs from session.id: the cache is session-scoped.
+	const agent = { id: "agent-index-cache", session, ctx: agentContext };
+	const appendUser = (id: string, text: string) =>
+		(session.append as (type: string, data: unknown, options: unknown) => unknown)("user/message", {
+			id,
+			role: "user",
+			source: { kind: "user" },
+			content: [{ type: "text", text }],
+		}, { surfaceOp: { op: "append" } });
+	try {
+		await root.emit("agent/created", { agent });
+		const text = root.contexts[0]?.text as (context: { agent: unknown }) => string;
+		const first = text({ agent });
+
+		appendUser("user-cache-1", "New block within the window");
+		assert.equal(text({ agent }), first);
+		assert.doesNotMatch(first, /New block within the window/);
+
+		session.record("step/end", { turn: 1, step: 1 });
+		session.record("step/start", { turn: 1, step: 5 });
+		const refreshed = text({ agent });
+		assert.notEqual(refreshed, first);
+		assert.match(refreshed, /New block within the window/);
+
+		appendUser("user-cache-2", "Post compaction block");
+		assert.doesNotMatch(text({ agent }), /Post compaction block/);
+		await root.emit("session/event", session, { seq: 999, type: "compaction/summary", data: {} });
+		assert.match(text({ agent }), /Post compaction block/);
+	} finally {
+		fs.rmSync(cwd, { recursive: true, force: true });
+		fs.rmSync(path.dirname(sessionMirrorPath(String(session.id))), { recursive: true, force: true });
+	}
 });
 
 test("DSH defers mirror mutation until session event publication has settled", async () => {

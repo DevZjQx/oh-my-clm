@@ -1,8 +1,8 @@
 import * as fs from "node:fs";
 import { CLM_MIRROR_FILENAME, CLM_TEMP_ROOT, sessionMirrorPath, } from "../src/lib/clm-paths.js";
 import { writePrivateText } from "../src/lib/clm-files.js";
-import { buildDshMirrorRecords, dshOpenTurnStep, executeDshCleanup, reconcileDshMirror, renderDshBlockIndex, } from "../src/features/live-context/dsh-bridge.js";
-import { estimateMirrorTokens, renderMirror, } from "../src/features/live-context/context-format.js";
+import { buildDshMirrorRecords, dshBlockIndexText, dshOpenTurnStep, executeDshCleanup, reconcileDshMirror, } from "../src/features/live-context/dsh-bridge.js";
+import { CLEANUP_DISCIPLINE, DEFAULT_BLOCK_INDEX_HEAD, DEFAULT_BLOCK_INDEX_PREVIEW_CHARS, DEFAULT_BLOCK_INDEX_TAIL, estimateMirrorTokens, renderMirror, } from "../src/features/live-context/context-format.js";
 import { formatCleanupToolResult, parseCleanupArgs, parseCleanupResultCopy, } from "../src/features/live-context/context-cleanup.js";
 export const name = "oh-my-clm";
 const PROMPT_SECTION = "oh-my-clm:live-context";
@@ -25,10 +25,15 @@ function readText(filePath) {
 const fileSystem = { readText, writeText: writePrivateText };
 function promptText() {
     const mirrorTemplate = `${CLM_TEMP_ROOT}/clm-<session-id>/${CLM_MIRROR_FILENAME}`;
+    const indexHead = positiveEnv("CLM_INDEX_HEAD", DEFAULT_BLOCK_INDEX_HEAD);
+    const indexTail = positiveEnv("CLM_INDEX_TAIL", DEFAULT_BLOCK_INDEX_TAIL);
+    const refreshSteps = positiveEnv("CLM_INDEX_REFRESH_STEPS", 4);
     return `<oh-my-clm-dsh-live-context>
 The DSH bridge mirrors the current session surface to \`${mirrorTemplate}\`.
-- The live runtime context includes an \`<oh-my-clm-block-index>\` with 1-based IDs, roles, and short previews for the first and last 40 editable blocks; when the list is longer, the middle ID range is summarized. Choose cleanup IDs from that index; you do not need to read LIVE_CTX_MAIN.md just to discover IDs or identify a block.
-- Use the registered \`cleanup({ blockIds: [...] })\` tool for stale, redundant, or self-referential blocks; it works by ID, preserves load-bearing block 1, and does not read truncated bodies. By default the result is a one-line confirmation; the refreshed block index already appears in each step's runtime context. Set CLM_CLEANUP_RESULT=full to append the refreshed index, or =none to suppress the result text.
+- The live runtime context includes an \`<oh-my-clm-block-index>\` with 1-based IDs, roles, and short previews for the first ${indexHead} and last ${indexTail} editable blocks; when the list is longer, a one-line summary names the omitted ID range. Choose cleanup IDs from that index. The index is refreshed no more often than once every ${refreshSteps} step(s) and immediately after a cleanup or mirror edit, so blocks created since the last refresh may only be discoverable by reading LIVE_CTX_MAIN.md.
+- ${CLEANUP_DISCIPLINE}
+- Block 1 is load-bearing and is always preserved. The protected initial task has no block ID and is not listed.
+- Use the registered \`cleanup({ blockIds: [...] })\` tool for stale, redundant, or self-referential blocks; it works by ID and does not read truncated bodies. By default the result is a one-line confirmation; the refreshed index appears after the next refresh. Set CLM_CLEANUP_RESULT=full to append the refreshed index immediately, or =none to suppress the result text.
 - Read LIVE_CTX_MAIN.md only when you need the full, untruncated body for a rewrite. Edit only the bodies of existing CLM_ENTRY blocks; keep the protocol header, CLM_SNAPSHOT, IDs, roles, and closing markers unchanged.
 - Shorten an existing block or delete it to request omitting stale history. Keep CLM_EMPTY when deleting every editable block.
 - The initial user task is protected. User-authored blocks may be omitted but cannot be rewritten.
@@ -61,6 +66,11 @@ function optionsFor(session) {
         maxMirrorChars: positiveEnv("CLM_MAX_MIRROR_CHARS", 96_000),
         fixedTokens: positiveEnv("CLM_CONTEXT_FIXED_TOKENS", 0),
         cleanupResult: cleanupResultCopy(),
+        blockIndex: {
+            maxPreviewChars: positiveEnv("CLM_INDEX_PREVIEW", DEFAULT_BLOCK_INDEX_PREVIEW_CHARS),
+            headBlocks: positiveEnv("CLM_INDEX_HEAD", DEFAULT_BLOCK_INDEX_HEAD),
+            tailBlocks: positiveEnv("CLM_INDEX_TAIL", DEFAULT_BLOCK_INDEX_TAIL),
+        },
     };
 }
 /**
@@ -69,12 +79,12 @@ function optionsFor(session) {
  * that `cleanup` accepts are visible in chat context without a mirror read. A
  * failure returns empty text rather than breaking prompt assembly.
  */
-function blockIndexContextText(context) {
+function blockIndexContextText(context, states) {
     const session = context.agent?.session;
     if (!session)
         return "";
     try {
-        return renderDshBlockIndex(session, optionsFor(session));
+        return dshBlockIndexText(session, optionsFor(session), states.get(String(session.id)), positiveEnv("CLM_INDEX_REFRESH_STEPS", 4));
     }
     catch {
         return "";
@@ -274,7 +284,7 @@ export function apply(ctx) {
         ctx.systemPrompt.context({
             name: BLOCK_INDEX_CONTEXT,
             order: BLOCK_INDEX_ORDER,
-            text: blockIndexContextText,
+            text: (context) => blockIndexContextText(context, states),
         });
     }
     else {
@@ -303,7 +313,9 @@ export function apply(ctx) {
             return;
         }
         const state = {};
-        const key = String(agent.id);
+        // State is session-scoped: the cleanup tool and the block-index context
+        // both look it up by session id, and a subagent's agent id need not match.
+        const key = String(session.id);
         states.set(key, state);
         const agentContext = agent.ctx ?? ctx;
         const disposePreStep = agentContext.on("agent/pre-step", async (_payload, next) => {
@@ -322,19 +334,26 @@ export function apply(ctx) {
         ctx.effect?.(() => disposePreStep, `oh-my-clm.agent(${key})`);
     });
     ctx.on("session/event", (session, event) => {
+        const key = String(session.id);
+        const state = states.get(key);
+        if (!state)
+            return;
         // Wait for a completed tool result (or a new user message) so a model
         // edit made by a tool is checked against the pre-step snapshot rather
         // than a half-settled assistant tool-call node. step/start also flushes
         // an edit that agent/pre-step had to defer because no step was open.
-        if (event?.type !== "tool/result" && event?.type !== "user/message" && event?.type !== "step/start")
-            return;
-        const key = String(session.id);
-        const state = states.get(key);
-        if (state)
+        if (event?.type === "tool/result" || event?.type === "user/message" || event?.type === "step/start") {
             void enqueueReconcile(ctx, session, state, queues, () => states.get(key) === state);
+            return;
+        }
+        // Compaction rewrites the surface and can renumber editable IDs without
+        // going through cleanup or a mirror edit.
+        if (typeof event?.type === "string" && event.type.includes("compaction")) {
+            state.blockIndex = undefined;
+        }
     });
     ctx.on("agent/disposed", ({ agent }) => {
-        states.delete(String(agent.id));
+        states.delete(String(agent.session?.id ?? agent.id));
     });
 }
 export const inject = ["systemPrompt", "tools", "commands"];

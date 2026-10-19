@@ -6,6 +6,15 @@ export const MIRROR_VERSION = "clm-v2";
 export const MIRROR_HEADER = `<!-- ${MIRROR_VERSION} -->`;
 export const DEFAULT_MAX_BLOCK_CHARS = 12_000;
 export const DEFAULT_MAX_MIRROR_CHARS = 96_000;
+/**
+ * Defaults for the model-facing block index. They are deliberately small: the
+ * index is injected as a dynamic runtime-context snapshot, and DSH appends a new
+ * snapshot whenever its text changes. The static protocol prose lives in the
+ * host's stable system-prompt section, not in this per-step payload.
+ */
+export const DEFAULT_BLOCK_INDEX_PREVIEW_CHARS = 48;
+export const DEFAULT_BLOCK_INDEX_HEAD = 40;
+export const DEFAULT_BLOCK_INDEX_TAIL = 16;
 
 /**
  * The single cleanup habit that is both the most useful and the least likely to
@@ -320,6 +329,11 @@ function blockPreview(text: string, maxChars: number): string {
  * preview intentionally stays short: it identifies a block, while an actual
  * rewrite still has to read the full body from the mirror. Protected blocks are
  * excluded because they have no cleanup ID and are never editable.
+ *
+ * Only the dynamic payload lives here. The cleanup discipline, the head/tail
+ * rule, the load-bearing note, and the refresh cadence belong to the host's
+ * stable system-prompt section so they are cached once instead of repeated in
+ * every runtime-context snapshot.
  */
 export function renderBlockIndex(
 	records: readonly MirrorRecord[],
@@ -328,9 +342,9 @@ export function renderBlockIndex(
 	const editable = records.filter((record) => !record.protected);
 	if (editable.length === 0) return "";
 	const displayIds = editableDisplayIds(records);
-	const maxPreviewChars = Math.max(24, Math.floor(options.maxPreviewChars ?? 96));
-	const headCount = Math.max(0, Math.floor(options.headBlocks ?? 40));
-	const tailCount = Math.max(0, Math.floor(options.tailBlocks ?? 40));
+	const maxPreviewChars = Math.max(24, Math.floor(options.maxPreviewChars ?? DEFAULT_BLOCK_INDEX_PREVIEW_CHARS));
+	const headCount = Math.max(0, Math.floor(options.headBlocks ?? DEFAULT_BLOCK_INDEX_HEAD));
+	const tailCount = Math.max(0, Math.floor(options.tailBlocks ?? DEFAULT_BLOCK_INDEX_TAIL));
 	const lineFor = (record: MirrorRecord): string => {
 		const blockId = displayIds.get(record.id) ?? record.id;
 		return `${blockId}. ${record.role}: ${blockPreview(record.text, maxPreviewChars)}`;
@@ -351,13 +365,8 @@ export function renderBlockIndex(
 	}
 	return [
 		"<oh-my-clm-block-index>",
-		"Editable context blocks, in cleanup ID order.",
-		`When the list is longer, this index shows the first ${headCount} and last ${tailCount} blocks and summarizes the omitted ID range.`,
+		"Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them.",
 		...lines,
-		"Call cleanup({ blockIds: [...] }) with these 1-based IDs to omit stale blocks.",
-		CLEANUP_DISCIPLINE,
-		"Block 1 is load-bearing and is always preserved.",
-		"The protected initial task has no block ID and is not listed.",
 		"</oh-my-clm-block-index>",
 	].join("\n");
 }

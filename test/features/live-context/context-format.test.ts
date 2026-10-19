@@ -309,9 +309,11 @@ test("block index exposes the same 1-based IDs as the mirror without protected b
 	assert.match(index, /\n3\. user: Keep the important repository fact\./);
 	assert.doesNotMatch(index, /Build a context editor\./);
 	assert.match(index, /cleanup\(\{ blockIds:/);
-	assert.match(index, /Batch every removal into one cleanup call/);
-	assert.match(index, /Delete a tool-call block together with its paired result/);
-	assert.match(index, /Block 1 is load-bearing/);
+	// The static protocol lives in the host's stable system-prompt section, not
+	// in this per-step runtime-context payload.
+	assert.doesNotMatch(index, /Batch every removal into one cleanup call/);
+	assert.doesNotMatch(index, /When the list is longer/);
+	assert.doesNotMatch(index, /Block 1 is load-bearing/);
 });
 
 test("block index previews are single-line and bounded", () => {
@@ -329,7 +331,7 @@ test("block index previews are single-line and bounded", () => {
 	assert.match(previewLine, /…$/);
 });
 
-test("the block index keeps the first and last 40 blocks and summarizes the middle", () => {
+test("the block index keeps the first 40 and last 16 blocks by default", () => {
 	const many: MirrorRecord[] = Array.from({ length: 120 }, (_, index) => ({
 		id: `block-${index + 1}`,
 		role: "assistant",
@@ -341,10 +343,37 @@ test("the block index keeps the first and last 40 blocks and summarizes the midd
 	assert.match(index, /\n1\. assistant: content 1\n/);
 	assert.match(index, /\n40\. assistant: content 40\n/);
 	assert.doesNotMatch(index, /\n41\. assistant:/);
-	assert.doesNotMatch(index, /\n80\. assistant:/);
+	assert.doesNotMatch(index, /\n104\. assistant:/);
+	assert.match(index, /\.\.\. 64 editable block\(s\) omitted from this index \(IDs 41-104\)\./);
+	assert.match(index, /\n105\. assistant: content 105\n/);
+	assert.match(index, /\n120\. assistant: content 120\n/);
+});
+
+test("the block index head and tail stay configurable", () => {
+	const many: MirrorRecord[] = Array.from({ length: 120 }, (_, index) => ({
+		id: `block-${index + 1}`,
+		role: "assistant",
+		text: `content ${index + 1}`,
+		protected: false,
+		toolCallIds: [],
+	}));
+	const index = renderBlockIndex(many, { maxPreviewChars: 32, headBlocks: 40, tailBlocks: 40 });
 	assert.match(index, /\.\.\. 40 editable block\(s\) omitted from this index \(IDs 41-80\)\./);
 	assert.match(index, /\n81\. assistant: content 81\n/);
-	assert.match(index, /\n120\. assistant: content 120\n/);
+});
+
+test("the block index preview defaults to 48 characters", () => {
+	const record: MirrorRecord = {
+		id: "long",
+		role: "toolResult",
+		text: "x".repeat(400),
+		protected: false,
+		toolCallIds: [],
+	};
+	const index = renderBlockIndex([record]);
+	const previewLine = index.split("\n").find((line) => line.startsWith("1. ")) ?? "";
+	assert.ok(previewLine.length <= "1. toolResult: ".length + 49, previewLine);
+	assert.match(previewLine, /…$/);
 });
 
 test("the block index is empty when every block is protected", () => {
