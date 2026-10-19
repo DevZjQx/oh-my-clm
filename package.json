@@ -1,8 +1,16 @@
 {
   "name": "oh-my-clm",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "A Pi extension and minimal DSH bridge for self-editable live context inspired by the Facebook Research CLM harness.",
   "icon": "./icon.svg",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DevZjQx/oh-my-clm.git"
+  },
+  "homepage": "https://github.com/DevZjQx/oh-my-clm#readme",
+  "bugs": {
+    "url": "https://github.com/DevZjQx/oh-my-clm/issues"
+  },
   "type": "module",
   "files": [
     "README.md",

@@ -2,7 +2,13 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/how-it-works.md`](./docs/how-it-works.md)。
 
-## 0.1.7（当前版本）
+## 0.1.8（当前版本）
+
+### 修复
+
+- **npm 页面 README 的文档链接改为绝对 GitHub 地址。** npm 包的 README 渲染页不解析仓库相对路径，`./docs/...`、`./changelog.md` 等链接会落到不存在的 npm 页面。现在 README 中的文件链接全部指向 `https://github.com/DevZjQx/oh-my-clm/blob/main/...`；同时在 `package.json` 补充 `repository`、`homepage` 和 `bugs` 元数据，让 npm 页面能正确显示仓库入口。
+
+## 0.1.7
 
 ### 新增
 

@@ -141,7 +141,7 @@ token 计数使用共享格式层的 provider-independent `estimateMessageTokens
 
 ### 契约与生命周期
 
-- 社区插件发现入口是 [`dsh-plugin.json`](./dsh-plugin.json)，host entry 为构建后的 `dist/dsh/index.js`；官方 bundle 安装元数据位于 `package.json` 的 `dsh.bundle.patch` 和 [`cordis.patch.yml`](./cordis.patch.yml)。在 DSH 0.2.0-rc.2 中，实际生效的是 bundle 元数据；`dsh-plugin.json` 的 Community permissions 目前不应被描述为运行时强制隔离。
+- 社区插件发现入口是 [`dsh-plugin.json`](https://github.com/DevZjQx/oh-my-clm/blob/main/dsh-plugin.json)，host entry 为构建后的 `dist/dsh/index.js`；官方 bundle 安装元数据位于 `package.json` 的 `dsh.bundle.patch` 和 [`cordis.patch.yml`](https://github.com/DevZjQx/oh-my-clm/blob/main/cordis.patch.yml)。在 DSH 0.2.0-rc.2 中，实际生效的是 bundle 元数据；`dsh-plugin.json` 的 Community permissions 目前不应被描述为运行时强制隔离。
 - DSH 生命周期使用官方 Harness 的 Cordis `agent/created`、`agent/pre-step`、`session/event`、`systemPrompt.section()`、`systemPrompt.context()` 和 `tools.register()` 扩展点；cleanup 直接对当前 session surface 执行按 ID 的 native replacement，不读取 mirror 文件。
 - `systemPrompt.context()` 负责把 block index 放进模型可见的 runtime context；DSH 自己的 runtime-context snapshot 也会从 mirror records 中排除，避免 index 递归列出自身。
 - 普通 mirror 编辑的 `session/event` 只排队 reconcile；当编辑由 `tool/result` 或 `user/message` 触发时，mutation 在该事件的 `Session.append()` 发布完成后、当前仍打开的 step 内执行。`agent/pre-step` 不执行 mutation；它只在 session 仍有 open turn/step 时等待已排队的收敛，否则直接返回，把待处理编辑留给随后的 `step/start`。session projection 仍由 DSH 提供，session log 仍是事实来源。
@@ -174,7 +174,7 @@ node scripts/build-dsh-plugin.mjs ./out
 node scripts/build-dsh-plugin.mjs --output ./out/oh-my-clm.tgz
 ```
 
-这个脚本会先编译并检查 host entry，再生成只包含 DSH host、运行时 `dist`、manifest、bundle patch、locale、icon 的 npm tgz；Pi extension、TypeScript 源码、测试文件和开发依赖不会进入该专用包。`@deepseek-ai/dsh-tools` 仅作为可选 peer 声明用于兼容性检查，不产生运行时依赖，也不得改回 `dependencies`（原因见 [changelog.md](./changelog.md) 的 0.1.1 说明）。普通 `npm pack` 仍用于构建同时包含 Pi 与 DSH 内容的完整包。
+这个脚本会先编译并检查 host entry，再生成只包含 DSH host、运行时 `dist`、manifest、bundle patch、locale、icon 的 npm tgz；Pi extension、TypeScript 源码、测试文件和开发依赖不会进入该专用包。`@deepseek-ai/dsh-tools` 仅作为可选 peer 声明用于兼容性检查，不产生运行时依赖，也不得改回 `dependencies`（原因见 [changelog.md](https://github.com/DevZjQx/oh-my-clm/blob/main/changelog.md) 的 0.1.1 说明）。普通 `npm pack` 仍用于构建同时包含 Pi 与 DSH 内容的完整包。
 
 `npm run build:dsh` 会从 `src/features/live-context/dsh-bridge.ts` 和共享格式层生成 `dist/`；`npm pack` 的 `prepack` 也会执行这一步。仓库测试主要是 mock host 和契约/包检查；外部 DSH 验证报告另外覆盖了真实 CLI 安装、bundle activation、system prompt 和 mirror/file-tool 生成。DSH 文件工具运行在宿主侧时可以访问 `/tmp/clm-*`；sandbox 内的 bash 不一定共享同一个 `/tmp`，因此 mirror 相关操作应以文件工具或 `cleanup` 为准，不要假设两个 `/tmp` 是同一个。`Session.append()` 的 replacement 会走正常 `session/event` 发布路径；需要立即验证后端崩溃持久性的部署应由宿主使用官方 `session/flush` 检查点，插件本身不猜测或注册额外的 flush API。
 
@@ -202,7 +202,7 @@ dsh/index.ts                   DSH/Cordis host adapter
 test/{lib,features,adapters,package,harness}
 ```
 
-`src/lib` 不导入 feature，feature 之间不互相导入，feature 不导入 host adapter，也不使用 barrel 文件。`npm run check` 会运行 `scripts/check-boundaries.mjs` 验证这些规则；完整的目录职责、新增文件放置规则和测试布局见 [docs/project-structure.md](./docs/project-structure.md)。
+`src/lib` 不导入 feature，feature 之间不互相导入，feature 不导入 host adapter，也不使用 barrel 文件。`npm run check` 会运行 `scripts/check-boundaries.mjs` 验证这些规则；完整的目录职责、新增文件放置规则和测试布局见 [docs/project-structure.md](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/project-structure.md)。
 
 ## 设计边界
 
@@ -210,14 +210,14 @@ test/{lib,features,adapters,package,harness}
 
 ## 文档
 
-版本更新说明（0.1.0–0.1.7）已移至 [changelog.md](./changelog.md)。
+版本更新说明（0.1.0–0.1.8）已移至 [changelog.md](https://github.com/DevZjQx/oh-my-clm/blob/main/changelog.md)。
 
-- [工作原理](./docs/how-it-works.md)：说明 live context mirror、生命周期、编辑校验和限制。
-- [项目结构](./docs/project-structure.md)：说明分层目录、单向依赖规则、测试布局和边界检查。
-- [CLM 技术分析表](./docs/CLM技术分析表.md)：整理 Context Language Models 论文、官方实现和工程取舍。
-- [DSH 证据与 harness](./docs/reports/README.md)：mock host harness 的运行方式和历史验证报告。
-- [DSH 缓存机制](./docs/dsh-cache-explained.md)：整理服务端前缀 KV 缓存、dsh 侧架构对齐和逐请求命中率可观测性。
-- [更新日志](./changelog.md)：0.1.0–0.1.7 各版本的修复与调整说明。
+- [工作原理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/how-it-works.md)：说明 live context mirror、生命周期、编辑校验和限制。
+- [项目结构](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/project-structure.md)：说明分层目录、单向依赖规则、测试布局和边界检查。
+- [CLM 技术分析表](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/CLM%E6%8A%80%E6%9C%AF%E5%88%86%E6%9E%90%E8%A1%A8.md)：整理 Context Language Models 论文、官方实现和工程取舍。
+- [DSH 证据与 harness](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/reports/README.md)：mock host harness 的运行方式和历史验证报告。
+- [DSH 缓存机制](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/dsh-cache-explained.md)：整理服务端前缀 KV 缓存、dsh 侧架构对齐和逐请求命中率可观测性。
+- [更新日志](https://github.com/DevZjQx/oh-my-clm/blob/main/changelog.md)：0.1.0–0.1.8 各版本的修复与调整说明。
 
 ## 开发检查
 
