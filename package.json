@@ -3,7 +3,6 @@
   "version": "0.1.7",
   "description": "A Pi extension and minimal DSH bridge for self-editable live context inspired by the Facebook Research CLM harness.",
   "icon": "./icon.svg",
-  "private": true,
   "type": "module",
   "files": [
     "README.md",
