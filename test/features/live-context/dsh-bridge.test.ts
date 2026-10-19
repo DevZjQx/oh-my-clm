@@ -303,13 +303,13 @@ test("DSH block index honors the compact host options", () => {
 	const session = dshSession("/workspace/index-options", "dsh-index-options");
 	const options = {
 		...bridgeOptions(String(session.id)),
-		blockIndex: { maxPreviewChars: 24, headBlocks: 1, tailBlocks: 1 },
+		blockIndex: { maxPreviewChars: 24, headBlocks: 1, middleBlocks: 1 },
 	};
 	const index = renderDshBlockIndex(session, options);
 	assert.match(index, /\n1\. assistant: I inspected the repo/);
-	assert.doesNotMatch(index, /\n2\. toolResult:/);
-	assert.match(index, /\.\.\. 1 editable block\(s\) omitted from this index \(IDs 2-2\)\./);
-	assert.match(index, /\n3\. user: Keep this later request\./);
+	assert.match(index, /\n2\. toolResult:/);
+	assert.doesNotMatch(index, /\n3\. user: Keep this later request\./);
+	assert.doesNotMatch(index, /omitted from this index/);
 });
 
 test("DSH block index refreshes every N steps and invalidates after cleanup", () => {

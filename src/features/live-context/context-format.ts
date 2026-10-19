@@ -12,9 +12,9 @@ export const DEFAULT_MAX_MIRROR_CHARS = 96_000;
  * snapshot whenever its text changes. The static protocol prose lives in the
  * host's stable system-prompt section, not in this per-step payload.
  */
-export const DEFAULT_BLOCK_INDEX_PREVIEW_CHARS = 48;
+export const DEFAULT_BLOCK_INDEX_PREVIEW_CHARS = 64;
 export const DEFAULT_BLOCK_INDEX_HEAD = 40;
-export const DEFAULT_BLOCK_INDEX_TAIL = 16;
+export const DEFAULT_BLOCK_INDEX_MIDDLE = 24;
 
 /**
  * The single cleanup habit that is both the most useful and the least likely to
@@ -308,10 +308,10 @@ function editableDisplayIds(records: readonly MirrorRecord[]): Map<string, strin
 export interface BlockIndexOptions {
 	/** Maximum characters of one block preview shown in the index. */
 	maxPreviewChars?: number;
-	/** Number of leading editable blocks listed when the total exceeds head + tail. */
+	/** Number of leading editable blocks listed in the index. */
 	headBlocks?: number;
-	/** Number of trailing editable blocks listed when the total exceeds head + tail. */
-	tailBlocks?: number;
+	/** Number of blocks listed immediately after the head; the rest are not listed. */
+	middleBlocks?: number;
 }
 
 function blockPreview(text: string, maxChars: number): string {
@@ -330,10 +330,14 @@ function blockPreview(text: string, maxChars: number): string {
  * rewrite still has to read the full body from the mirror. Protected blocks are
  * excluded because they have no cleanup ID and are never editable.
  *
- * Only the dynamic payload lives here. The cleanup discipline, the head/tail
+ * Only the dynamic payload lives here. The cleanup discipline, the head/middle
  * rule, the load-bearing note, and the refresh cadence belong to the host's
  * stable system-prompt section so they are cached once instead of repeated in
  * every runtime-context snapshot.
+ *
+ * The index lists a contiguous prefix: the first `headBlocks` editable blocks,
+ * then the next `middleBlocks`. It intentionally omits the tail and the
+ * middle-range summary; later IDs have to be discovered from the mirror.
  */
 export function renderBlockIndex(
 	records: readonly MirrorRecord[],
@@ -344,25 +348,14 @@ export function renderBlockIndex(
 	const displayIds = editableDisplayIds(records);
 	const maxPreviewChars = Math.max(24, Math.floor(options.maxPreviewChars ?? DEFAULT_BLOCK_INDEX_PREVIEW_CHARS));
 	const headCount = Math.max(0, Math.floor(options.headBlocks ?? DEFAULT_BLOCK_INDEX_HEAD));
-	const tailCount = Math.max(0, Math.floor(options.tailBlocks ?? DEFAULT_BLOCK_INDEX_TAIL));
+	const middleCount = Math.max(0, Math.floor(options.middleBlocks ?? DEFAULT_BLOCK_INDEX_MIDDLE));
 	const lineFor = (record: MirrorRecord): string => {
 		const blockId = displayIds.get(record.id) ?? record.id;
 		return `${blockId}. ${record.role}: ${blockPreview(record.text, maxPreviewChars)}`;
 	};
-	const total = editable.length;
-	const lines: string[] = [];
-	if (total <= headCount + tailCount) {
-		lines.push(...editable.map(lineFor));
-	} else {
-		const head = editable.slice(0, headCount);
-		const tail = editable.slice(total - tailCount);
-		lines.push(...head.map(lineFor));
-		const omitted = total - head.length - tail.length;
-		lines.push(
-			`... ${omitted} editable block(s) omitted from this index (IDs ${head.length + 1}-${total - tail.length}).`,
-		);
-		lines.push(...tail.map(lineFor));
-	}
+	const lines = editable
+		.slice(0, Math.min(editable.length, headCount + middleCount))
+		.map(lineFor);
 	return [
 		"<oh-my-clm-block-index>",
 		"Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them.",

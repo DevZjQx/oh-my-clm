@@ -331,7 +331,7 @@ test("block index previews are single-line and bounded", () => {
 	assert.match(previewLine, /…$/);
 });
 
-test("the block index keeps the first 40 and last 16 blocks by default", () => {
+test("the block index shows the first 40 plus the next 24 by default", () => {
 	const many: MirrorRecord[] = Array.from({ length: 120 }, (_, index) => ({
 		id: `block-${index + 1}`,
 		role: "assistant",
@@ -342,14 +342,12 @@ test("the block index keeps the first 40 and last 16 blocks by default", () => {
 	const index = renderBlockIndex(many, { maxPreviewChars: 32 });
 	assert.match(index, /\n1\. assistant: content 1\n/);
 	assert.match(index, /\n40\. assistant: content 40\n/);
-	assert.doesNotMatch(index, /\n41\. assistant:/);
-	assert.doesNotMatch(index, /\n104\. assistant:/);
-	assert.match(index, /\.\.\. 64 editable block\(s\) omitted from this index \(IDs 41-104\)\./);
-	assert.match(index, /\n105\. assistant: content 105\n/);
-	assert.match(index, /\n120\. assistant: content 120\n/);
+	assert.match(index, /\n64\. assistant: content 64\n/);
+	assert.doesNotMatch(index, /\n65\. assistant:/);
+	assert.doesNotMatch(index, /omitted from this index/);
 });
 
-test("the block index head and tail stay configurable", () => {
+test("the block index head and middle stay configurable", () => {
 	const many: MirrorRecord[] = Array.from({ length: 120 }, (_, index) => ({
 		id: `block-${index + 1}`,
 		role: "assistant",
@@ -357,12 +355,13 @@ test("the block index head and tail stay configurable", () => {
 		protected: false,
 		toolCallIds: [],
 	}));
-	const index = renderBlockIndex(many, { maxPreviewChars: 32, headBlocks: 40, tailBlocks: 40 });
-	assert.match(index, /\.\.\. 40 editable block\(s\) omitted from this index \(IDs 41-80\)\./);
-	assert.match(index, /\n81\. assistant: content 81\n/);
+	const index = renderBlockIndex(many, { maxPreviewChars: 32, headBlocks: 40, middleBlocks: 40 });
+	assert.match(index, /\n80\. assistant: content 80\n/);
+	assert.doesNotMatch(index, /\n81\. assistant:/);
+	assert.doesNotMatch(index, /omitted from this index/);
 });
 
-test("the block index preview defaults to 48 characters", () => {
+test("the block index preview defaults to 64 characters", () => {
 	const record: MirrorRecord = {
 		id: "long",
 		role: "toolResult",
@@ -372,7 +371,7 @@ test("the block index preview defaults to 48 characters", () => {
 	};
 	const index = renderBlockIndex([record]);
 	const previewLine = index.split("\n").find((line) => line.startsWith("1. ")) ?? "";
-	assert.ok(previewLine.length <= "1. toolResult: ".length + 49, previewLine);
+	assert.ok(previewLine.length <= "1. toolResult: ".length + 65, previewLine);
 	assert.match(previewLine, /…$/);
 });
 
