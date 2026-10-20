@@ -100,7 +100,7 @@ DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程里切换索引形状并
 
 ### Pi
 
-`cleanup` 通过 Pi `registerTool` 注册，参数校验和删除计划使用共享的 `parseCleanupArgs` / `planCleanup`。工具执行时写入 mirror，真正的持久化仍由随后的 `turn_end` 生成 branch-local `context_edit`。如果工具调用后 projection 比文件多一条，扩展会在磁盘内容仍等于上次渲染文本时重新同步 mirror；磁盘上存在未提交的模型编辑时则保持 stale 拒绝，避免冲掉尚未应用的修改——此时拒绝原因直接提示"cleanup 要在本轮任何 mirror 编辑之前，且一个 turn 只能一次"，而不是笼统的 snapshot stale。
+`cleanup` 通过 Pi `registerTool` 注册，参数校验和删除计划使用共享的 `parseCleanupArgs` / `planCleanup`。工具执行时写入 mirror，真正的持久化仍由随后的 `turn_end` 生成 branch-local `context_edit`。如果工具调用后 projection 比文件多一条，扩展会在磁盘内容仍等于上次渲染文本时重新同步 mirror；磁盘上存在未提交的模型编辑时则保持 stale 拒绝，避免冲掉尚未应用的修改——此时拒绝原因直接提示"cleanup 要在该 step 任何 mirror 编辑之前，且一个 step 只能一次"，而不是笼统的 snapshot stale。
 
 ### DSH
 
