@@ -2,7 +2,21 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/features/live-context-mirror.md`](./docs/features/live-context-mirror.md)。
 
-## 0.1.10（当前版本）
+## 0.1.11（当前版本）
+
+### 修复
+
+- **body 里出现协议字面量不再毁掉整个 mirror。** 此前渲染是把 body 原样写进文件，所以只要某个 block 的正文里有 `[[CLM_ENTRY id=N role=...]]`（典型来源：模型在推理里引用了一段 mirror，或 tool call 参数里带着 mirror 片段），解析器就会把它当成真的块开标记：先是重复 / 未闭合 ID，接着**每一次** cleanup 都被拒（`Cannot remove malformed CLM_ENTRY id=…`，哪怕请求里根本没有那个 ID），最后 `turn_end` 判定编辑非法并静默回滚。现在渲染端给这类行加一个转义反斜杠（`escapeMirrorBody()`），解析端读回时去掉（`unescapeMirrorBody()`），body 逐字往返，已经转义的行再加一层、反复渲染稳定。
+- **解析、规划、删除共用一个顶层扫描器。** 新增 `scanMirrorBlocks()` 状态机：block 打开后只有它自己的 closing marker 能改变状态，其余 marker 形状的行一律当正文。`parseMirror()`、`parseCleanupMirror()`、`removeMirrorBlocks()` 都从这里取 span，所以“规划认可的块”和“实际删除的块”不可能不一致；手写未转义的 marker 也不会凭空多出块。
+- **cleanup 失败不再半途抛异常。** `removeMirrorBlocks()` 改为返回 `{ ok: true, text } | { ok: false, reason }`：缺 closing marker、重复顶层 ID、目标 span 不存在都会作为带具体 ID 的 `rejected` 结果回来，而不是在 `planCleanup` 通过后于写盘阶段抛错。原因文本同时提示“body 里的 marker 需要转义反斜杠”。
+- **被回滚的 mirror 编辑会告知模型。** 以前 `turn_end` 拒绝编辑只发一条 UI 通知，下一次 `syncMirror()` 直接把文件恢复成 canonical projection，模型看到的是“写入成功、内容凭空消失”。现在拒绝原因会以一条一次性的 `<pi-clm-edit-notice>` 用户消息进入下一次请求（`context` 钩子注入，注入后清空），并区分“被拒绝”与“不在 turn 边界内，未提交”。
+- **mirror 转义进入协议。** 文件 header 增加一行说明，提示词增加一句“body 里的 marker 行保留前导反斜杠”（Pi 侧仍 ≤1000 字符）。这是 `clm-v2` 的渲染约定而不是新协议版本号：snapshot 仍由 canonical records 计算，转义只影响显示层，因此旧 mirror 文件无需迁移即可被新解析器读回。
+
+### 文档
+
+- **`docs/features/live-context-mirror.md` 新增 §3.1 Body 转义。** 说明转义规则、`escapeMirrorBody()` / `unescapeMirrorBody()` 的往返关系、`scanMirrorBlocks()` 只认顶层标记，以及 §5.3 的“外部修改被回滚时会告知模型”。`README.md` 的编辑规则和 `docs/features/cleanup-tool.md` 的删除语义同步补齐。
+
+## 0.1.10
 
 ### 调整
 
