@@ -86,6 +86,11 @@ test("extension mirrors a projection and emits persistent context edits at turn_
 	// Rewriting a tool-call block is the cheapest way to fold a tool turn: the
 	// paired result leaves with it, so the fact goes in that block's body.
 	assert.match(prompt, /also omits its tool result/);
+	// "step" is the unit that matters: Pi commits at the end of each step, so the
+	// cheapest fold window is the previous step of the same user turn. "turn"
+	// reads as the whole user turn and closes that window.
+	assert.match(prompt, /from the step you are still producing/);
+	assert.doesNotMatch(prompt, /rewrite the turn you are still in/);
 	// Same standard as the DSH section: the schema owns the API, so parameter
 	// names, env switches, and repeated protocol detail stay out of the prompt.
 	assert.doesNotMatch(prompt, /blockIds|skipRoles|CLM_EMPTY|CLM_CONTEXT_BUDGET|CLM_MAX_BLOCK_CHARS|CLM_MAX_MIRROR_CHARS|patch\.json/);

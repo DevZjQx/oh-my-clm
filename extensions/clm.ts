@@ -149,7 +149,7 @@ function syncMirror(ctx: ExtensionContext, force = false): MirrorSnapshot {
 function promptAppendix(ctx: ExtensionContext): string {
 	const filePath = mirrorPath(ctx);
 	return `${PROMPT_MARKER}
-Your Pi context is mirrored to \`${filePath}\`. To free context, shorten stale \`[[CLM_ENTRY id=N role=...]]\` bodies with one edit/write during an agent turn: keep the protocol header, the \`CLM_SNAPSHOT\` line, the markers and their order, and block 1 intact; rewrite only from a block's complete current body; do not read or print the file. The initial task is protected and not shown; user blocks may be omitted, never rewritten. To delete blocks use the \`cleanup\` tool (batch every target into one call); \`cleanup({ list: "A-B" })\` inspects a range first. Rewriting a tool-call block also omits its tool result: put the fact in that block's body. Do not rewrite the turn you are still in.
+Your Pi context is mirrored to \`${filePath}\`. To free context, shorten stale \`[[CLM_ENTRY id=N role=...]]\` bodies with one edit/write during an agent turn: keep the protocol header, the \`CLM_SNAPSHOT\` line, the markers and their order, and block 1 intact; rewrite only from a block's complete current body; do not read or print the file. The initial task is protected and not shown; user blocks may be omitted, never rewritten. To delete blocks use the \`cleanup\` tool (batch every target into one call); \`cleanup({ list: "A-B" })\` inspects a range first. Rewriting a tool-call block also omits its tool result: put the fact in that block's body. Do not rewrite a block from the step you are still producing.
 When a ${CONTEXT_NUDGE_MARKER} appears, that turn is context-only: make the one edit, do no task work, and stop.
 ${PROMPT_MARKER}`;
 }

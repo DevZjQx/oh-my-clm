@@ -178,7 +178,7 @@ Pi 在当前 branch 记录 `context_edit`，然后在下一次请求中替换或
 
 如果 assistant block 含有 tool call，而它被改写或删除，扩展会同时删除对应 tool result；否则下一轮 provider 可能看到孤立的 tool result。反过来，删除 tool result 也会删除其 owner assistant。
 
-这也是推荐的折叠写法：需要保留某个工具 turn 的事实时，把事实写进携带 tool call 的 assistant block body，配对的 toolResult 会随改写一并省略——一次编辑同时完成"摘要"和"收掉原文"，不需要先读原始输出，也不需要新的工具。不要改写仍在进行的 turn 里的 block，留到下一轮；那时原文就在上一条消息里，蒸馏不需要回看 mirror。
+这也是推荐的折叠写法：需要保留某个工具 turn 的事实时，把事实写进携带 tool call 的 assistant block body，配对的 toolResult 会随改写一并省略——一次编辑同时完成"摘要"和"收掉原文"，不需要先读原始输出，也不需要新的工具。不要改写仍在产出的 step 里的 block（它的 tool call 可能还没结算），留到下一个 step；那时原文就在上一条消息里，蒸馏不需要回看 mirror。最便宜的窗口正是同一 user turn 的上一步——Pi 的 `turn_end` 按 step 提交，所以那一步的内容已经提交、可以被安全改写。
 
 ### 5.3 文件外部修改
 
