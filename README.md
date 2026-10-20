@@ -9,6 +9,7 @@
 **目录**
 
 - [核心机制](#核心机制)
+- [安装](#安装)
 - [快速上手](#快速上手)
 - [命令](#命令)
 - [预算与生命周期](#预算与生命周期)
@@ -71,9 +72,58 @@ DSH 的 runtime context 会包含 `<oh-my-clm-block-index>`，有两种模式（
 
 由于 context edit 属于当前 branch，`/tree`、fork 和 session resume 继续遵守 Pi 的分支语义。
 
+## 安装
+
+npm 主包同时包含 Pi extension 和 DSH/Cordis bundle，两种宿主都可以从 npm 或 GitHub 安装。npm 页面：<https://www.npmjs.com/package/oh-my-clm>；源码仓库：<https://github.com/DevZjQx/oh-my-clm>。
+
+### Pi
+
+```bash
+# 从 npm 安装，写入 ~/.pi/agent/settings.json
+pi install npm:oh-my-clm
+
+# 从 GitHub 安装
+pi install git:github.com/DevZjQx/oh-my-clm
+```
+
+加 `--local`（或 `-l`）可写入当前项目的 `.pi/settings.json`。只试用一次、不修改 settings：
+
+```bash
+pi -e npm:oh-my-clm
+pi -e git:github.com/DevZjQx/oh-my-clm
+```
+
+`pi list` 查看已安装的包，`pi update --extensions` 同步更新，`pi remove <source>` 卸载。安装或更新后重新启动 Pi 即可加载。
+
+### DSH
+
+`dsh plugin` 是 DSH 包管理器的入口，安装时指定目标 profile：
+
+```bash
+# 从 npm 安装
+dsh plugin --profile <profile> add oh-my-clm
+
+# 从 GitHub 安装
+dsh plugin --profile <profile> add github:DevZjQx/oh-my-clm
+```
+
+把 `<profile>` 换成实际使用的 profile，例如 `web` 或 `tui`。安装后重启该 profile 即可加载：
+
+```bash
+dsh --profile <profile>
+```
+
+卸载：
+
+```bash
+dsh plugin --profile <profile> remove oh-my-clm
+```
+
+需要固定版本时，npm 源在包名后加 `@<version>`（例如 `oh-my-clm@0.1.12`），GitHub 源在仓库后加 `#<ref>`（例如 `github:DevZjQx/oh-my-clm#<commit-sha>`）。DSH 不读取 `pi` 设置，Pi 的安装也不会自动把插件加入任何 DSH profile。
+
 ## 快速上手
 
-在仓库根目录运行：
+从源码运行，在仓库根目录执行：
 
 ```bash
 pi --extension ./extensions/clm.ts

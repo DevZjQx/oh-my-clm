@@ -2,7 +2,13 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/features/live-context-mirror.md`](./docs/features/live-context-mirror.md)。
 
-## 0.1.11（当前版本）
+## 0.1.12（当前版本）
+
+### 文档
+
+- **README 新增安装说明。** 补上 Pi 与 DSH 两种宿主的安装方式，分别给出 npm 和 GitHub 源：`pi install npm:oh-my-clm` / `pi install git:github.com/DevZjQx/oh-my-clm`，以及 `dsh plugin --profile <profile> add oh-my-clm` / `dsh plugin --profile <profile> add github:DevZjQx/oh-my-clm`；同时说明临时试用、更新、卸载和版本固定。
+
+## 0.1.11
 
 ### 修复
 
