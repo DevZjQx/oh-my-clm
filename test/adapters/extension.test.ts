@@ -83,10 +83,13 @@ test("extension mirrors a projection and emits persistent context edits at turn_
 	const prompt = beforeStart.systemPromptOptions.appendSystemPrompt ?? "";
 	assert.ok(prompt.includes(sessionMirrorPath(sessionId)));
 	assert.match(prompt, /cleanup/);
+	// Rewriting a tool-call block is the cheapest way to fold a tool turn: the
+	// paired result leaves with it, so the fact goes in that block's body.
+	assert.match(prompt, /also omits its tool result/);
 	// Same standard as the DSH section: the schema owns the API, so parameter
 	// names, env switches, and repeated protocol detail stay out of the prompt.
 	assert.doesNotMatch(prompt, /blockIds|skipRoles|CLM_EMPTY|CLM_CONTEXT_BUDGET|CLM_MAX_BLOCK_CHARS|CLM_MAX_MIRROR_CHARS|patch\.json/);
-	assert.ok(prompt.length <= 900, `Pi live-context prompt grew to ${prompt.length} chars`);
+	assert.ok(prompt.length <= 1000, `Pi live-context prompt grew to ${prompt.length} chars`);
 
 	await handlers.get("context")?.({}, ctx);
 	const mirrorPath = sessionMirrorPath(sessionId);
@@ -285,6 +288,65 @@ test("Pi cleanup keeps an uncommitted mirror edit instead of re-rendering over i
 	const after = fs.readFileSync(mirrorPath, "utf8");
 	assert.doesNotMatch(after, /Stale tool noise/);
 	assert.match(after, /Anchor block, model-edited\./);
+});
+
+test("Pi cleanup explains a mirror that an earlier edit already moved this turn", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-cleanup-order-"));
+	const sessionId = "cleanup-order-session";
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "anchor", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "Anchor block." }] }] },
+			{ sourceEntry: { id: "noise", type: "message" }, messages: [{ role: "user", content: "Stale tool noise." }] },
+		],
+		messages: [] as unknown[],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const tools = new Map<string, any>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerTool(tool: any) { tools.set(tool.name, tool); },
+		registerCommand: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: false,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: () => undefined },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => sessionId,
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+	const mirrorPath = sessionMirrorPath(sessionId);
+	const mirror = fs.readFileSync(mirrorPath, "utf8");
+	fs.writeFileSync(mirrorPath, mirror.replace("Anchor block.", "Anchor block, model-edited."));
+
+	// The mirror edit is now uncommitted and Pi has appended this turn's assistant
+	// message, so the file's snapshot can no longer match the live projection.
+	// Cleanup cannot reconcile that safely; it must say so instead of "stale".
+	projection.entries.push({
+		sourceEntry: { id: "turn-assistant", type: "message" },
+		messages: [{ role: "assistant", content: [{ type: "text", text: "Working on it." }] }],
+	});
+	const result = await tools.get("cleanup").execute("cleanup-order-1", { blockIds: [2] }, undefined, undefined, ctx);
+	assert.equal(result.structuredContent?.status, "rejected");
+	assert.equal(result.isError, true);
+	assert.match(result.structuredContent?.reason ?? "", /at most one cleanup per turn/);
+	assert.match(result.structuredContent?.reason ?? "", /before any mirror edit/);
+	const after = fs.readFileSync(mirrorPath, "utf8");
+	assert.match(after, /Anchor block, model-edited\./);
+	assert.match(after, /Stale tool noise/);
 });
 
 test("session resume rebuilds the live mirror before the next model request", async () => {

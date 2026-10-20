@@ -35,6 +35,7 @@ cleanup({ "list": "3-16" })
 - 显式 ID 1 会被拒绝；range 覆盖 1 时保留 block 1。初始用户任务（protected prefix）不在可编辑区域中。
 - 配对级联删除通过 `pairedRemovalIds` / `paired` 单独报告，不会混进调用者请求的 ID。
 - 用户消息只能保留或省略，不能被 cleanup 改写；cleanup 只做删除。
+- Pi 侧一个 turn 最多调用一次 cleanup，并且要在本轮任何 mirror 编辑之前。文件一旦在本轮被改过（一次编辑或一次更早的 cleanup），它的 snapshot 就落后于 live projection（Pi 在请求后追加了携带本工具调用的 assistant 消息），cleanup 会整体拒绝并在 reason 里点明顺序，而不是静默重渲染掉那笔改动。
 - 删除最后一个可编辑 block 时，mirror 保留 `<!-- CLM_EMPTY -->`。
 
 ## 3. block index
@@ -99,7 +100,7 @@ DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程里切换索引形状并
 
 ### Pi
 
-`cleanup` 通过 Pi `registerTool` 注册，参数校验和删除计划使用共享的 `parseCleanupArgs` / `planCleanup`。工具执行时写入 mirror，真正的持久化仍由随后的 `turn_end` 生成 branch-local `context_edit`。如果工具调用后 projection 比文件多一条，扩展会在磁盘内容仍等于上次渲染文本时重新同步 mirror；磁盘上存在未提交的模型编辑时则保持 stale 拒绝，避免冲掉尚未应用的修改。
+`cleanup` 通过 Pi `registerTool` 注册，参数校验和删除计划使用共享的 `parseCleanupArgs` / `planCleanup`。工具执行时写入 mirror，真正的持久化仍由随后的 `turn_end` 生成 branch-local `context_edit`。如果工具调用后 projection 比文件多一条，扩展会在磁盘内容仍等于上次渲染文本时重新同步 mirror；磁盘上存在未提交的模型编辑时则保持 stale 拒绝，避免冲掉尚未应用的修改——此时拒绝原因直接提示"cleanup 要在本轮任何 mirror 编辑之前，且一个 turn 只能一次"，而不是笼统的 snapshot stale。
 
 ### DSH
 
@@ -142,4 +143,5 @@ DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程里切换索引形状并
 4. assistant tool call 与 tool result 级联处理，不留下孤立 message；
 5. 未知、重复、过期 ID 和 role 变化整体拒绝；
 6. `list` 只读，不写 mirror，不能与删除参数同用；
-7. 结果模式不改变工具调用记录，也不吞掉 listing 内容。
+7. 结果模式不改变工具调用记录，也不吞掉 listing 内容；
+8. Pi 侧 mirror 已带本轮改动时，cleanup 以可行动的 `rejected` 结束，既不静默重渲染，也不删除任何 block。

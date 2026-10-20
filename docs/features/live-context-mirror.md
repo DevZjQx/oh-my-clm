@@ -174,7 +174,9 @@ Pi 在当前 branch 记录 `context_edit`，然后在下一次请求中替换或
 
 ### 5.2 Tool call / tool result 配对
 
-如果 assistant block 含有 tool call，而它被改写或删除，扩展会同时删除对应 tool result；否则下一轮 provider 可能看到孤立的 tool result。反过来，删除 tool result 也会删除其 owner assistant。模型应把需要保留的事实写入不带 tool call 的短摘要，或只编辑普通历史 block。
+如果 assistant block 含有 tool call，而它被改写或删除，扩展会同时删除对应 tool result；否则下一轮 provider 可能看到孤立的 tool result。反过来，删除 tool result 也会删除其 owner assistant。
+
+这也是推荐的折叠写法：需要保留某个工具 turn 的事实时，把事实写进携带 tool call 的 assistant block body，配对的 toolResult 会随改写一并省略——一次编辑同时完成"摘要"和"收掉原文"，不需要先读原始输出，也不需要新的工具。不要改写仍在进行的 turn 里的 block，留到下一轮；那时原文就在上一条消息里，蒸馏不需要回看 mirror。
 
 ### 5.3 文件外部修改
 

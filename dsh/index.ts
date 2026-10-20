@@ -154,7 +154,7 @@ function promptText(): string {
 	return `<oh-my-clm-dsh-live-context>
 \`<oh-my-clm-block-index>\` lists compacted-away history as 1-based IDs; a turn's range is inclusive.
 Prefer \`cleanup\` to free window: whole-turn ranges (e.g. \`["3-16"]\`) remove in one call, and \`cleanup({ list: "A-B" })\` inspects a range without removing anything.
-To compress instead, edit the session mirror at \`${mirrorTemplate}\` (the exact path is above the block index): read just the block you are shortening, shorten its body, and keep the protocol header, the \`CLM_SNAPSHOT\` line, IDs, roles, and markers unchanged.
+To compress instead, edit the session mirror at \`${mirrorTemplate}\` (the exact path is above the block index): shorten the block body, and keep the protocol header, the \`CLM_SNAPSHOT\` line, IDs, roles, and markers unchanged. Rewriting a tool-call block also omits its tool result: put the fact in that body.
 Block 1 and the initial task are protected. Nothing else is required of you.
 </oh-my-clm-dsh-live-context>`;
 }

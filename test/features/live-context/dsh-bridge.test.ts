@@ -705,6 +705,8 @@ test("mock DSH host loads the entry, registers hooks, and mutates the active sur
 	const promptSection = root.sections[0]?.text ?? "";
 	assert.match(promptSection, /oh-my-clm-block-index/);
 	assert.match(promptSection, /cleanup/);
+	// A tool-call rewrite drops its paired result, so the fact belongs in that body.
+	assert.match(promptSection, /also omits its tool result/);
 	// The mirror path and its editability are in scope because the mirror is the
 	// compression interface. The schema still owns the API, and bridge internals
 	// and env switches stay out of model-visible text.

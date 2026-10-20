@@ -6,6 +6,10 @@
 
 ### 调整
 
+- **提示词点名"改写 tool-call block"这条折叠路径。** 携带 tool call 的 assistant block 被改写时，扩展本来就会一并省略配对的 toolResult（`planContextEdits` 的配对规则，已有测试覆盖），所以"写一句事实 + 收掉原始输出"是一次编辑就能完成的事——不需要新工具，也不需要先把大块输出读回来再摘要。两个宿主的提示词各加一句说明这一点（Pi 同时注明不要改写仍在进行中的 turn）；两处提示词长度守卫相应校准（Pi `≤ 900` → `≤ 1000`，DSH 维持 `≤ 800`，实际 692）。触发物是模型此前不知道这条路径存在，而不是能力缺失。
+- **cleanup 的顺序冲突不再伪装成 stale。** Pi 侧 mirror 一旦在本轮被改过（一次编辑或一次更早的 cleanup），文件的 snapshot 就落后于 live projection，`cleanup` 会整体系拒绝——但旧原因只写 "The mirror snapshot is stale"，模型看到的是一个无法行动的 dead end，而实际修法很简单：一个 turn 最多一次 cleanup，且放在任何 mirror 编辑之前。现在命中的是这条可行动原因（共享规划器未改，host 侧按"本轮已改动"判定），并有回归测试固定"原因可读、mirror 不被重渲染、块不被删除"。
+- **DSH 提示词不再建议先读再写。** 删掉 `read just the block you are shortening`：它把大 body 回读当成前置步骤，而这正是慢且易丢真的路径（回看时拿到的是截断 preview）；现在只说"改 body，保留协议行"，实际长度 692 字符（上限 800）。
+
 - **npm keywords 补齐到 10 个。** 从 `pi-package`、`pi-extension`、`context-management`、`clm` 扩展为同时覆盖宿主（`pi-coding-agent`、`dsh-plugin`）和概念（`context-engineering`、`live-context`、`llm-context`、`agent-memory`）的词表，让两种搜索意图都能命中：找 Pi 扩展的人和找上下文管理方案的人。keywords 只随版本打包，npm 不提供修改已发布版本的接口，所以只能靠这次发版生效。
 
 ### 修复
