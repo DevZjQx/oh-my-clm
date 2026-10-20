@@ -601,9 +601,66 @@ test("Pi tells the model when a mirror edit was rejected", async () => {
 	const notice = next.messages.map((message) => String(message.content)).find((content) => content.includes("<pi-clm-edit-notice>"));
 	assert.ok(notice, "expected an edit notice message");
 	assert.match(notice, /rejected/);
+	// This reason already ends in a period; the notice must not double it.
+	assert.match(notice, /rejected: The mirror snapshot is stale; refresh it before editing context\. The mirror was restored/);
+	assert.ok(!String(notice).includes(".."), "the notice must not end a reason with two periods");
 	// The notice is one-shot: an unchanged request no longer carries it.
 	const after = await handlers.get("context")?.({ messages: [] }, ctx) as { messages: unknown[] } | undefined;
 	assert.equal(after, undefined);
+});
+
+test("Pi gives a reason without a period a sentence break in the edit notice", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-reject-plain-"));
+	const sessionId = "reject-notice-plain-session";
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "anchor", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "Anchor block." }] }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerTool: () => undefined,
+		registerCommand: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: true,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: () => undefined },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => sessionId,
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+	const mirrorPath = sessionMirrorPath(sessionId);
+	// A block the projection never had: rejected with "Unknown CLM_ENTRY ids are
+	// not allowed: 99", a reason with no trailing period.
+	fs.writeFileSync(
+		mirrorPath,
+		fs.readFileSync(mirrorPath, "utf8") + "\n[[CLM_ENTRY id=99 role=assistant]]\nhidden\n[[/CLM_ENTRY id=99]]\n",
+		"utf8",
+	);
+
+	await handlers.get("turn_end")?.({ entries: [] }, ctx);
+
+	const next = await handlers.get("context")?.({ messages: [] }, ctx) as { messages: Array<{ content: unknown }> } | undefined;
+	const notice = next?.messages.map((message) => String(message.content)).find((content) => content.includes("<pi-clm-edit-notice>"));
+	assert.ok(notice, "expected an edit notice message");
+	// Without normalization this reads "... allowed: 99 The mirror was restored".
+	assert.match(notice, /rejected: Unknown CLM_ENTRY ids are not allowed: 99\. The mirror was restored/);
 });
 
 test("Pi cleanup removes a block while a neighbour body quotes markers", async () => {

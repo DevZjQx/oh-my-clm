@@ -136,11 +136,21 @@ function syncMirror(ctx: ExtensionContext, force = false): MirrorSnapshot {
 	return snapshot;
 }
 
+/**
+ * One notice sentence for a rejected edit. Plan reasons arrive with mixed
+ * punctuation (some end in a period, most do not), so normalize here rather
+ * than at each call site: drop one trailing period, then add exactly one.
+ */
+function rejectedEditNotice(reason: string | undefined): string {
+	const detail = (reason ?? "invalid edit").replace(/\.\s*$/, "");
+	return `Your last mirror edit was rejected: ${detail}. The mirror was restored to the canonical projection; fix that block in the mirror during a turn, or use cleanup.`;
+}
+
 /** Why an edit that was already on disk will not reach the session tree. */
 function discardedEditNotice(ctx: ExtensionContext, previous: MirrorSnapshot, current: string): string {
 	const plan = planContextEdits(previous.records, parseMirror(current), editPlanOptions(ctx));
 	if (plan.status === "rejected") {
-		return `Your last mirror edit was rejected: ${plan.reason ?? "invalid edit"}. The mirror was restored to the canonical projection; fix that block in the mirror during a turn, or use cleanup.`;
+		return rejectedEditNotice(plan.reason);
 	}
 	return "A mirror edit arrived outside a turn boundary, so it was not applied and the mirror was restored. Make the edit during a turn (the edit is committed at that turn's end).";
 }
@@ -443,7 +453,7 @@ export default function (pi: ExtensionAPI) {
 				"info",
 			);
 		} else if (plan.status === "rejected") {
-			state.pendingNotice = `Your last mirror edit was rejected: ${plan.reason ?? "invalid edit"}. The mirror was restored to the canonical projection; fix that block in the mirror during a turn, or use cleanup.`;
+			state.pendingNotice = rejectedEditNotice(plan.reason);
 			notify(ctx, "CLM edit rejected: " + (plan.reason ?? "invalid edit"), "warning");
 		}
 		if (selfReadEntries.length > 0) newEntries.push(...selfReadEntries);
