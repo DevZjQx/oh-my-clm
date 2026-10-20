@@ -47,6 +47,7 @@ mirror 的结构如下：
 ### 编辑规则
 
 - 只修改 block body；保留 `CLM_SNAPSHOT`、`CLM_ENTRY` 和 closing marker。
+- body 里如果需要出现 `[[CLM_ENTRY ...]]`、`[[/CLM_ENTRY ...]]`、`<!-- CLM_EMPTY -->`、`CLM_SNAPSHOT` 或 `clm-v2` 这样的字面行，保留它前面的一个反斜杠 `\`：这是转义，去掉后该行会变成协议结构。
 - `id` 是从 `1` 开始的可读编辑序号；不要改 ID，也不要重排 block。扩展内部仍用 Pi 的 opaque entry ID。
 - 删除一个可编辑 block 会从后续 projection 中省略该消息；删除最后一个 block 时保留 `<!-- CLM_EMPTY -->`。
 - 初始用户任务受到保护，不会出现在可编辑区域中；user-authored block 可以被省略，但不能被模型改写。

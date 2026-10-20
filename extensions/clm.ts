@@ -124,13 +124,25 @@ function syncMirror(ctx: ExtensionContext, force = false): MirrorSnapshot {
 		// A direct edit outside a model turn has no safe append-only boundary. Do
 		// not silently apply it or leave the model looking at stale, untracked data.
 		// Restore the canonical projection; model-issued edits are reconciled in
-		// turn_end, where Pi accepts context_edit entries.
+		// turn_end, where Pi accepts context_edit entries. The reason still reaches
+		// the model on the next request, because a reverted edit that nobody
+		// mentions looks like the write succeeded.
+		state.pendingNotice ??= discardedEditNotice(ctx, previous, current);
 		writePrivateText(filePath, rendered);
 	}
 
 	const snapshot = { filePath, records, rendered, signature };
 	state.snapshot = snapshot;
 	return snapshot;
+}
+
+/** Why an edit that was already on disk will not reach the session tree. */
+function discardedEditNotice(ctx: ExtensionContext, previous: MirrorSnapshot, current: string): string {
+	const plan = planContextEdits(previous.records, parseMirror(current), editPlanOptions(ctx));
+	if (plan.status === "rejected") {
+		return `Your last mirror edit was rejected: ${plan.reason ?? "invalid edit"}. The mirror was restored to the canonical projection; fix that block in the mirror during a turn, or use cleanup.`;
+	}
+	return "A mirror edit arrived outside a turn boundary, so it was not applied and the mirror was restored. Make the edit during a turn (the edit is committed at that turn's end).";
 }
 
 /**
@@ -149,7 +161,7 @@ function syncMirror(ctx: ExtensionContext, force = false): MirrorSnapshot {
 function promptAppendix(ctx: ExtensionContext): string {
 	const filePath = mirrorPath(ctx);
 	return `${PROMPT_MARKER}
-Your Pi context is mirrored to \`${filePath}\`. To free context, shorten stale \`[[CLM_ENTRY id=N role=...]]\` bodies with one edit/write during an agent turn: keep the protocol header, the \`CLM_SNAPSHOT\` line, the markers and their order, and block 1 intact; rewrite only from a block's complete current body; do not read or print the file. The initial task is protected and not shown; user blocks may be omitted, never rewritten. To delete blocks use the \`cleanup\` tool (batch every target into one call); \`cleanup({ list: "A-B" })\` inspects a range first. Rewriting a tool-call block also omits its tool result: put the fact in that block's body. Do not rewrite a block from the step you are still producing.
+Your Pi context is mirrored to \`${filePath}\`. To free context, shorten stale \`[[CLM_ENTRY id=N role=...]]\` bodies with one edit/write during an agent turn: keep the protocol header, the \`CLM_SNAPSHOT\` line, the markers and their order, and block 1 intact; keep a body line's leading backslash when it looks like a marker or comment; rewrite only from a block's complete current body; do not read or print the file. The initial task is protected and not shown; user blocks may be omitted, never rewritten. To delete blocks use the \`cleanup\` tool (batch every target into one call); \`cleanup({ list: "A-B" })\` inspects a range first. Rewriting a tool-call block also omits its tool result: put the fact in that block's body. Do not rewrite a block from the step you are still producing.
 When a ${CONTEXT_NUDGE_MARKER} appears, that turn is context-only: make the one edit, do no task work, and stop.
 ${PROMPT_MARKER}`;
 }
@@ -225,6 +237,8 @@ function mirrorReadContextEdits(event: TurnEndEvent, ctx: ExtensionContext, file
 
 const state: {
 	snapshot?: MirrorSnapshot;
+	/** One-shot rejection note delivered with the next request. */
+	pendingNotice?: string;
 } = {};
 
 const cleanupParameters = Type.Object({
@@ -320,8 +334,14 @@ function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolRe
 	try {
 		// All filesystem work is synchronous and completes before this tool
 		// returns. The bridge therefore cannot observe a half-finished cleanup.
-		const cleaned = removeMirrorBlocks(text, plan.removedBlockIds);
-		writePrivateText(filePath, cleaned);
+		const removal = removeMirrorBlocks(text, plan.removedBlockIds);
+		if (!removal.ok) {
+			return rejectedCleanupResult(
+				plan.requestedBlockIds,
+				`Cleanup could not rewrite the live mirror: ${removal.reason}.`,
+			);
+		}
+		writePrivateText(filePath, removal.text);
 	} catch (error) {
 		return rejectedCleanupResult(
 			plan.requestedBlockIds,
@@ -376,12 +396,24 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("context", async (event: ContextEvent, ctx): Promise<ContextEventResult | void> => {
 		const snapshot = syncMirror(ctx);
-		if (!snapshot.records.some((record) => !record.protected)) return;
-		const nudge = contextBudgetNudge(ctx, Array.isArray(event.messages) ? event.messages : []);
-		if (!nudge) return;
-		return {
-			messages: [...event.messages, { role: "user" as const, content: nudge, timestamp: Date.now() }],
-		};
+		const additions: { role: "user"; content: string; timestamp: number }[] = [];
+		// A rejected or reverted mirror edit is reported once, on the request after
+		// it happened. Without this the model sees a successful write that silently
+		// disappeared from the next mirror render.
+		if (state.pendingNotice) {
+			additions.push({
+				role: "user",
+				content: `<pi-clm-edit-notice>\n${state.pendingNotice}\n</pi-clm-edit-notice>`,
+				timestamp: Date.now(),
+			});
+			state.pendingNotice = undefined;
+		}
+		if (snapshot.records.some((record) => !record.protected)) {
+			const nudge = contextBudgetNudge(ctx, Array.isArray(event.messages) ? event.messages : []);
+			if (nudge) additions.push({ role: "user", content: nudge, timestamp: Date.now() });
+		}
+		if (additions.length === 0) return;
+		return { messages: [...event.messages, ...additions] };
 	});
 
 	pi.on("turn_end", async (event: TurnEndEvent, ctx) => {
@@ -396,6 +428,7 @@ export default function (pi: ExtensionAPI) {
 
 		const newEntries: SessionBoundaryDraft[] = [];
 		if (plan.status === "applied") {
+			state.pendingNotice = undefined;
 			for (const edit of plan.edits) {
 				newEntries.push({
 					type: "context_edit",
@@ -410,6 +443,7 @@ export default function (pi: ExtensionAPI) {
 				"info",
 			);
 		} else if (plan.status === "rejected") {
+			state.pendingNotice = `Your last mirror edit was rejected: ${plan.reason ?? "invalid edit"}. The mirror was restored to the canonical projection; fix that block in the mirror during a turn, or use cleanup.`;
 			notify(ctx, "CLM edit rejected: " + (plan.reason ?? "invalid edit"), "warning");
 		}
 		if (selfReadEntries.length > 0) newEntries.push(...selfReadEntries);

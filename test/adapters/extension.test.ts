@@ -551,3 +551,109 @@ test("budget pressure uses an ephemeral nudge instead of a compact command", asy
 		else process.env.CLM_CONTEXT_BUDGET = previousBudget;
 	}
 });
+
+test("Pi tells the model when a mirror edit was rejected", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-reject-"));
+	const sessionId = "reject-notice-session";
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "anchor", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "Anchor block." }] }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const notifications: string[] = [];
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerTool: () => undefined,
+		registerCommand: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: true,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: (message: string) => { notifications.push(message); } },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => sessionId,
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+	const mirrorPath = sessionMirrorPath(sessionId);
+	const stale = fs.readFileSync(mirrorPath, "utf8").replace(/CLM_SNAPSHOT [a-f0-9]{16}/, "CLM_SNAPSHOT 0000000000000000");
+	fs.writeFileSync(mirrorPath, stale, "utf8");
+
+	await handlers.get("turn_end")?.({ entries: [] }, ctx);
+	assert.ok(notifications.some((message) => /rejected/i.test(message)));
+
+	const next = await handlers.get("context")?.({ messages: [] }, ctx) as { messages: Array<{ content: unknown }> } | undefined;
+	assert.ok(next, "the rejected edit must be reported on the next request");
+	const notice = next.messages.map((message) => String(message.content)).find((content) => content.includes("<pi-clm-edit-notice>"));
+	assert.ok(notice, "expected an edit notice message");
+	assert.match(notice, /rejected/);
+	// The notice is one-shot: an unchanged request no longer carries it.
+	const after = await handlers.get("context")?.({ messages: [] }, ctx) as { messages: unknown[] } | undefined;
+	assert.equal(after, undefined);
+});
+
+test("Pi cleanup removes a block while a neighbour body quotes markers", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-quoted-"));
+	const sessionId = "quoted-marker-session";
+	const quoted = "The mirror said:\n[[CLM_ENTRY id=3 role=user]]\n[[/CLM_ENTRY id=3]]";
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "anchor", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: quoted }] }] },
+			{ sourceEntry: { id: "noise", type: "message" }, messages: [{ role: "user", content: "Remove this noise." }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const tools = new Map<string, any>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerTool(tool: any) { tools.set(tool.name, tool); },
+		registerCommand: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: false,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: () => undefined },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => sessionId,
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+	const mirrorPath = sessionMirrorPath(sessionId);
+	assert.match(fs.readFileSync(mirrorPath, "utf8"), /\\\[\[CLM_ENTRY id=3 role=user\]\]/);
+
+	const result = await tools.get("cleanup").execute("cleanup-quoted", { blockIds: [2] }, undefined, undefined, ctx);
+	assert.equal(result.isError, false, result.content?.[0]?.text);
+	assert.deepEqual(result.structuredContent?.removedBlockIds, [2]);
+
+	const mirror = fs.readFileSync(mirrorPath, "utf8");
+	assert.doesNotMatch(mirror, /Remove this noise/);
+	assert.match(mirror, /\\\[\[CLM_ENTRY id=3 role=user\]\]/);
+	assert.equal(fs.existsSync(mirrorPath), true);
+});

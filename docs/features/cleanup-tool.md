@@ -37,6 +37,8 @@ cleanup({ "list": "3-16" })
 - 用户消息只能保留或省略，不能被 cleanup 改写；cleanup 只做删除。
 - Pi 侧一个 step（一次 assistant 响应及其 tool call）最多调用一次 cleanup，并且要在该 step 任何 mirror 编辑之前。Pi 的 `turn_end` 在每个 step 结束时触发（见 Pi `docs/json.md`），每次提交都会刷新 mirror 基线，所以跨 step 的多次 cleanup 是正常且安全的；同一 step 内先改 body 再 cleanup 则会整体拒绝——文件一旦在提交前被改过，它的 snapshot 就落后于 live projection，cleanup 不静默重渲染也不删除任何 block，并在 reason 里点明顺序。
 - 删除最后一个可编辑 block 时，mirror 保留 `<!-- CLM_EMPTY -->`。
+- 删除使用与解析相同的顶层 span：body 里引用（或手写）的 `[[CLM_ENTRY ...]]`、`[[/CLM_ENTRY ...]]` 不会被当成可删块，所以“某个 block 的正文里贴了 marker”不会再把删除变成切错范围的静默损坏。
+- 真的损坏（缺 closing marker、重复顶层 ID、目标 span 不存在）会作为 `rejected` 返回并给出具体 ID；`removeMirrorBlocks()` 失败时返回结果对象而不是抛异常，因此不会出现“规划通过、写盘到一半失败”的半状态。
 
 ## 3. block index
 

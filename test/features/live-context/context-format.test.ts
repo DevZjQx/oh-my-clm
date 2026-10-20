@@ -642,3 +642,57 @@ test("a turn that only contains a user block is listed as one user line", () => 
 	assert.doesNotMatch(digest, /\. turn /);
 	assert.match(digest, /\nIDs 2\.\. \(current turn, not listed\): Second turn\n/);
 });
+
+test("a body that quotes protocol text round-trips without becoming structure", () => {
+	const body = [
+		"Before.",
+		"[[CLM_ENTRY id=2 role=toolResult]]",
+		"[[/CLM_ENTRY id=2]]",
+		"<!-- CLM_EMPTY -->",
+		"<!-- CLM_SNAPSHOT 0123456789abcdef -->",
+		"<!-- clm-v2 -->",
+		"\\[[CLM_ENTRY id=3 role=user]]",
+		"    [[CLM_ENTRY id=4 role=user]]",
+		"    \\[[/CLM_ENTRY id=4]]",
+		"After.",
+	].join("\n");
+	const mirrorRecords: MirrorRecord[] = [
+		{ id: "task", role: "user", text: "Task.", protected: true, toolCallIds: [] },
+		{ id: "anchor", role: "assistant", text: "Anchor.", protected: false, toolCallIds: [] },
+		{ id: "quoted", role: "assistant", text: body, protected: false, toolCallIds: [] },
+	];
+	const mirror = renderMirror(mirrorRecords);
+	// Every dangerous line is escaped, and nothing escaped stays unescaped.
+	assert.match(mirror, /\n\\\[\[CLM_ENTRY id=2 role=toolResult\]\]\n/);
+	assert.match(mirror, /\n\\\[\[\/CLM_ENTRY id=2\]\]\n/);
+	assert.match(mirror, /\n\\<!-- CLM_EMPTY -->\n/);
+	assert.match(mirror, /\n\\\\\[\[CLM_ENTRY id=3 role=user\]\]\n/);
+	// Indented quoted lines escape after their indentation and round-trip too.
+	assert.ok(mirror.split("\n").includes("    \\[[CLM_ENTRY id=4 role=user]]"));
+	assert.ok(mirror.split("\n").includes("    \\\\[[/CLM_ENTRY id=4]]"));
+
+	const parsed = parseMirror(mirror);
+	assert.equal(parsed.recognized, true);
+	assert.equal(parsed.malformed, false);
+	assert.deepEqual(parsed.duplicateIds, []);
+	assert.deepEqual(parsed.blocks.get("2")?.body, body);
+	assert.equal(parsed.blocks.size, 2);
+	// A re-render of the parsed bodies is byte-identical: escaping is stable.
+	const rerendered = renderMirror(mirrorRecords);
+	assert.equal(rerendered, mirror);
+});
+
+test("an unescaped marker quoted in a body stays inside that body", () => {
+	const mirror = renderMirror([
+		{ id: "task", role: "user", text: "Task.", protected: true, toolCallIds: [] },
+		{ id: "anchor", role: "assistant", text: "Anchor.", protected: false, toolCallIds: [] },
+		{ id: "quoted", role: "assistant", text: "See [[CLM_ENTRY id=9 role=user]] in the dump.", protected: false, toolCallIds: [] },
+	]);
+	// A hand-written, unescaped stray cannot open a phantom block.
+	const inline = mirror.replace("See [[CLM_ENTRY id=9 role=user]] in the dump.", "See\n[[CLM_ENTRY id=9 role=user]]\nin the dump.");
+	const parsed = parseMirror(inline);
+	assert.equal(parsed.malformed, false);
+	assert.deepEqual(parsed.duplicateIds, []);
+	assert.deepEqual([...parsed.blocks.keys()], ["1", "2"]);
+	assert.match(parsed.blocks.get("2")?.body ?? "", /\[\[CLM_ENTRY id=9 role=user\]\]/);
+});

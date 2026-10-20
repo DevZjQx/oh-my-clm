@@ -63,7 +63,9 @@ test("cleanup validates IDs and removes whole spans without reconstructing bodie
 	assert.deepEqual(plan.removedBlockIds, [2, 3]);
 	assert.deepEqual(plan.omittedIds, ["stale-answer", "self-read"]);
 
-	const cleaned = removeMirrorBlocks(mirror, plan.removedBlockIds);
+	const removal = removeMirrorBlocks(mirror, plan.removedBlockIds);
+	assert.equal(removal.ok, true);
+	const cleaned = removal.ok ? removal.text : "";
 	assert.match(cleaned, /^<!-- clm-v2 -->/);
 	assert.match(cleaned, /CLM_SNAPSHOT/);
 	assert.match(cleaned, /CLM_ENTRY id=1 role=assistant/);
@@ -117,7 +119,9 @@ test("cleanup works when a retained preview is truncated", () => {
 	assert.match(mirror, /preview truncated/);
 	const plan = planCleanup(records, parseCleanupMirror(mirror), [2]);
 	assert.equal(plan.status, "applied");
-	const cleaned = removeMirrorBlocks(mirror, plan.removedBlockIds);
+	const removal = removeMirrorBlocks(mirror, plan.removedBlockIds);
+	assert.equal(removal.ok, true);
+	const cleaned = removal.ok ? removal.text : "";
 	assert.doesNotMatch(cleaned, /preview truncated/);
 	assert.match(cleaned, /A retained fact\./);
 });
@@ -371,4 +375,52 @@ test("cleanup list returns read-only rows and is never planned as a removal", ()
 	const past = describeCleanupList(records, { start: 99, end: 120 });
 	assert.equal(past.status, "rejected");
 	assert.match(past.reason, /last ID 4/);
+});
+
+test("cleanup removes the right span when another body quotes markers", () => {
+	const records: MirrorRecord[] = [
+		{ id: "task", role: "user", text: "Keep the task.", protected: true, toolCallIds: [] },
+		{
+			id: "anchor",
+			role: "assistant",
+			// A tool call whose arguments echo the mirror: this is what broke cleanup
+			// before body escaping, because the echo parsed as a second block 2.
+			text: "edit\n{\"oldText\":\n[[CLM_ENTRY id=2 role=toolResult]]\n[[/CLM_ENTRY id=2]]\n}",
+			protected: false,
+			toolCallIds: [],
+		},
+		{ id: "stale", role: "toolResult", text: "Stale tool output.", protected: false, toolCallIds: [] },
+	];
+	const mirror = renderMirror(records);
+	const structural = parseCleanupMirror(mirror);
+	assert.equal(structural.malformed, false);
+	assert.deepEqual(structural.duplicateIds, []);
+	assert.deepEqual([...structural.blocks.keys()], ["1", "2"]);
+
+	const plan = planCleanup(records, structural, [2]);
+	assert.equal(plan.status, "applied");
+	const removal = removeMirrorBlocks(mirror, plan.removedBlockIds);
+	assert.equal(removal.ok, true);
+	const cleaned = removal.ok ? removal.text : "";
+	assert.doesNotMatch(cleaned, /Stale tool output/);
+	assert.match(cleaned, /\\\[\[CLM_ENTRY id=2 role=toolResult\]\]/);
+	assert.equal(parseMirror(cleaned).recognized, true);
+});
+
+test("a malformed mirror is rejected instead of throwing mid-write", () => {
+	const records = cleanupRecords();
+	const mirror = renderMirror(records);
+	const truncated = mirror.replace(/\n\[\[\/CLM_ENTRY id=2\]\]\n/, "\n");
+	const plan = planCleanup(records, parseCleanupMirror(truncated), [3]);
+	assert.equal(plan.status, "rejected");
+	assert.match(plan.reason ?? "", /malformed/i);
+	assert.match(plan.reason ?? "", /id\(s\): 2/i);
+
+	const removal = removeMirrorBlocks(truncated, [3]);
+	assert.equal(removal.ok, false);
+	assert.match(removal.ok === false ? removal.reason : "", /malformed/i);
+
+	const missing = removeMirrorBlocks(mirror, [99]);
+	assert.equal(missing.ok, false);
+	assert.match(missing.ok === false ? missing.reason : "", /not found/i);
 });

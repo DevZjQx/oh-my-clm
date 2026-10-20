@@ -86,7 +86,7 @@ Pi 的 `turn_end` 在每个模型 step 结束时触发，语义是"一次 assist
 4. 执行 tool call/result 配对保护和 shrink-only gate；
 5. 返回一个或多个 Pi `context_edit` entry。
 
-结构错误、过期 snapshot 或不满足 gate 的编辑会整体拒绝，不会部分应用。扩展不写隐藏 receipt；状态和错误通过 Pi UI 通知，原始 session JSONL 保持干净。
+结构错误、过期 snapshot 或不满足 gate 的编辑会整体拒绝，不会部分应用。扩展不写隐藏 receipt；状态和错误通过 Pi UI 通知，并在下一次请求里用一条一次性的 `<pi-clm-edit-notice>` 明确告诉模型这次编辑被拒的原因，原始 session JSONL 保持干净。
 
 ### 2.5 下一轮：Pi 重建 projection
 
@@ -100,6 +100,7 @@ Pi 在当前 branch 记录 `context_edit`，然后在下一次请求中替换或
 <!-- clm-v2 -->
 <!-- CLM_SNAPSHOT 6e4c2a1f8b7d9012 -->
 <!-- Edit block bodies only. Keep CLM_ENTRY and closing markers intact. -->
+<!-- A body line that must read as a marker or comment gains one leading backslash; keep it. -->
 <!-- id is the editable block's ordinal; do not change it or reorder blocks. -->
 <!-- Delete an editable block to omit that message; use CLM_EMPTY when deleting the last one. -->
 <!-- The protected initial task is intentionally not shown here. -->
@@ -130,6 +131,22 @@ Pi 在当前 branch 记录 `context_edit`，然后在下一次请求中替换或
 ```
 
 完整 header 加 `CLM_EMPTY` 表示“明确删除所有可编辑内容”；缺少 header 的空文件则会被拒绝。
+
+### 3.1 Body 转义
+
+body 里经常会出现看起来像协议的文本：模型引用了一段 mirror、tool call 的参数里带着 `[[CLM_ENTRY id=N role=...]]`、或者一条被摘要掉的推理原文里有 closing marker。渲染时这类行会在缩进之后加一个反斜杠：
+
+```text
+[[CLM_ENTRY id=1 role=assistant]]
+the dump showed
+\[[CLM_ENTRY id=2 role=toolResult]]
+\[[/CLM_ENTRY id=2]]
+[[/CLM_ENTRY id=1]]
+```
+
+规则由共享层 `escapeMirrorBody()` / `unescapeMirrorBody()` 实现，`parseMirror()` 读回时去掉一个反斜杠，所以 body 逐字往返、snapshot 不变。已经在 body 里的 `\[[CLM_ENTRY ...]]` 会再加一层转义（解析时正好去掉一层），所以反复渲染是稳定的。
+
+结构解析只认**顶层**标记：`scanMirrorBlocks()` 是一个状态机，block 打开后只有它自己的 closing marker 能改变状态，其余形如 marker 的行一律当正文。因此即使模型手写了一个没转义的 `[[CLM_ENTRY ...]]`，也不会凭空多出一个 block；“协议损坏”只可能来自真的缺 closing marker 或真的重复 ID。
 
 ## 4. Projection 到 records
 
@@ -165,7 +182,7 @@ Pi 在当前 branch 记录 `context_edit`，然后在下一次请求中替换或
 
 1. 文件有正确版本、snapshot 和合法 block，或明确的 `CLM_EMPTY`；
 2. snapshot 与当前 turn 的 canonical records 匹配；
-3. 没有重复或未知 ID；
+3. 没有重复或未知 ID（body 里转义过的标记不算 ID）；
 4. role 没有变化，closing marker 没有缺失；
 5. user-authored block 不能被改写，只能保留或省略；
 6. 编辑后的估算 context 必须严格短于编辑前。
@@ -182,7 +199,7 @@ Pi 在当前 branch 记录 `context_edit`，然后在下一次请求中替换或
 
 ### 5.3 文件外部修改
 
-只有 agent turn 内的变化会被当作候选 edit。其他进程直接写 mirror 时，下一次同步恢复 canonical projection。文件写入使用临时文件加 rename，尽量避免半写入状态。
+只有 agent turn 内的变化会被当作候选 edit。其他进程直接写 mirror 时，下一次同步恢复 canonical projection，并把“为什么这次编辑没有被应用”作为一条一次性的 `<pi-clm-edit-notice>` 带进下一次请求——静默回滚会让模型以为写入成功。文件写入使用临时文件加 rename，尽量避免半写入状态。
 
 ## 6. Mirror 自读保护
 

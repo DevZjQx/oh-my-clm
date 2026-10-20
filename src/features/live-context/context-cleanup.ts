@@ -4,6 +4,7 @@ import {
 	mirrorFingerprint,
 	estimateMirrorTokens,
 	renderBlockList,
+	scanMirrorBlocks,
 	type ContextEditDraft,
 	type EditPlan,
 	type MirrorRecord,
@@ -11,7 +12,6 @@ import {
 } from "./context-format.ts";
 
 const SNAPSHOT_PATTERN = /^<!-- CLM_SNAPSHOT ([a-f0-9]{16}) -->$/;
-const BLOCK_START_PATTERN = /^\[\[CLM_ENTRY\s+id=([^\s\]]+)\s+role=([^\s\]]+)\]\]$/;
 const EMPTY_MARKER = "<!-- CLM_EMPTY -->";
 
 /**
@@ -117,14 +117,6 @@ function nonNegativeSafeInteger(value: unknown): value is number {
 
 function positiveSafeInteger(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
-}
-
-function decodeId(id: string): string {
-	try {
-		return decodeURIComponent(id);
-	} catch {
-		return id;
-	}
 }
 
 function fixedTokens(options: CleanupPlanOptions): number {
@@ -309,40 +301,22 @@ export function parseCleanupMirror(text: string): CleanupParsedMirror {
 	const lines = normalized.split("\n");
 	const version = lines.some((line) => line.trim() === MIRROR_HEADER) ? MIRROR_VERSION : undefined;
 	const snapshot = lines.map((line) => line.trim().match(SNAPSHOT_PATTERN)?.[1]).find(Boolean);
+	const scan = scanMirrorBlocks(normalized);
 	const blocks = new Map<string, { role: string }>();
-	const duplicateIds: string[] = [];
-	const missingEndIds: string[] = [];
-	let empty = false;
-	let malformed = false;
-
-	for (let index = 0; index < lines.length; index += 1) {
-		const line = lines[index]?.trim() ?? "";
-		if (line === EMPTY_MARKER) {
-			if (blocks.size > 0) malformed = true;
-			empty = true;
-			continue;
-		}
-		const match = line.match(BLOCK_START_PATTERN);
-		if (!match) continue;
-		const encodedId = match[1] ?? "";
-		const id = decodeId(encodedId);
-		const role = match[2] ?? "user";
-		const endMarker = `[[/CLM_ENTRY id=${encodedId}]]`;
-		let end = index + 1;
-		while (end < lines.length && (lines[end]?.trim() ?? "") !== endMarker) end += 1;
-		if (end >= lines.length) {
-			missingEndIds.push(id);
-			malformed = true;
-			break;
-		}
-		if (blocks.has(id)) duplicateIds.push(id);
-		else blocks.set(id, { role });
-		index = end;
+	for (const span of scan.blocks) {
+		if (!blocks.has(span.id)) blocks.set(span.id, { role: span.role });
 	}
-
-	if (empty && blocks.size > 0) malformed = true;
-	const recognized = Boolean(version && snapshot && !malformed && (empty || blocks.size > 0));
-	return { recognized, version, snapshot, empty, malformed, blocks, duplicateIds, missingEndIds };
+	const recognized = Boolean(version && snapshot && !scan.malformed && (scan.empty || blocks.size > 0));
+	return {
+		recognized,
+		version,
+		snapshot,
+		empty: scan.empty,
+		malformed: scan.malformed,
+		blocks,
+		duplicateIds: scan.duplicateIds,
+		missingEndIds: scan.missingEndIds,
+	};
 }
 
 /** Build the structural mirror view for DSH cleanup without rendering bodies. */
@@ -378,7 +352,10 @@ function validateMirrorForCleanup(
 		return rejectPlan(
 			requestedBlockIds,
 			parsed.malformed
-				? `Malformed ${MIRROR_VERSION} mirror; refusing to clean a partial document.`
+				? `Malformed ${MIRROR_VERSION} mirror; refusing to clean a partial document` +
+					(parsed.missingEndIds.length > 0
+						? ` (unclosed CLM_ENTRY id(s): ${parsed.missingEndIds.join(", ")}).`
+						: ".")
 				: "No valid CLM mirror header was found; refusing to clean the file.",
 			beforeTokens,
 		);
@@ -389,7 +366,8 @@ function validateMirrorForCleanup(
 	if (parsed.duplicateIds.length > 0) {
 		return rejectPlan(
 			requestedBlockIds,
-			`Duplicate CLM_ENTRY ids are not allowed: ${parsed.duplicateIds.join(", ")}`,
+			`Duplicate CLM_ENTRY ids are not allowed: ${[...new Set(parsed.duplicateIds)].join(", ")}.` +
+				" A marker line inside a body needs one leading backslash.",
 			beforeTokens,
 		);
 	}
@@ -616,31 +594,54 @@ export function describeCleanupList(
 
 /**
  * Remove whole CLM_ENTRY spans from a mirror after planCleanup has validated
- * the protocol. This preserves all header comments and never reconstructs a
- * block body from the visible preview.
+ * the protocol. Spans come from the same top-level scan that parsing uses, so a
+ * marker quoted inside a body is never mistaken for a deletable block. This
+ * preserves all header comments and never reconstructs a block body from the
+ * visible preview.
+ *
+ * Failures are returned, not thrown: a malformed mirror must reach the model as
+ * a cleanup rejection with a reason, never as a lost write or an exception.
  */
-export function removeMirrorBlocks(text: string, blockIds: readonly number[]): string {
+export function removeMirrorBlocks(
+	text: string,
+	blockIds: readonly number[],
+): { ok: true; text: string } | { ok: false; reason: string } {
 	const normalized = String(text ?? "").replace(/\r\n?/g, "\n");
-	const targets = new Set(blockIds.map((blockId) => String(blockId)));
 	const lines = normalized.split("\n");
-	const kept: string[] = [];
-	let retainedBlocks = 0;
-
-	for (let index = 0; index < lines.length; index += 1) {
-		const line = lines[index]?.trim() ?? "";
-		const match = line.match(BLOCK_START_PATTERN);
-		if (!match || !targets.has(decodeId(match[1] ?? ""))) {
-			if (match) retainedBlocks += 1;
-			kept.push(lines[index] ?? "");
-			continue;
-		}
-		const encodedId = match[1] ?? "";
-		const endMarker = `[[/CLM_ENTRY id=${encodedId}]]`;
-		let end = index + 1;
-		while (end < lines.length && (lines[end]?.trim() ?? "") !== endMarker) end += 1;
-		if (end >= lines.length) throw new Error(`Cannot remove malformed CLM_ENTRY id=${encodedId}.`);
-		index = end;
+	const scan = scanMirrorBlocks(normalized);
+	if (scan.malformed) {
+		const missing = scan.missingEndIds.length > 0
+			? `unclosed CLM_ENTRY id(s): ${scan.missingEndIds.join(", ")}`
+			: "the empty marker coexists with blocks";
+		return { ok: false, reason: `the live mirror is malformed (${missing})` };
 	}
+	if (scan.duplicateIds.length > 0) {
+		return { ok: false, reason: `duplicate CLM_ENTRY id(s): ${[...new Set(scan.duplicateIds)].join(", ")}` };
+	}
+
+	const targets = new Set(blockIds.map((blockId) => String(blockId)));
+	const spans = new Map<string, { startLine: number; endLine: number }>();
+	for (const span of scan.blocks) spans.set(span.id, { startLine: span.startLine, endLine: span.endLine });
+	const missingTargets = [...targets].filter((target) => !spans.has(target));
+	if (missingTargets.length > 0) {
+		return { ok: false, reason: `CLM_ENTRY id(s) not found in the live mirror: ${missingTargets.join(", ")}` };
+	}
+
+	const dropped = new Set<number>();
+	for (const target of targets) {
+		const span = spans.get(target);
+		if (!span) continue;
+		for (let index = span.startLine; index <= span.endLine; index += 1) dropped.add(index);
+		// The renderer separates entries with one blank line; dropping the span
+		// plus its trailing separator keeps the remaining document canonical.
+		if ((lines[span.endLine + 1] ?? "").trim() === "") dropped.add(span.endLine + 1);
+	}
+
+	const kept: string[] = [];
+	for (let index = 0; index < lines.length; index += 1) {
+		if (!dropped.has(index)) kept.push(lines[index] ?? "");
+	}
+	const retainedBlocks = scan.blocks.length - targets.size;
 
 	let result = kept.join("\n");
 	if (!result.endsWith("\n")) result += "\n";
@@ -648,7 +649,7 @@ export function removeMirrorBlocks(text: string, blockIds: readonly number[]): s
 	if (retainedBlocks === 0 && !hasEmptyMarker) {
 		result = result.trimEnd() + `\n\n${EMPTY_MARKER}\n`;
 	}
-	return result;
+	return { ok: true, text: result };
 }
 
 export function cleanupToolResult(

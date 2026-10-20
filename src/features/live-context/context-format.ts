@@ -38,6 +38,75 @@ export const DEFAULT_BLOCK_LIST_CHARS = 6_000;
 const EMPTY_MARKER = "<!-- CLM_EMPTY -->";
 const SNAPSHOT_PATTERN = /^<!-- CLM_SNAPSHOT ([a-f0-9]{16}) -->$/;
 const BLOCK_START_PATTERN = /^\[\[CLM_ENTRY\s+id=([^\s\]]+)\s+role=([^\s\]]+)\]\]$/;
+const BLOCK_END_PATTERN = /^\[\[\/CLM_ENTRY\s+id=([^\s\]]+)\]\]$/;
+/**
+ * A body line that would otherwise read as protocol gets one leading backslash.
+ * The escape is the model-facing rule that keeps a quoted marker (for example a
+ * tool call whose arguments contain a mirror snippet) inside the body instead of
+ * opening a phantom block.
+ */
+const MIRROR_ESCAPE = "\\";
+
+/** Structural meaning of one trimmed line, or undefined for ordinary body text. */
+function mirrorMarkerKind(line: string):
+	| "start"
+	| "end"
+	| "empty"
+	| "meta"
+	| undefined {
+	const trimmed = line.trim();
+	if (trimmed === EMPTY_MARKER) return "empty";
+	if (trimmed === MIRROR_HEADER || SNAPSHOT_PATTERN.test(trimmed)) return "meta";
+	if (BLOCK_START_PATTERN.test(trimmed)) return "start";
+	if (BLOCK_END_PATTERN.test(trimmed)) return "end";
+	return undefined;
+}
+
+/**
+ * Would this trimmed text be read as protocol after unescaping? The check is
+ * recursive in one direction only: `[[CLM_ENTRY ...]]`, `\[[CLM_ENTRY ...]]`,
+ * `\\[[CLM_ENTRY ...]]` and so on are all marker text, because each leading
+ * backslash is the escape for the line after it.
+ */
+function isMirrorMarkerText(text: string): boolean {
+	let value = text.trim();
+	for (;;) {
+		if (mirrorMarkerKind(value)) return true;
+		if (!value.startsWith(MIRROR_ESCAPE)) return false;
+		value = value.slice(MIRROR_ESCAPE.length).trimStart();
+	}
+}
+
+/**
+ * Escape one body line so the mirror round-trips exactly: a protocol-looking
+ * line, or a line that the parser would otherwise unescape, gains one leading
+ * backslash after its indentation.
+ */
+function escapeMirrorBodyLine(line: string): string {
+	const content = line.trimStart();
+	if (content.length === 0) return line;
+	if (!isMirrorMarkerText(content)) return line;
+	const indent = line.length - content.length;
+	return line.slice(0, indent) + MIRROR_ESCAPE + content;
+}
+
+function unescapeMirrorBodyLine(line: string): string {
+	const content = line.trimStart();
+	if (!content.startsWith(MIRROR_ESCAPE)) return line;
+	if (!isMirrorMarkerText(content.slice(MIRROR_ESCAPE.length))) return line;
+	const indent = line.length - content.length;
+	return line.slice(0, indent) + content.slice(MIRROR_ESCAPE.length);
+}
+
+/** Escape a complete body for rendering. */
+export function escapeMirrorBody(text: string): string {
+	return String(text ?? "").split("\n").map(escapeMirrorBodyLine).join("\n");
+}
+
+/** Undo `escapeMirrorBody` for a body parsed out of the mirror. */
+export function unescapeMirrorBody(text: string): string {
+	return String(text ?? "").split("\n").map(unescapeMirrorBodyLine).join("\n");
+}
 
 export type MirrorRole = "user" | "assistant" | "toolResult" | "custom";
 
@@ -67,6 +136,31 @@ export interface ParsedMirrorBlock {
 	id: string;
 	role: string;
 	body: string;
+	/** 0-based line numbers of the opening and closing marker lines. */
+	startLine: number;
+	endLine: number;
+}
+
+/** One top-level `CLM_ENTRY` span found by `scanMirrorBlocks`. */
+export interface MirrorBlockSpan {
+	encodedId: string;
+	id: string;
+	role: string;
+	startLine: number;
+	endLine: number;
+}
+
+/**
+ * The single structural reading of a mirror. Parsing, cleanup planning and
+ * span removal all consume this shape, so a marker quoted inside a body can
+ * never be seen by one of them and missed by another.
+ */
+export interface MirrorScan {
+	blocks: MirrorBlockSpan[];
+	empty: boolean;
+	malformed: boolean;
+	duplicateIds: string[];
+	missingEndIds: string[];
 }
 
 export interface ParsedMirror {
@@ -659,6 +753,7 @@ export function renderMirror(records: readonly MirrorRecord[], options: { snapsh
 		MIRROR_HEADER,
 		"<!-- CLM_SNAPSHOT " + (options.snapshot ?? mirrorFingerprint(records)) + " -->",
 		"<!-- Edit block bodies only. Keep CLM_ENTRY and closing markers intact. -->",
+		"<!-- A body line that must read as a marker or comment gains one leading backslash; keep it. -->",
 		"<!-- id is the editable block's ordinal; do not change it or reorder blocks. -->",
 		"<!-- Delete an editable block to omit that message; use CLM_EMPTY when deleting the last one. -->",
 		"<!-- The protected initial task is intentionally not shown here. -->",
@@ -667,7 +762,7 @@ export function renderMirror(records: readonly MirrorRecord[], options: { snapsh
 	const blocks = records
 		.filter((record) => !record.protected)
 		.map((record) => {
-			const body = record.renderText ?? record.text;
+			const body = escapeMirrorBody(record.renderText ?? record.text);
 			const displayId = displayIds.get(record.id) ?? record.id;
 			return "[[CLM_ENTRY id=" + displayId + " role=" + record.role + "]]\n" +
 				body +
@@ -683,41 +778,76 @@ export function parseMirror(text: string): ParsedMirror {
 	const lines = normalized.split("\n");
 	const version = lines.some((line) => line.trim() === MIRROR_HEADER) ? MIRROR_VERSION : undefined;
 	const snapshot = lines.map((line) => line.trim().match(SNAPSHOT_PATTERN)?.[1]).find(Boolean);
+	const scan = scanMirrorBlocks(normalized);
 	const blocks = new Map<string, ParsedMirrorBlock>();
-	const duplicateIds: string[] = [];
-	const missingEndIds: string[] = [];
-	let empty = false;
-	let malformed = false;
-
-	for (let index = 0; index < lines.length; index += 1) {
-		const line = lines[index]?.trim() ?? "";
-		if (line === EMPTY_MARKER) {
-			if (blocks.size > 0) malformed = true;
-			empty = true;
-			continue;
-		}
-		const match = line.match(BLOCK_START_PATTERN);
-		if (!match) continue;
-		const encodedId = match[1] ?? "";
-		const id = decodeId(encodedId);
-		const role = match[2] ?? "user";
-		const endMarker = "[[/CLM_ENTRY id=" + encodedId + "]]";
-		let end = index + 1;
-		while (end < lines.length && (lines[end]?.trim() ?? "") !== endMarker) end += 1;
-		if (end >= lines.length) {
-			missingEndIds.push(id);
-			malformed = true;
-			break;
-		}
-		const block = { id, role, body: lines.slice(index + 1, end).join("\n").trim() };
-		if (blocks.has(id)) duplicateIds.push(id);
-		else blocks.set(id, block);
-		index = end;
+	for (const span of scan.blocks) {
+		if (blocks.has(span.id)) continue;
+		blocks.set(span.id, {
+			id: span.id,
+			role: span.role,
+			body: unescapeMirrorBody(lines.slice(span.startLine + 1, span.endLine).join("\n")).trim(),
+			startLine: span.startLine,
+			endLine: span.endLine,
+		});
 	}
 
-	if (empty && blocks.size > 0) malformed = true;
-	const recognized = Boolean(version && snapshot && !malformed && (empty || blocks.size > 0));
-	return { recognized, version, snapshot, empty, malformed, blocks, duplicateIds, missingEndIds };
+	const recognized = Boolean(version && snapshot && !scan.malformed && (scan.empty || blocks.size > 0));
+	return {
+		recognized,
+		version,
+		snapshot,
+		empty: scan.empty,
+		malformed: scan.malformed,
+		blocks,
+		duplicateIds: scan.duplicateIds,
+		missingEndIds: scan.missingEndIds,
+	};
+}
+
+/**
+ * Read the top-level block structure of a mirror.
+ *
+ * The scan is a state machine, not a marker search: while a block is open, the
+ * only line that can change state is that block's own closing marker. Every
+ * other `[[CLM_ENTRY ...]]`-shaped line inside a body is body text (the renderer
+ * escapes such lines, and this rule keeps a hand-written or model-written
+ * unescaped one harmless). A single reading means `removeMirrorBlocks` can never
+ * cut a span that `parseMirror` did not see.
+ */
+export function scanMirrorBlocks(text: string): MirrorScan {
+	const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
+	const blocks: MirrorBlockSpan[] = [];
+	const duplicateIds: string[] = [];
+	const missingEndIds: string[] = [];
+	const seen = new Set<string>();
+	let empty = false;
+	let open: MirrorBlockSpan | undefined;
+
+	for (let index = 0; index < lines.length; index += 1) {
+		const trimmed = (lines[index] ?? "").trim();
+		if (open) {
+			if (trimmed === `[[/CLM_ENTRY id=${open.encodedId}]]`) {
+				open.endLine = index;
+				blocks.push(open);
+				open = undefined;
+			}
+			continue;
+		}
+		const start = trimmed.match(BLOCK_START_PATTERN);
+		if (start) {
+			const encodedId = start[1] ?? "";
+			const id = decodeId(encodedId);
+			if (seen.has(id)) duplicateIds.push(id);
+			seen.add(id);
+			open = { encodedId, id, role: start[2] ?? "user", startLine: index, endLine: -1 };
+			continue;
+		}
+		if (trimmed === EMPTY_MARKER) empty = true;
+	}
+
+	if (open) missingEndIds.push(open.id);
+	const malformed = missingEndIds.length > 0 || (empty && blocks.length > 0);
+	return { blocks, empty, malformed, duplicateIds, missingEndIds };
 }
 
 export function normalizeText(text: string): string {
