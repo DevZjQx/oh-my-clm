@@ -290,7 +290,7 @@ test("Pi cleanup keeps an uncommitted mirror edit instead of re-rendering over i
 	assert.match(after, /Anchor block, model-edited\./);
 });
 
-test("Pi cleanup explains a mirror that an earlier edit already moved this turn", async () => {
+test("Pi cleanup explains a mirror that an earlier edit already moved this step", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-cleanup-order-"));
 	const sessionId = "cleanup-order-session";
 	const projection = {
@@ -342,7 +342,7 @@ test("Pi cleanup explains a mirror that an earlier edit already moved this turn"
 	const result = await tools.get("cleanup").execute("cleanup-order-1", { blockIds: [2] }, undefined, undefined, ctx);
 	assert.equal(result.structuredContent?.status, "rejected");
 	assert.equal(result.isError, true);
-	assert.match(result.structuredContent?.reason ?? "", /at most one cleanup per turn/);
+	assert.match(result.structuredContent?.reason ?? "", /at most one cleanup per step/);
 	assert.match(result.structuredContent?.reason ?? "", /before any mirror edit/);
 	const after = fs.readFileSync(mirrorPath, "utf8");
 	assert.match(after, /Anchor block, model-edited\./);

@@ -288,11 +288,13 @@ function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolRe
 	// left alone, so the staleness rejection still protects uncommitted edits.
 	const previous = state.snapshot;
 	const onDisk = readText(filePath);
-	// A change already made this turn (a mirror edit, or an earlier cleanup) leaves
-	// the file's snapshot behind the live projection, because Pi appends the
+	// A change already made in this step (a mirror edit, or an earlier cleanup)
+	// leaves the file's snapshot behind the live projection, because Pi appends the
 	// assistant message carrying this very tool call after the request-time write.
 	// Re-rendering would discard that change, so it is kept and reported instead.
-	const changedThisTurn = previous !== undefined && onDisk !== undefined && onDisk !== previous.rendered;
+	// The constraint is per step: `turn_end` fires at the end of each step and
+	// refreshes the baseline, so a later step can cleanup again.
+	const changedThisStep = previous !== undefined && onDisk !== undefined && onDisk !== previous.rendered;
 	if (!previous || onDisk === undefined || onDisk === previous.rendered) syncMirror(ctx);
 
 	const records = buildRecords();
@@ -306,10 +308,10 @@ function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolRe
 		{ fixedTokens: fixedRequestTokens(ctx) },
 	);
 	if (plan.status !== "applied") {
-		if (changedThisTurn && /snapshot is stale/.test(plan.reason ?? "")) {
+		if (changedThisStep && /snapshot is stale/.test(plan.reason ?? "")) {
 			return rejectedCleanupResult(
 				plan.requestedBlockIds,
-				"The mirror was already changed earlier in this turn, so it no longer matches the live projection. Do at most one cleanup per turn, and run it before any mirror edit.",
+				"The mirror was already changed earlier in this step, so it no longer matches the live projection. Do at most one cleanup per step, and run it before any mirror edit.",
 			);
 		}
 		return cleanupToolResult(plan);

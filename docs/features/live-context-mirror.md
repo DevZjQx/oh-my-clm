@@ -78,7 +78,7 @@ Pi context_edit entry
 
 ### 2.4 `turn_end`：计划并提交编辑
 
-agent turn 结束后，扩展：
+Pi 的 `turn_end` 在每个模型 step 结束时触发，语义是"一次 assistant 响应及其 tool call 结束"（见 Pi `docs/json.md`），而不是一次 user turn 结束；所以模型在同一 user turn 内多次 step 的编辑会逐步提交。扩展在每次 `turn_end`：
 
 1. 读取 mirror；
 2. 检查版本、snapshot、重复/未知 ID、role、closing marker 等协议条件；
@@ -169,6 +169,8 @@ Pi 在当前 branch 记录 `context_edit`，然后在下一次请求中替换或
 4. role 没有变化，closing marker 没有缺失；
 5. user-authored block 不能被改写，只能保留或省略；
 6. 编辑后的估算 context 必须严格短于编辑前。
+
+因为 gate 只允许严格收缩，改写是单向棘轮：一个 body 一旦被换成更短的文本，把原文写回去会以"必须更短"被拒绝。恢复原文只能靠原始 session 日志或 branch 切换，这也是 mirror 只作为显示/编辑面、而原始 JSONL 始终是事实源的原因。
 
 固定的 shrink-only 策略不通过环境变量切换。共享格式层的 `estimateMessageTokens(message)` 对当前 Pi 支持的消息形状采用与 Pi host 一致的 `3.5 chars/token` 近似和按消息 rounding，并同时接受 DSH 的 `reasoning`、`tool-call`/`tool` 等词汇；system sections 和 tool declarations 在结构化 system message 中也按 host 规则估算。当前 Pi extension 的公开 `ExtensionContext` 只提供 effective system prompt，因此 `fixedRequestTokens` 只计可取得的 prompt；host 未提供的 tool declaration overhead 必须标记为 incomplete approximation，而不能假定已计入。它用于 before/after 比较；Pi context window 仍是最终约束。
 

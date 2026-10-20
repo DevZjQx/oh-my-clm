@@ -35,7 +35,7 @@ cleanup({ "list": "3-16" })
 - 显式 ID 1 会被拒绝；range 覆盖 1 时保留 block 1。初始用户任务（protected prefix）不在可编辑区域中。
 - 配对级联删除通过 `pairedRemovalIds` / `paired` 单独报告，不会混进调用者请求的 ID。
 - 用户消息只能保留或省略，不能被 cleanup 改写；cleanup 只做删除。
-- Pi 侧一个 turn 最多调用一次 cleanup，并且要在本轮任何 mirror 编辑之前。文件一旦在本轮被改过（一次编辑或一次更早的 cleanup），它的 snapshot 就落后于 live projection（Pi 在请求后追加了携带本工具调用的 assistant 消息），cleanup 会整体拒绝并在 reason 里点明顺序，而不是静默重渲染掉那笔改动。
+- Pi 侧一个 step（一次 assistant 响应及其 tool call）最多调用一次 cleanup，并且要在该 step 任何 mirror 编辑之前。Pi 的 `turn_end` 在每个 step 结束时触发（见 Pi `docs/json.md`），每次提交都会刷新 mirror 基线，所以跨 step 的多次 cleanup 是正常且安全的；同一 step 内先改 body 再 cleanup 则会整体拒绝——文件一旦在提交前被改过，它的 snapshot 就落后于 live projection，cleanup 不静默重渲染也不删除任何 block，并在 reason 里点明顺序。
 - 删除最后一个可编辑 block 时，mirror 保留 `<!-- CLM_EMPTY -->`。
 
 ## 3. block index
@@ -144,4 +144,4 @@ DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程里切换索引形状并
 5. 未知、重复、过期 ID 和 role 变化整体拒绝；
 6. `list` 只读，不写 mirror，不能与删除参数同用；
 7. 结果模式不改变工具调用记录，也不吞掉 listing 内容；
-8. Pi 侧 mirror 已带本轮改动时，cleanup 以可行动的 `rejected` 结束，既不静默重渲染，也不删除任何 block。
+8. Pi 侧 mirror 已带本 step 改动时，cleanup 以可行动的 `rejected` 结束，既不静默重渲染，也不删除任何 block。
