@@ -1,8 +1,5 @@
-import { CLM_MIRROR_FILENAME } from "../../lib/clm-paths.js";
 import { cleanupMirrorForRecords, cleanupToolResult, describeCleanupList, planCleanup, } from "./context-cleanup.js";
 import { buildMirrorRecords, DEFAULT_MAX_BLOCK_CHARS, DEFAULT_MAX_MIRROR_CHARS, estimateMessageTokens, estimateMirrorTokens, mirrorSignature, parseMirror, planContextEdits, renderBlockDigest, renderBlockIndex, renderMirror, } from "./context-format.js";
-/** The DSH-facing mirror filename deliberately matches the Pi adapter. */
-export const DSH_MIRROR_FILENAME = CLM_MIRROR_FILENAME;
 function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -32,7 +29,7 @@ function isSurfaceMessageEvent(type) {
  * they are omitted here. Keeping them out also prevents the block index from
  * listing itself and growing on every step.
  */
-export function buildDshProjectionEntries(session) {
+function buildDshProjectionEntries(session) {
     const events = new Map(session.snapshotEvents().map((event) => [event.seq, event]));
     const entries = [];
     for (const seq of session.surface.nodes) {
@@ -110,7 +107,7 @@ export function dshBlockIndexText(session, options, state, refreshSteps = 4) {
  * that have already completed. The upcoming step is deliberately not part of
  * the key because it does not exist yet when the runtime context is rendered.
  */
-export function dshBlockIndexEpoch(session) {
+function dshBlockIndexEpoch(session) {
     if (!session || typeof session.snapshotEvents !== "function")
         return { closedSteps: 0 };
     let turn;
@@ -333,7 +330,7 @@ function appendContentReplacement(session, record, event, action, targetSeq, coo
  * text, since `assistant/message` cannot carry `sourceEventSeqs`. No custom
  * event or proposal file is involved.
  */
-export function applyDshContextEdits(session, plan, records, options) {
+function applyDshContextEdits(session, plan, records, options) {
     if (plan.status !== "applied")
         return rejectMutation("Only an applied edit plan can mutate a DSH session.");
     if (typeof session.append !== "function") {

@@ -1,4 +1,3 @@
-import { CLM_MIRROR_FILENAME } from "../../lib/clm-paths.ts";
 import {
 	cleanupMirrorForRecords,
 	cleanupToolResult,
@@ -26,9 +25,6 @@ import {
 	type MirrorRecord,
 	type ProjectionEntryLike,
 } from "./context-format.ts";
-
-/** The DSH-facing mirror filename deliberately matches the Pi adapter. */
-export const DSH_MIRROR_FILENAME = CLM_MIRROR_FILENAME;
 
 export interface DshSessionEventLike {
 	seq: number;
@@ -164,7 +160,7 @@ function isSurfaceMessageEvent(type: string): boolean {
  * they are omitted here. Keeping them out also prevents the block index from
  * listing itself and growing on every step.
  */
-export function buildDshProjectionEntries(session: DshSessionLike): ProjectionEntryLike[] {
+function buildDshProjectionEntries(session: DshSessionLike): ProjectionEntryLike[] {
 	const events = new Map(session.snapshotEvents().map((event) => [event.seq, event]));
 	const entries: ProjectionEntryLike[] = [];
 	for (const seq of session.surface.nodes) {
@@ -255,7 +251,7 @@ export function dshBlockIndexText(
  * that have already completed. The upcoming step is deliberately not part of
  * the key because it does not exist yet when the runtime context is rendered.
  */
-export function dshBlockIndexEpoch(
+function dshBlockIndexEpoch(
 	session: Pick<DshSessionLike, "snapshotEvents"> | undefined,
 ): { turn?: number; closedSteps: number } {
 	if (!session || typeof session.snapshotEvents !== "function") return { closedSteps: 0 };
@@ -500,7 +496,7 @@ function appendContentReplacement(
  * text, since `assistant/message` cannot carry `sourceEventSeqs`. No custom
  * event or proposal file is involved.
  */
-export function applyDshContextEdits(
+function applyDshContextEdits(
 	session: DshSessionLike,
 	plan: EditPlan,
 	records: readonly MirrorRecord[],

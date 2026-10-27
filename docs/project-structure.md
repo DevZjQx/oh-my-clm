@@ -39,7 +39,6 @@ oh-my-clm
 │   ├── reference                # 论文、上游实现和宿主机制的背景资料
 │   │   ├── clm-technical-analysis.md
 │   │   └── dsh-prefix-cache.md
-│   ├── fact-check-2026-10-20.md # 一次性事实核查报告（本地，不随 npm 包发布）
 │   ├── reports                  # 历史验证报告 + 报告说明
 │   └── reckless                 # 内部决策记录/证据账本/路线图（不发布）
 ├── dist                         # tsc 构建产物（随仓库提交）

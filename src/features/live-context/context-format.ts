@@ -33,7 +33,7 @@ export const DEFAULT_BLOCK_INDEX_TAIL = 40;
  * and a truncated listing names the range that continues it instead of leaving a
  * silently partial view.
  */
-export const DEFAULT_BLOCK_LIST_CHARS = 6_000;
+const DEFAULT_BLOCK_LIST_CHARS = 6_000;
 
 const EMPTY_MARKER = "<!-- CLM_EMPTY -->";
 const SNAPSHOT_PATTERN = /^<!-- CLM_SNAPSHOT ([a-f0-9]{16}) -->$/;
@@ -99,12 +99,12 @@ function unescapeMirrorBodyLine(line: string): string {
 }
 
 /** Escape a complete body for rendering. */
-export function escapeMirrorBody(text: string): string {
+function escapeMirrorBody(text: string): string {
 	return String(text ?? "").split("\n").map(escapeMirrorBodyLine).join("\n");
 }
 
 /** Undo `escapeMirrorBody` for a body parsed out of the mirror. */
-export function unescapeMirrorBody(text: string): string {
+function unescapeMirrorBody(text: string): string {
 	return String(text ?? "").split("\n").map(unescapeMirrorBodyLine).join("\n");
 }
 
@@ -253,7 +253,7 @@ function textFromBlock(block: TextBlock): string {
 	return "";
 }
 
-export function contentText(content: unknown): string {
+function contentText(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	return content
@@ -495,7 +495,7 @@ export function renderBlockIndex(
  * Pick the 1-based trailing window: the last `count` blocks, never overlapping
  * the head. Returns undefined when there is nothing left to list after it.
  */
-export function selectTailWindow(
+function selectTailWindow(
 	total: number,
 	headEnd: number,
 	count: number,
@@ -850,7 +850,7 @@ export function scanMirrorBlocks(text: string): MirrorScan {
 	return { blocks, empty, malformed, duplicateIds, missingEndIds };
 }
 
-export function normalizeText(text: string): string {
+function normalizeText(text: string): string {
 	return String(text ?? "").replace(/\r\n?/g, "\n").trim();
 }
 

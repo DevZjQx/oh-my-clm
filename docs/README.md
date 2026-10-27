@@ -20,6 +20,5 @@
 ## 验证
 
 - [DSH 证据与 harness](./reports/README.md)：mock host harness 的运行方式、当前证据和历史验证报告。
-- [事实核查报告（2026-10-20，本地）](./fact-check-2026-10-20.md)：对当时文档与实现的一次性核查记录，路径和行号指向重组前结构，不作为当前行为说明。
 
 版本更新说明见根目录的 [changelog.md](../changelog.md)。
