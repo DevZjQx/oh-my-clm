@@ -714,3 +714,119 @@ test("Pi cleanup removes a block while a neighbour body quotes markers", async (
 	assert.match(mirror, /\\\[\[CLM_ENTRY id=3 role=user\]\]/);
 	assert.equal(fs.existsSync(mirrorPath), true);
 });
+
+// docs/plan.md §3 case 8 / I-1: extension state must be keyed per session. A
+// one-shot notice left by session A must not surface in session B's request.
+test("plan §3.8 (I-1): interleaved sessions do not share the pending notice", async () => {
+	const previousBudget = process.env.CLM_CONTEXT_BUDGET;
+	delete process.env.CLM_CONTEXT_BUDGET;
+	try {
+		const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+		const api = {
+			on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+				handlers.set(name, handler);
+				return () => undefined;
+			},
+			registerCommand: () => undefined,
+			registerTool: () => undefined,
+		};
+		extension(api as any);
+
+		const projection = {
+			entries: [
+				{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+				{ sourceEntry: { id: "old-answer", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "An old answer." }] }] },
+			],
+			messages: [],
+		};
+		const noticesA: string[] = [];
+		const makeCtx = (sessionId: string, hasUI: boolean, collect?: (message: string) => void) => ({
+			cwd: fs.mkdtempSync(path.join(os.tmpdir(), `oh-my-clm-ms-${sessionId}-`)),
+			hasUI,
+			mode: "print",
+			model: undefined,
+			getContextUsage: () => undefined,
+			ui: { notify: collect ?? (() => undefined) },
+			sessionManager: {
+				buildSessionProjection: () => projection,
+				getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+				getSessionId: () => sessionId,
+			},
+		});
+		const ctxA = makeCtx("plan-ms-a", true, (message) => noticesA.push(message));
+		const ctxB = makeCtx("plan-ms-b", true);
+
+		await handlers.get("context")?.({ messages: [] }, ctxA);
+		// A rejected edit leaves a one-shot notice in the extension state.
+		const mirrorPathA = sessionMirrorPath("plan-ms-a");
+		fs.writeFileSync(
+			mirrorPathA,
+			fs.readFileSync(mirrorPathA, "utf8").replace(/CLM_SNAPSHOT [a-f0-9]{16}/, "CLM_SNAPSHOT 0000000000000000"),
+			"utf8",
+		);
+		await handlers.get("turn_end")?.({ entries: [] }, ctxA);
+		assert.ok(noticesA.some((message) => /rejected/i.test(message)), "session A should have produced a rejection notice");
+
+		const resultB = await handlers.get("context")?.({ messages: [] }, ctxB) as
+			{ messages?: Array<{ role: string; content: string }> } | undefined;
+		const leaked = (resultB?.messages ?? []).some((message) => String(message.content).includes("<pi-clm-edit-notice>"));
+		assert.equal(leaked, false, "session A's pending notice must not be delivered to session B");
+	} finally {
+		if (previousBudget === undefined) delete process.env.CLM_CONTEXT_BUDGET;
+		else process.env.CLM_CONTEXT_BUDGET = previousBudget;
+	}
+});
+
+// docs/plan.md §3 case 9 / I-2: the budget nudge needs a stop condition. It is
+// synthetic and never written to session history, so its own marker guard can
+// never see a previous nudge and it repeats indefinitely without progress.
+test("plan §3.9 (I-2): repeated no-progress nudge rounds are bounded", async () => {
+	const previousBudget = process.env.CLM_CONTEXT_BUDGET;
+	process.env.CLM_CONTEXT_BUDGET = "100";
+	try {
+		const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+		const api = {
+			on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+				handlers.set(name, handler);
+				return () => undefined;
+			},
+			registerCommand: () => undefined,
+			registerTool: () => undefined,
+		};
+		extension(api as any);
+		const projection = {
+			entries: [
+				{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+				{ sourceEntry: { id: "old-answer", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "An old answer." }] }] },
+			],
+			messages: [],
+		};
+		const ctx = {
+			cwd: fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-nudge-loop-")),
+			hasUI: false,
+			mode: "print",
+			model: undefined,
+			getContextUsage: () => undefined,
+			ui: { notify: () => undefined },
+			sessionManager: {
+				buildSessionProjection: () => projection,
+				getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+				getSessionId: () => "plan-nudge-session",
+			},
+		};
+		await handlers.get("session_start")?.({}, ctx);
+		// Each new request sees the same history: the synthetic nudge is not part
+		// of it, so `messages.some(contains marker)` can never short-circuit.
+		const messages = [{ role: "user", content: "x".repeat(1_000) }];
+		let nudges = 0;
+		for (let round = 0; round < 5; round += 1) {
+			const result = await handlers.get("context")?.({ messages }, ctx) as
+				{ messages?: Array<{ role: string; content: string }> } | undefined;
+			nudges += (result?.messages ?? []).filter((message) => String(message.content).includes("<pi-clm-budget-nudge>")).length;
+		}
+		assert.ok(nudges <= 2, `nudge needs a stop condition: emitted ${nudges} times across 5 identical rounds`);
+	} finally {
+		if (previousBudget === undefined) delete process.env.CLM_CONTEXT_BUDGET;
+		else process.env.CLM_CONTEXT_BUDGET = previousBudget;
+	}
+});

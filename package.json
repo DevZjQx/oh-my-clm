@@ -1,6 +1,6 @@
 {
   "name": "oh-my-clm",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "A Pi extension and minimal DSH bridge for self-editable live context inspired by the Facebook Research CLM harness.",
   "icon": "./icon.svg",
   "repository": {
@@ -69,8 +69,8 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
-    "@deepseek-ai/dsh": "^0.2.0-rc.2",
-    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh": "^0.2.0-rc.2 || ^0.2.2-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2 || ^0.2.2-rc.1",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",

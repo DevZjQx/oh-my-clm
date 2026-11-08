@@ -1,5 +1,13 @@
 import { cleanupMirrorForRecords, cleanupToolResult, describeCleanupList, planCleanup, } from "./context-cleanup.js";
 import { buildMirrorRecords, DEFAULT_MAX_BLOCK_CHARS, DEFAULT_MAX_MIRROR_CHARS, estimateMessageTokens, estimateMirrorTokens, mirrorSignature, parseMirror, planContextEdits, renderBlockDigest, renderBlockIndex, renderMirror, } from "./context-format.js";
+/**
+ * Closed source tag for DSH replacement nodes. A model-driven edit must never
+ * be attributed to a human user: this field is owned by the runtime and cannot
+ * be declared from a mirror body (see RESERVED_PROVENANCE_PATTERN). DSH's
+ * MessageSourceMap is merge-extensible, so a plugin-specific kind is the
+ * intended way to name a non-human producer.
+ */
+const DSH_EDIT_SOURCE = { kind: "oh-my-clm" };
 function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -247,7 +255,7 @@ function appendOmission(session, targetSeq, coordinates) {
             id: mutationMessageId(session, targetSeq, "omit"),
             role: "developer",
             content: [],
-            source: { kind: "user" },
+            source: DSH_EDIT_SOURCE,
         },
     }, {
         surfaceOp: { op: "replace", startSeq: targetSeq, endSeq: targetSeq },
@@ -292,7 +300,7 @@ function appendContentReplacement(session, record, event, action, targetSeq, coo
                 id: mutationMessageId(session, targetSeq, "developer"),
                 role: "developer",
                 content,
-                source: { kind: "user" },
+                source: DSH_EDIT_SOURCE,
             },
         }, {
             surfaceOp: { op: "replace", startSeq: targetSeq, endSeq: targetSeq },
@@ -370,7 +378,7 @@ function applyDshContextEdits(session, plan, records, options) {
         const existing = actions.get(record.id);
         if (existing?.replacement === null)
             return undefined;
-        actions.set(record.id, { targetId: record.id, replacement: null, reason: "omit" });
+        actions.set(record.id, { targetId: record.id, replacement: null, reason: "omit", provenance: "model-mirror-edit" });
         return undefined;
     };
     // Match the shared Pi policy: no edited assistant tool call may leave a

@@ -44,6 +44,17 @@ const BLOCK_END_PATTERN = /^\[\[\/CLM_ENTRY\s+id=([^\s\]]+)\]\]$/;
  * opening a phantom block.
  */
 const MIRROR_ESCAPE = "\\";
+/** Marker only the renderer writes into a truncated preview body. */
+export const MIRROR_PREVIEW_TRUNCATED_MARKER = "oh-my-clm mirror preview truncated";
+const MIRROR_PREVIEW_TRUNCATED_PATTERN = /oh-my-clm mirror preview truncated/;
+/**
+ * Provenance is a closed field written by the runtime, never parsed from a
+ * body. A body that tries to declare one of these reserved attributes is not a
+ * history rewrite and must be rejected at the edit boundary.
+ */
+const RESERVED_PROVENANCE_PATTERN = /\[oh-my-clm\b[^\]]*\b(?:source|owner|agent|trusted|provenance)\s*=/i;
+/** Shared load-bearing rule for both deletion paths (cleanup and mirror edits). */
+export const PRESERVE_FIRST_BLOCK_REASON = "load-bearing block 1 must be preserved; delete a later block or use cleanup.";
 /** Structural meaning of one trimmed line, or undefined for ordinary body text. */
 function mirrorMarkerKind(line) {
     const trimmed = line.trim();
@@ -245,7 +256,7 @@ function compactMirrorText(text, maxChars) {
     const normalized = normalizeText(text);
     if (normalized.length <= maxChars)
         return normalized;
-    const marker = "\n...[oh-my-clm mirror preview truncated; " +
+    const marker = "\n...[" + MIRROR_PREVIEW_TRUNCATED_MARKER + "; " +
         normalized.length +
         " source characters retained unless this block is edited]...\n";
     const available = Math.max(0, maxChars - marker.length);
@@ -282,6 +293,15 @@ function editableDisplayIds(records) {
             ids.set(record.id, String(++index));
     }
     return ids;
+}
+/**
+ * The first editable block is the load-bearing anchor. Both `planCleanup` and
+ * `planContextEdits` identify it here, so a deletion refused on one path is
+ * refused on the other even after a compaction summary releases the protected
+ * prefix.
+ */
+export function loadBearingRecord(records) {
+    return records.find((record) => !record.protected);
 }
 function blockPreview(text, maxChars) {
     const collapsed = normalizeText(text).replace(/\s+/g, " ");
@@ -708,6 +728,20 @@ function fallbackEstimatorMessage(role, text, toolCallId) {
 }
 const CHARS_PER_TOKEN = 3.5;
 const ESTIMATED_IMAGE_CHARS = 4_800;
+/**
+ * Provider-independent character weighting. A flat 3.5 chars/token charges
+ * CJK, emoji and other non-ASCII scripts the same as ASCII, so a Chinese
+ * rewrite can look like a shrink while growing real provider tokens. Each
+ * non-ASCII code point is charged roughly one token; ASCII keeps the host's
+ * 3.5 chars/token ratio. This is still an approximation, not a tokenizer.
+ */
+function weightedChars(text) {
+    let total = 0;
+    for (const character of text) {
+        total += (character.codePointAt(0) ?? 0) < 0x80 ? 1 : CHARS_PER_TOKEN;
+    }
+    return total;
+}
 function safeJsonStringify(value) {
     try {
         return JSON.stringify(value) ?? "undefined";
@@ -718,18 +752,18 @@ function safeJsonStringify(value) {
 }
 function contentEstimateChars(content) {
     if (typeof content === "string")
-        return content.length;
+        return weightedChars(content);
     if (!Array.isArray(content))
         return 0;
     return content.reduce((total, part) => {
         if (!isRecord(part))
-            return total + (typeof part === "string" ? part.length : 0);
+            return total + (typeof part === "string" ? weightedChars(part) : 0);
         if (part.type === "text" && typeof part.text === "string")
-            return total + part.text.length;
+            return total + weightedChars(part.text);
         if (part.type === "thinking" && typeof part.thinking === "string")
-            return total + part.thinking.length;
+            return total + weightedChars(part.thinking);
         if (part.type === "reasoning" && typeof part.text === "string")
-            return total + part.text.length;
+            return total + weightedChars(part.text);
         if (part.type === "image")
             return total + ESTIMATED_IMAGE_CHARS;
         return total;
@@ -755,23 +789,25 @@ function systemTextChars(message) {
                 parts.push(value);
         }
     }
-    return parts.filter((part) => part.length > 0).join("\n\n").length;
+    return weightedChars(parts.filter((part) => part.length > 0).join("\n\n"));
 }
 /** Match Pi's independent rounding for system tool additions/removals. */
 function estimateToolsTokens(tools) {
     if (!Array.isArray(tools) || tools.length === 0)
         return 0;
-    return Math.ceil(safeJsonStringify(tools).length / CHARS_PER_TOKEN);
+    return Math.ceil(weightedChars(safeJsonStringify(tools)) / CHARS_PER_TOKEN);
 }
 /**
  * Estimate one structured message without importing a host runtime.
  *
  * Supported Pi message shapes follow the current provider-independent host
  * estimator: 3.5 characters per token, rounded per message (and per system
- * tool declaration list). The shared layer also accepts DSH's `reasoning`,
+ * tool declaration list). Non-ASCII scripts are weighted so a CJK rewrite
+ * cannot masquerade as a shrink, and assistant string bodies are counted like
+ * any other string body. The shared layer also accepts DSH's `reasoning`,
  * `tool-call`, and `tool` vocabulary. Keeping the estimator here makes the
  * format layer loadable by both Pi and DSH; it is still an approximation, not
- * a provider tokenizer.
+ * a provider tokenizer, and is never the sole safety check (see README).
  */
 export function estimateMessageTokens(message) {
     const candidate = estimatorMessage(message);
@@ -793,30 +829,38 @@ export function estimateMessageTokens(message) {
             chars = contentEstimateChars(candidate.content);
             break;
         case "assistant":
+            if (typeof candidate.content === "string") {
+                chars = weightedChars(candidate.content);
+                break;
+            }
             if (Array.isArray(candidate.content)) {
                 for (const part of candidate.content) {
+                    if (typeof part === "string") {
+                        chars += weightedChars(part);
+                        continue;
+                    }
                     if (!isRecord(part))
                         continue;
                     if ((part.type === "text" || part.type === "reasoning") && typeof part.text === "string") {
-                        chars += part.text.length;
+                        chars += weightedChars(part.text);
                     }
                     else if (part.type === "thinking" && typeof part.thinking === "string") {
-                        chars += part.thinking.length;
+                        chars += weightedChars(part.thinking);
                     }
                     else if (part.type === "toolCall" || part.type === "tool-call") {
-                        chars += typeof part.name === "string" ? part.name.length : 0;
-                        chars += safeJsonStringify(part.arguments).length;
+                        chars += typeof part.name === "string" ? weightedChars(part.name) : 0;
+                        chars += weightedChars(safeJsonStringify(part.arguments));
                     }
                 }
             }
             break;
         case "bashExecution":
-            chars = (typeof candidate.command === "string" ? candidate.command.length : 0)
-                + (typeof candidate.output === "string" ? candidate.output.length : 0);
+            chars = (typeof candidate.command === "string" ? weightedChars(candidate.command) : 0)
+                + (typeof candidate.output === "string" ? weightedChars(candidate.output) : 0);
             break;
         case "branchSummary":
         case "compactionSummary":
-            chars = typeof candidate.summary === "string" ? candidate.summary.length : 0;
+            chars = typeof candidate.summary === "string" ? weightedChars(candidate.summary) : 0;
             break;
     }
     return Math.ceil(chars / CHARS_PER_TOKEN);
@@ -859,6 +903,24 @@ function contentReplacement(role, text) {
     if (role === "assistant" || role === "toolResult")
         return [{ type: "text", text }];
     return text;
+}
+/**
+ * Why a `replace` body must never be written back into the session. A mirror
+ * body is untrusted history text: it is not allowed to overwrite canonical
+ * content it cannot see, smuggle the renderer's truncation marker, or declare
+ * privileged provenance that only the runtime may assign.
+ */
+function unsafeReplacementReason(record, body) {
+    if (record.renderText !== undefined) {
+        return "this block shows a truncated or elided preview, so rewriting it would discard unseen canonical text; omit the block or use cleanup instead";
+    }
+    if (MIRROR_PREVIEW_TRUNCATED_PATTERN.test(body)) {
+        return "a body cannot contain the reserved preview-truncated marker";
+    }
+    if (RESERVED_PROVENANCE_PATTERN.test(body)) {
+        return "a body cannot declare a privileged source/owner; provenance is assigned by the runtime";
+    }
+    return undefined;
 }
 /**
  * Turn a user/model-edited mirror into append-only Pi context edits. The
@@ -1035,6 +1097,28 @@ export function planContextEdits(records, parsed, options = {}) {
             actions.set(record.id, { kind: "replace", body, reason: "block edited" });
         }
     }
+    // A model-written body is untrusted history text. Reject any rewrite that
+    // would overwrite canonical content the mirror never showed, that carries
+    // the reserved truncation marker, or that forges a runtime-owned source.
+    const unsafeRewrites = records
+        .filter((record) => actions.get(record.id)?.kind === "replace")
+        .map((record) => ({
+        id: record.id,
+        reason: unsafeReplacementReason(record, actions.get(record.id)?.body ?? ""),
+    }))
+        .filter((entry) => entry.reason !== undefined);
+    if (unsafeRewrites.length > 0) {
+        return {
+            status: "rejected",
+            edits: [],
+            beforeTokens,
+            afterTokens: beforeTokens,
+            changedIds: unsafeRewrites.map((entry) => entry.id),
+            omittedIds: [],
+            warnings,
+            reason: unsafeRewrites.map((entry) => `${entry.id}: ${entry.reason}.`).join(" "),
+        };
+    }
     const byToolCallId = new Map();
     for (const record of records) {
         for (const id of record.toolCallIds)
@@ -1089,6 +1173,23 @@ export function planContextEdits(records, parsed, options = {}) {
         }
     }
     const changed = records.filter((record) => actions.get(record.id)?.kind !== "keep");
+    // The load-bearing anchor is shared with planCleanup: neither deletion path
+    // may remove the first editable block, including omissions cascaded from a
+    // paired tool call/result. This stays true after a compaction summary, when
+    // the protected prefix is no longer marked in the projection.
+    const loadBearing = loadBearingRecord(records);
+    if (loadBearing && actions.get(loadBearing.id)?.kind === "omit") {
+        return {
+            status: "rejected",
+            edits: [],
+            beforeTokens,
+            afterTokens: beforeTokens,
+            changedIds: changed.map((record) => record.id),
+            omittedIds: changed.filter((record) => actions.get(record.id)?.kind === "omit").map((record) => record.id),
+            warnings,
+            reason: PRESERVE_FIRST_BLOCK_REASON,
+        };
+    }
     if (changed.length === 0) {
         return {
             status: "noop",
@@ -1139,13 +1240,14 @@ export function planContextEdits(records, parsed, options = {}) {
         if (!action || action.kind === "keep" || record.protected)
             continue;
         if (action.kind === "omit") {
-            edits.push({ targetId: record.id, replacement: null, reason: "omit" });
+            edits.push({ targetId: record.id, replacement: null, reason: "omit", provenance: "model-mirror-edit" });
         }
         else {
             edits.push({
                 targetId: record.id,
                 replacement: { content: contentReplacement(record.role, action.body ?? "") },
                 reason: "replace",
+                provenance: "model-mirror-edit",
             });
         }
     }

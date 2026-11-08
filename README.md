@@ -51,9 +51,9 @@ mirror 的结构如下：
 - body 里如果需要出现 `[[CLM_ENTRY ...]]`、`[[/CLM_ENTRY ...]]`、`<!-- CLM_EMPTY -->`、`CLM_SNAPSHOT` 或 `clm-v2` 这样的字面行，保留它前面的一个反斜杠 `\`：这是转义，去掉后该行会变成协议结构。
 - `id` 是从 `1` 开始的可读编辑序号；不要改 ID，也不要重排 block。扩展内部仍用 Pi 的 opaque entry ID。
 - 删除一个可编辑 block 会从后续 projection 中省略该消息；删除最后一个 block 时保留 `<!-- CLM_EMPTY -->`。
-- 初始用户任务受到保护，不会出现在可编辑区域中；user-authored block 可以被省略，但不能被模型改写。
-- Pi 侧的 mirror preview 有固定的单 block 和总大小上限；DSH 默认相同，但可用 `CLM_MAX_BLOCK_CHARS` / `CLM_MAX_MIRROR_CHARS` 覆盖。截断只影响显示，不改变 canonical source。
-- `cleanup({ blockIds: [...] })` 按当前 1-based editable ID 删除 block；load-bearing block 1 始终保留，assistant/tool-result 配对也会整体处理。未知、重复、过期或协议损坏的 ID 会整体拒绝。
+- 初始用户任务在无 compaction 时受保护，不会出现在可编辑区域中；出现 compaction summary 后 protected 前缀被释放，但首个可编辑 block（load-bearing block 1）在两条删除路径上始终保留，初始任务因此仍不会被删除。user-authored block 可以被省略，但不能被模型改写。
+- Pi 侧的 mirror preview 有固定的单 block 和总大小上限；DSH 默认相同，但可用 `CLM_MAX_BLOCK_CHARS` / `CLM_MAX_MIRROR_CHARS` 覆盖。截断只影响显示，canonical source 始终完整；但**改写截断块会被拒绝**——否则 head+tail 截断副本会成为新的 canonical 正文，中间未显示内容永久丢失。只能省略该 block 或用 `cleanup`。
+- `cleanup({ blockIds: [...] })` 按当前 1-based editable ID 删除 block；load-bearing block 1 在 `cleanup` 与 mirror 编辑两条路径上共享 `loadBearingRecord()` 守卫、始终保留，assistant/tool-result 配对也会整体处理。未知、重复、过期或协议损坏的 ID 会整体拒绝。
 - 如果工具结果读取了 `LIVE_CTX_MAIN.md`，该结果会在未来 projection 中替换成短指针，避免 mirror 自我复制。
 - 改写或删除 assistant tool turn 时，配对的 tool result 也会一起处理，避免孤立的 tool message。
 
@@ -119,7 +119,7 @@ dsh --profile <profile>
 dsh plugin --profile <profile> remove oh-my-clm
 ```
 
-需要固定版本时，npm 源在包名后加 `@<version>`（例如 `oh-my-clm@0.1.12`），GitHub 源在仓库后加 `#<ref>`（例如 `github:DevZjQx/oh-my-clm#<commit-sha>`）。DSH 不读取 `pi` 设置，Pi 的安装也不会自动把插件加入任何 DSH profile。
+需要固定版本时，npm 源在包名后加 `@<version>`（例如 `oh-my-clm@0.1.13`），GitHub 源在仓库后加 `#<ref>`（例如 `github:DevZjQx/oh-my-clm#<commit-sha>`）。DSH 不读取 `pi` 设置，Pi 的安装也不会自动把插件加入任何 DSH profile。
 
 ## 快速上手
 
@@ -175,9 +175,9 @@ Pi 侧的 mirror 显示上限是固定的：单 block 约 `12000` 字符，总 m
 
 ### token 估算
 
-token 计数使用共享格式层的 provider-independent `estimateMessageTokens(message)`，按消息分别估算。对当前 Pi 支持的 text、thinking、tool call、图片、system sections 和 tool declarations，它采用与 Pi host 一致的 `3.5 chars/token` 近似及 rounding。共享层不导入 Pi runtime，但会显式处理 DSH 的 `reasoning`、`tool-call`、`tool` 等形状；只有未识别的其他自有消息形状才走 fallback 估算。
+token 计数使用共享格式层的 provider-independent `estimateMessageTokens(message)`，按消息分别估算。对当前 Pi 支持的 text、thinking、tool call、图片、system sections 和 tool declarations，ASCII 文本沿用与 Pi host 一致的 `3.5 chars/token` 近似及按消息 rounding；非 ASCII 字符（CJK、emoji 等）按约 1 token/字符加权，assistant 的字符串正文也按正文计入（此前计 0）。共享层不导入 Pi runtime，但会显式处理 DSH 的 `reasoning`、`tool-call`、`tool` 等形状；只有未识别的其他自有消息形状才走 fallback 估算。
 
-当前 Pi extension 的公开 `ExtensionContext` 只提供 effective system prompt，`fixedRequestTokens` 因此只计该 prompt；tool declaration overhead 只有在 host 传入结构化 system message 时才会被计入，否则这个估算就不完整。它不是 provider 的精确 tokenizer；Pi/DSH 自身的 context window 仍是最终约束。
+当前 Pi extension 的公开 `ExtensionContext` 只提供 effective system prompt，`fixedRequestTokens` 因此只计该 prompt；tool declaration overhead 只有在 host 传入结构化 system message 时才会被计入，否则这个估算就不完整。**它不是 provider 的精确 tokenizer**：加权只保证"换语种导致真实 token 增长"不再被误判为收缩，shrink-only 门本质上仍是近似估算，Pi/DSH 自身的 context window 才是最终约束。用宿主 `getContextUsage()` / usage 精确校准、以及"估算 + 宿主上限"双检尚未实现。
 
 ### mirror 文件位置与权限
 
@@ -192,7 +192,7 @@ token 计数使用共享格式层的 provider-independent `estimateMessageTokens
 
 ### 契约与生命周期
 
-- 社区插件发现入口是 [`dsh-plugin.json`](https://github.com/DevZjQx/oh-my-clm/blob/main/dsh-plugin.json)，host entry 为构建后的 `dist/dsh/index.js`；官方 bundle 安装元数据位于 `package.json` 的 `dsh.bundle.patch` 和 [`cordis.patch.yml`](https://github.com/DevZjQx/oh-my-clm/blob/main/cordis.patch.yml)。在 DSH 0.2.0-rc.2 中，实际生效的是 bundle 元数据；`dsh-plugin.json` 的 Community permissions 目前不应被描述为运行时强制隔离。
+- 社区插件发现入口是 [`dsh-plugin.json`](https://github.com/DevZjQx/oh-my-clm/blob/main/dsh-plugin.json)，host entry 为构建后的 `dist/dsh/index.js`；官方 bundle 安装元数据位于 `package.json` 的 `dsh.bundle.patch` 和 [`cordis.patch.yml`](https://github.com/DevZjQx/oh-my-clm/blob/main/cordis.patch.yml)。在 DSH 0.2.0-rc.2 与 0.2.2-rc.1 中，实际生效的都是 bundle 元数据；`dsh-plugin.json` 的 Community permissions 按真实写入位置声明为 `host-temp`（`/tmp/clm-<session>/`），它描述位置而不是 workspace 边界，也不提供运行时强制隔离。
 - DSH 生命周期使用官方 Harness 的 Cordis `agent/created`、`agent/pre-step`、`session/event`、`systemPrompt.section()`、`systemPrompt.context()` 和 `tools.register()` 扩展点；cleanup 直接对当前 session surface 执行按 ID 的 native replacement，不读取 mirror 文件。
 - `systemPrompt.context()` 负责把 block index 放进模型可见的 runtime context；DSH 自己的 runtime-context snapshot 也会从 mirror records 中排除，避免 index 递归列出自身。
 - 普通 mirror 编辑的 `session/event` 只排队 reconcile；当编辑由 `tool/result` 或 `user/message` 触发时，mutation 在该事件的 `Session.append()` 发布完成后、当前仍打开的 step 内执行。`agent/pre-step` 不执行 mutation；它只在 session 仍有 open turn/step 时等待已排队的收敛，否则直接返回，把待处理编辑留给随后的 `step/start`。session projection 仍由 DSH 提供，session log 仍是事实来源。
@@ -204,7 +204,9 @@ bridge 会对 mirror 编辑执行与 Pi 侧相同的 snapshot、结构安全和 
 
 当前 bridge 会改变 DSH active surface，这与 Pi 的 branch-local `context_edit` 不是一回事：cleanup 的删除计划全部是 `replacement: null`，因此只追加空 `developer/message` omission；普通 mirror 编辑在改写 tool result 时追加 `tool/result` content replacement，在改写/删除 assistant 时追加 `developer/message`（assistant 改写用缩短后的文本，删除用空 content）。原始事件仍保留在 append-only session log 中，`deriveMessages()` 使用新的 surface。
 
-DSH 明确禁止 `assistant/message` 携带 `sourceEventSeqs`，而每个 replacement 又必须引用所有被遮蔽的节点，所以 assistant block 不能原地替换成另一个 assistant message。改写后的文本以 developer 身份进入模型可见历史，不再归属原模型回复。
+DSH 明确禁止 `assistant/message` 携带 `sourceEventSeqs`，而每个 replacement 又必须引用所有被遮蔽的节点，所以 assistant block 不能原地替换成另一个 assistant message。改写后的文本以 developer 身份进入模型可见历史，不再归属原模型回复；其 `source.kind` 为插件自有的 `oh-my-clm`，不再标记为 `user`。
+
+写入时溯源：`ContextEditDraft.provenance` 是规划器写入的封闭字段（`model-mirror-edit` / `runtime-cleanup`），不从正文解析；mirror body 中出现 `[oh-my-clm ... source=/owner=/trusted=/provenance=]` 之类的保留来源声明会被整体拒绝。Pi 侧运行时通知和 budget nudge 改为 `system` 角色消息，不冒充合成 `user` 消息。系统提示、安全策略和 block index 从不进入可编辑 mirror，模型可改区只放历史正文。仍缺审批/签名、编辑 diff/审计与最小回滚（见"设计边界"）。
 
 它不生成 proposal/receipt 文件，也不注册自定义 session event；reconcile 在事件回调之外串行执行，避免 `Session.append()` reentrant failure。所有 omission 和 assistant 改写都使用 append 时真正打开的 `turn`/`step`（正数），`tool/result` replacement 保持原 event envelope、只改 `content`，并带 `sourceEventSeqs: [targetSeq]`。
 
@@ -212,7 +214,7 @@ host entry 不复制 `dsh-ops` 的 Rust 工具、shell、PTC 或 TUI 矩阵，�
 
 ### 安装与打包
 
-安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()`/surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。
+安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()`/surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。该契约已对照上游 `@deepseek-ai/dsh` 0.2.2-rc.1（harness master `fcc0ad46`）复核：`Session.append()`、`surfaceOp`、`sourceEventSeqs` 与 `source.kind` 校验均未变化；E-012 报告与上述 commit 仍作为最初实现时的历史依据保留。
 
 如果要交给 DSH 插件管理器安装，使用专门的 DSH 打包脚本：
 
@@ -231,7 +233,7 @@ node scripts/build-dsh-plugin.mjs --output ./out/oh-my-clm.tgz
 
 ### 配置项
 
-DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 `CLM_CONTEXT_FIXED_TOKENS`；它们只影响 mirror preview 或 shrink-only safety gate 的近似估算，不改变 DSH 的 context window。`CLM_CLEANUP_RESULT` 只在 DSH host bridge 中读取（Pi 侧固定为 `full` 语义）：默认 `compact` 只返回一行确认（刷新后的 block index 会在下一次索引刷新后出现），`full` 会在结果后附带刷新后的索引，`none` 只抑制删除/拒绝确认；`cleanup({ list: "A-B" })` 的只读 listing 在任何 copy 模式下都返回行内容。它只影响模型可见的结果，不改变工具调用记录本身。
+DSH host bridge 可选读取 `CLM_MAX_BLOCK_CHARS`、`CLM_MAX_MIRROR_CHARS` 和 `CLM_CONTEXT_FIXED_TOKENS`；它们只影响 mirror preview 或 shrink-only safety gate 的近似估算，不改变 DSH 的 context window。`CLM_CLEANUP_RESULT` 只在 DSH host bridge 中读取（Pi 侧固定为 `compact` 语义）：默认 `compact` 只返回一行确认（刷新后的 block index 会在下一次索引刷新后出现），`full` 会在结果后附带刷新后的索引，`none` 只抑制成功确认，`rejected` 与 `listed` 始终可见（被拒绝的 cleanup 必须把可行动的 reason 交给模型）；`cleanup({ list: "A-B" })` 的只读 listing 在任何 copy 模式下都返回行内容。它只影响模型可见的结果，不改变工具调用记录本身。
 
 Block index 的模式与尺寸开关：`CLM_INDEX_MODE`（`digest` 默认 / `blocks`）、`CLM_INDEX_PREVIEW`（默认 64，preview 字符数）、`CLM_INDEX_HEAD`（默认 12）、`CLM_INDEX_TAIL`（默认 40，尾部窗口宽度；旧名 `CLM_INDEX_MIDDLE` 仍作为回退别名读取）、`CLM_INDEX_LINES`（digest 模式最多列出多少个 turn，默认 40）、`CLM_INDEX_REFRESH_STEPS`（默认 4，同一个 turn 内最多每几步重渲染一次）。
 

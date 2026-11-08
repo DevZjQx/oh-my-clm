@@ -3,7 +3,7 @@
   "manifestVersion": "0.15",
   "id": "oh-my-clm.live-context",
   "name": "oh-my-clm",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "license": "MIT",
   "facets": {
     "host": {
@@ -14,13 +14,13 @@
   "permissions": [
     {
       "name": "oh-my-clm.fs.read",
-      "scope": "workspace",
-      "reason": "Read the DSH live-context mirror before validating and applying a Session.append surface replacement."
+      "scope": "host-temp",
+      "reason": "Read the DSH live-context mirror under the host temporary directory (/tmp/clm-<session>/LIVE_CTX_MAIN.md) before validating and applying a Session.append surface replacement. This declares a location, not a runtime isolation boundary."
     },
     {
       "name": "oh-my-clm.fs.write",
-      "scope": "workspace",
-      "reason": "Write the DSH live-context mirror in the host temporary directory."
+      "scope": "host-temp",
+      "reason": "Write the DSH live-context mirror under the host temporary directory (/tmp/clm-<session>/LIVE_CTX_MAIN.md). Artifacts are outside the workspace and are not isolated by this permission."
     }
   ],
   "contributes": {

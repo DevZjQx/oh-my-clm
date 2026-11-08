@@ -424,3 +424,21 @@ test("a malformed mirror is rejected instead of throwing mid-write", () => {
 	assert.equal(missing.ok, false);
 	assert.match(missing.ok === false ? missing.reason : "", /not found/i);
 });
+
+// docs/plan.md §3 case 6 / P1-5: "none" suppresses only the success
+// confirmation; a rejection must still reach the model with its reason.
+test("plan §3.6 (P1-5): rejected cleanup still returns its reason under copy=none", () => {
+	const rejected = {
+		status: "rejected" as const,
+		requestedBlockIds: [99],
+		removedBlockIds: [],
+		pairedRemovalIds: [],
+		reason: "Unknown cleanup block ID: 99.",
+	};
+	assert.match(formatCleanupToolResult(rejected, "compact"), /Unknown cleanup block ID: 99\./);
+	assert.match(
+		formatCleanupToolResult(rejected, "none"),
+		/Unknown cleanup block ID: 99\./,
+		"a rejected cleanup must stay visible even when success confirmations are suppressed",
+	);
+});

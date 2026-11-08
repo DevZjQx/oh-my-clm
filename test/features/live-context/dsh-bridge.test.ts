@@ -1074,3 +1074,22 @@ test("DSH /clm mode switches the index shape live and clears the cached preview"
 		fs.rmSync(path.dirname(sessionMirrorPath(String(session.id))), { recursive: true, force: true });
 	}
 });
+
+// docs/plan.md §3 case 4b / P1-3: the source field is owned by the runtime, so a
+// model-driven replacement must not be attributed to a human user.
+test("plan §3.4b (P1-3): DSH replacement messages do not impersonate a user source", () => {
+	const session = dshSession();
+	const files = new MemoryFiles();
+	const options = bridgeOptions(String(session.id));
+	const result = executeDshCleanup(session, [3], options, files);
+	assert.equal(result.status, "applied");
+	const mutations = session.snapshotEvents().filter((event) => event.type === "developer/message");
+	assert.ok(mutations.length > 0);
+	for (const mutation of mutations) {
+		assert.notEqual(
+			(mutation.data as any).message?.source?.kind,
+			"user",
+			"a runtime developer replacement must not be labelled as user-authored",
+		);
+	}
+});

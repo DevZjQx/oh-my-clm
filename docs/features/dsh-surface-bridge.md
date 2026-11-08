@@ -11,7 +11,7 @@
 - DSH 生命周期使用官方 Harness 的 Cordis `agent/created`、`agent/pre-step`、`session/event`、`systemPrompt.section()`、`systemPrompt.context()` 和 `tools.register()` 扩展点，不自己启动 agent loop，也不扫描 session JSONL。
 - cleanup 直接对当前 session surface 执行按 ID 的 native replacement，不读取 mirror 文件。
 - `systemPrompt.context()` 负责把 block index 放进模型可见的 runtime context；`source.kind === "runtime-context"` 的 snapshot 会从 mirror records 中排除，避免 index 递归列出自身。
-- 在 DSH 0.2.0-rc.2 中，实际生效的是 bundle 元数据；`dsh-plugin.json` 的 Community permissions 目前不应被描述为运行时强制隔离。
+- 在 DSH 0.2.0-rc.2 与 0.2.2-rc.1 中，实际生效的都是 bundle 元数据；`dsh-plugin.json` 的 Community permissions 按真实写入位置声明为 `host-temp`（`/tmp/clm-<session>/`），只描述位置，不提供 workspace 隔离或运行时强制边界。
 
 ## 2. 生命周期与 surface 适配
 
@@ -56,7 +56,7 @@ DSH 明确禁止 `assistant/message` 携带 `sourceEventSeqs`，而每个 replac
 
 ## 4. 安装与打包
 
-安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()` / surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。
+安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()` / surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。该契约已对照上游 `@deepseek-ai/dsh` 0.2.2-rc.1（harness master `fcc0ad46`）复核：`Session.append()`、`surfaceOp`、`sourceEventSeqs` 与 `source.kind` 校验均未变化；E-012 报告与上述 commit 仍作为最初实现时的历史依据保留。
 
 如果要交给 DSH 插件管理器安装，使用专门的 DSH 打包脚本：
 

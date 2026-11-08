@@ -2,7 +2,29 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/features/live-context-mirror.md`](./docs/features/live-context-mirror.md)。
 
-## 0.1.12（当前版本）
+## 0.1.13（当前版本）
+
+依据 [`docs/plan.md`](./docs/plan.md) 的 6 条打回项与 §3 的 11 条回归用例整改；`npm test` 109/109、`npm run check`、`npm run typecheck` 全通过。
+
+### 修复
+
+- **改写截断 preview 不再毁掉 canonical 正文（P1-1）。** `planContextEdits` 现在拒绝改写任何 `renderText` 非空的块（截断或自引用省略），并要求 body 不含保留的截断 marker；否则 head+tail 副本会成为新的 canonical 正文，中间内容永久丢失且因变短而通过 shrink 门。
+- **shrink 门的 token 估算（P1-2）。** `estimateMessageTokens` 修复 assistant 字符串正文计 0 的分支，并对非 ASCII 字符（CJK、emoji 等）按约 1 token/字符加权，使"换语种导致真实 token 增长"的编辑不再被误判为收缩。估算仍是近似，不是 provider tokenizer；宿主 usage 校准与上限双检尚未实现，已在文档中标明。
+- **写入时溯源与来源伪造（P1-3）。** 新增 `ContextEditDraft.provenance` 封闭字段（规划器写入、不从正文解析）；mirror body 中伪造 `[oh-my-clm ... source=/owner=/trusted=/provenance=]` 的编辑被拒绝；DSH 的 omission 与 assistant 改写改用 `source: { kind: "oh-my-clm" }`，不再冒充 `user`；Pi 的 `<pi-clm-edit-notice>` 与 budget nudge 改为 `system` 角色消息，不注入合成 `user`。系统提示/索引不进可编辑 mirror，模型可改区只放历史正文。审批/签名、diff/审计、回滚仍未实现。
+- **block-1 守卫下沉到共享编辑规划层（P1-4）。** 新增 `loadBearingRecord()`，`planCleanup` 与 `planContextEdits` 共用；compaction 释放 protected 前缀后，首个可编辑 block 仍不可删除（含配对级联与显式 `CLM_EMPTY` 全清）。一条旧的"空 mirror 省略全部"断言按新不变量更新。
+- **`CLM_CLEANUP_RESULT=none` 不再吞掉拒绝（P1-5）。** `none` 只抑制成功确认；`rejected` 始终返回可行动 reason，`listed` 始终返回行内容。README / cleanup-tool 文档的 `none` 与 Pi 结果模式口径同步（Pi 实为 `compact`）。
+- **权限声明与实际写入位置一致（P1-6）。** `dsh-plugin.json` 的 fs 权限 scope 从装饰性的 `workspace` 改为 `host-temp`，并去掉隔离暗示；新增回归断言 scope 与 `CLM_TEMP_ROOT` 一致。
+- **Pi 扩展状态按 session 分键（I-1）。** 模块级全局 `state` 改为 `Map<sessionId, SessionState>`，交错 session 的 mirror snapshot 与一次性 notice 不再串台。
+- **budget nudge 有停止条件（I-2）。** 合成 nudge 不进 history，原 marker 去重永远看不到自己；现在按 session 记录轮数与"连续两轮无进展"，达到上限即中止，真实收缩后可重置。
+
+### 宿主版本对齐
+
+- 对照 Pi `1.3.0 → 1.5.0`、`@deepseek-ai/dsh` `0.2.0-rc.2 → 0.2.2-rc.1`（harness master `fcc0ad46`）、cordis `4.0.5 → 4.1.0` 的上游源码复核契约：`context` handler 追加 `system` 角色消息的保留逻辑、`MessageSourceMap` / `source.kind` 校验、`surfaceOp: { op: "replace" }` 与 `sourceEventSeqs` 约束、以及 `agent/created`、`agent/pre-step`、`session/event`、`systemPrompt.section()`、`systemPrompt.context()`、`tools.register()` 扩展点均未变化；`npm run typecheck` 在 Pi 1.5.0 类型下同样通过。Pi 1.5.0 的工具参数校验改走 `@earendil-works/pi-schema` 不影响本插件：参数 schema 只用标准 JSON Schema，`typebox` 仍是受支持的扩展导入。
+- `@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-tools` 的 peer 范围放宽为 `^0.2.0-rc.2 || ^0.2.2-rc.1`：semver 预发布规则下 `^0.2.0-rc.2` 并不匹配 `0.2.2-rc.1`，而旧宿主仍需继续支持。`cordis ^4.0.4` 已覆盖 `4.1.0`，保持不变。
+- 构建期 `devDependencies` 保持在 `pi-coding-agent ^1.3.0` / `dsh-tools 0.2.0-rc.2` 这条已验证的基线，不随宿主升级：这些是本地 typecheck 与打包产物校验用的钉死基线，`^1.3.0` 已覆盖 1.5.0，且升级 `dsh-tools` 到 0.2.2-rc.1 会因它要求 `cordis ~4.1.0` 触发依赖冲突、连锁重建整条 `@deepseek-ai` 依赖树。插件源码本身不导入任何 `@deepseek-ai/*` 运行时包，宿主版本兼容由 peer 声明与上面的契约复核覆盖。
+- 外部 E-012 报告与官方 Harness 契约提交仍是历史依据：前者验证的是 DSH 0.2.0-rc.2 的真实安装与路径，后者是本地 `Session.append()` 契约的取值来源，文档保留原记录并补充本次在新版上的复核说明，不改写历史。
+
+## 0.1.12
 
 ### 文档
 
@@ -15,7 +37,7 @@
 - **body 里出现协议字面量不再毁掉整个 mirror。** 此前渲染是把 body 原样写进文件，所以只要某个 block 的正文里有 `[[CLM_ENTRY id=N role=...]]`（典型来源：模型在推理里引用了一段 mirror，或 tool call 参数里带着 mirror 片段），解析器就会把它当成真的块开标记：先是重复 / 未闭合 ID，接着**每一次** cleanup 都被拒（`Cannot remove malformed CLM_ENTRY id=…`，哪怕请求里根本没有那个 ID），最后 `turn_end` 判定编辑非法并静默回滚。现在渲染端给这类行加一个转义反斜杠（`escapeMirrorBody()`），解析端读回时去掉（`unescapeMirrorBody()`），body 逐字往返，已经转义的行再加一层、反复渲染稳定。
 - **解析、规划、删除共用一个顶层扫描器。** 新增 `scanMirrorBlocks()` 状态机：block 打开后只有它自己的 closing marker 能改变状态，其余 marker 形状的行一律当正文。`parseMirror()`、`parseCleanupMirror()`、`removeMirrorBlocks()` 都从这里取 span，所以“规划认可的块”和“实际删除的块”不可能不一致；手写未转义的 marker 也不会凭空多出块。
 - **cleanup 失败不再半途抛异常。** `removeMirrorBlocks()` 改为返回 `{ ok: true, text } | { ok: false, reason }`：缺 closing marker、重复顶层 ID、目标 span 不存在都会作为带具体 ID 的 `rejected` 结果回来，而不是在 `planCleanup` 通过后于写盘阶段抛错。原因文本同时提示“body 里的 marker 需要转义反斜杠”。
-- **被回滚的 mirror 编辑会告知模型。** 以前 `turn_end` 拒绝编辑只发一条 UI 通知，下一次 `syncMirror()` 直接把文件恢复成 canonical projection，模型看到的是“写入成功、内容凭空消失”。现在拒绝原因会以一条一次性的 `<pi-clm-edit-notice>` 用户消息进入下一次请求（`context` 钩子注入，注入后清空），并区分“被拒绝”与“不在 turn 边界内，未提交”。
+- **被回滚的 mirror 编辑会告知模型。** 以前 `turn_end` 拒绝编辑只发一条 UI 通知，下一次 `syncMirror()` 直接把文件恢复成 canonical projection，模型看到的是“写入成功、内容凭空消失”。现在拒绝原因会以一条一次性的 `<pi-clm-edit-notice>` 系统消息进入下一次请求（`context` 钩子注入，注入后清空），并区分"被拒绝"与"不在 turn 边界内，未提交"。
 - **mirror 转义进入协议。** 文件 header 增加一行说明，提示词增加一句“body 里的 marker 行保留前导反斜杠”（Pi 侧仍 ≤1000 字符）。这是 `clm-v2` 的渲染约定而不是新协议版本号：snapshot 仍由 canonical records 计算，转义只影响显示层，因此旧 mirror 文件无需迁移即可被新解析器读回。
 
 ### 文档

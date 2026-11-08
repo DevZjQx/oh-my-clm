@@ -26,6 +26,15 @@ import {
 	type ProjectionEntryLike,
 } from "./context-format.ts";
 
+/**
+ * Closed source tag for DSH replacement nodes. A model-driven edit must never
+ * be attributed to a human user: this field is owned by the runtime and cannot
+ * be declared from a mirror body (see RESERVED_PROVENANCE_PATTERN). DSH's
+ * MessageSourceMap is merge-extensible, so a plugin-specific kind is the
+ * intended way to name a non-human producer.
+ */
+const DSH_EDIT_SOURCE = { kind: "oh-my-clm" } as const;
+
 export interface DshSessionEventLike {
 	seq: number;
 	type: string;
@@ -404,7 +413,7 @@ function appendOmission(
 			id: mutationMessageId(session, targetSeq, "omit"),
 			role: "developer",
 			content: [],
-			source: { kind: "user" },
+			source: DSH_EDIT_SOURCE,
 		},
 	}, {
 		surfaceOp: { op: "replace", startSeq: targetSeq, endSeq: targetSeq },
@@ -456,7 +465,7 @@ function appendContentReplacement(
 				id: mutationMessageId(session, targetSeq, "developer"),
 				role: "developer",
 				content,
-				source: { kind: "user" },
+				source: DSH_EDIT_SOURCE,
 			},
 		}, {
 			surfaceOp: { op: "replace", startSeq: targetSeq, endSeq: targetSeq },
@@ -540,7 +549,7 @@ function applyDshContextEdits(
 		if (record.protected) return rejectMutation(`Protected DSH record ${record.id} cannot be omitted: ${reason}`);
 		const existing = actions.get(record.id);
 		if (existing?.replacement === null) return undefined;
-		actions.set(record.id, { targetId: record.id, replacement: null, reason: "omit" });
+		actions.set(record.id, { targetId: record.id, replacement: null, reason: "omit", provenance: "model-mirror-edit" });
 		return undefined;
 	};
 

@@ -32,7 +32,7 @@ cleanup({ "list": "3-16" })
 - ID 是当前 mirror / index 中从 `1` 开始的可读编辑序号；不要改 ID，也不要重排 block。
 - `list` 不能和 `blockIds` / `ranges` / `skipRoles` 同时出现，避免“边看边删”。
 - 单次 `list` 结果约有 6 KB 字符预算；被截断时末尾会给出继续读取的区间（`... 65 more block(s); call cleanup({ list: "114-178" }) to continue.`），不会静默返回部分视图。
-- 显式 ID 1 会被拒绝；range 覆盖 1 时保留 block 1。初始用户任务（protected prefix）不在可编辑区域中。
+- 显式 ID 1 会被拒绝；range 覆盖 1 时保留 block 1。共享的 `loadBearingRecord()` 守卫让 mirror 编辑路径也无法删除 block 1；compaction 后 protected 前缀释放时同样成立。
 - 配对级联删除通过 `pairedRemovalIds` / `paired` 单独报告，不会混进调用者请求的 ID。
 - 用户消息只能保留或省略，不能被 cleanup 改写；cleanup 只做删除。
 - Pi 侧一个 step（一次 assistant 响应及其 tool call）最多调用一次 cleanup，并且要在该 step 任何 mirror 编辑之前。Pi 的 `turn_end` 在每个 step 结束时触发（见 Pi `docs/json.md`），每次提交都会刷新 mirror 基线，所以跨 step 的多次 cleanup 是正常且安全的；同一 step 内先改 body 再 cleanup 则会整体拒绝——文件一旦在提交前被改过，它的 snapshot 就落后于 live projection，cleanup 不静默重渲染也不删除任何 block，并在 reason 里点明顺序。
@@ -88,13 +88,13 @@ DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程里切换索引形状并
 
 ## 4. 结果模式
 
-`CLM_CLEANUP_RESULT` 只在 DSH host bridge 中读取；Pi 侧固定为 `full` 语义。
+`CLM_CLEANUP_RESULT` 只在 DSH host bridge 中读取；Pi 侧固定为 `compact` 语义（`cleanupToolResult` 默认 `compact`）。
 
 | 值 | 行为 |
 | --- | --- |
-| `compact`（默认） | 删除/拒绝只返回一行确认；刷新后的 block index 会在下一次索引刷新后出现。 |
-| `full` | 在结果后附带刷新后的索引。 |
-| `none` | 只抑制删除/拒绝确认；`cleanup({ list: "A-B" })` 的只读 listing 在任何模式下都返回行内容。 |
+| `compact`（默认） | 成功时只返回一行确认；被拒绝时仍返回 `cleanup rejected; <reason>`；刷新后的 block index 会在下一次索引刷新后出现。 |
+| `full` | 在结果后附带刷新后的索引（拒绝时同样附带）。 |
+| `none` | 只抑制**成功**确认；`rejected` 始终返回可行动的 reason，`cleanup({ list: "A-B" })` 的只读 listing 在任何模式下都返回行内容。 |
 
 结果模式只影响模型可见的结果，不改变工具调用记录本身。
 
@@ -110,7 +110,7 @@ DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程里切换索引形状并
 
 ## 6. 配置
 
-以下变量只在 DSH host bridge 中读取；Pi 侧没有 block index，cleanup 结果固定为 `full` 语义。
+以下变量只在 DSH host bridge 中读取；Pi 侧没有 block index，cleanup 结果固定为 `compact` 语义（`cleanupToolResult` 默认 `compact`）。
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
@@ -141,7 +141,7 @@ DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程里切换索引形状并
 
 1. cleanup 按 ID 在一次工具调用内完成 host-side mutation；
 2. preview 截断和 `old_string` 不会影响删除；
-3. block 1、协议头、`CLM_SNAPSHOT` 保留；
+3. block 1（cleanup 与 mirror 编辑两条路径）、协议头、`CLM_SNAPSHOT` 保留；
 4. assistant tool call 与 tool result 级联处理，不留下孤立 message；
 5. 未知、重复、过期 ID 和 role 变化整体拒绝；
 6. `list` 只读，不写 mirror，不能与删除参数同用；

@@ -1,4 +1,4 @@
-import { MIRROR_HEADER, MIRROR_VERSION, mirrorFingerprint, estimateMirrorTokens, renderBlockList, scanMirrorBlocks, } from "./context-format.js";
+import { MIRROR_HEADER, MIRROR_VERSION, PRESERVE_FIRST_BLOCK_REASON, loadBearingRecord, mirrorFingerprint, estimateMirrorTokens, renderBlockList, scanMirrorBlocks, } from "./context-format.js";
 const SNAPSHOT_PATTERN = /^<!-- CLM_SNAPSHOT ([a-f0-9]{16}) -->$/;
 const EMPTY_MARKER = "<!-- CLM_EMPTY -->";
 /** Widest inclusive range a single cleanup call may expand to. */
@@ -267,7 +267,7 @@ function validateMirrorForCleanup(records, parsed, args, options) {
             return rejectPlan(requestedBlockIds, `Unknown cleanup block ID: ${blockId}.`, beforeTokens);
         }
         if ((options.preserveFirstBlock ?? true) && blockId === 1) {
-            return rejectPlan(requestedBlockIds, "Cleanup preserves load-bearing block 1.", beforeTokens);
+            return rejectPlan(requestedBlockIds, PRESERVE_FIRST_BLOCK_REASON, beforeTokens);
         }
     }
     return undefined;
@@ -332,9 +332,8 @@ export function planCleanup(records, parsed, requested, options = {}) {
     const addOmission = (record, reason) => {
         if (record.protected)
             return `Protected block ${record.id} cannot be omitted.`;
-        const displayId = displayed.find((entry) => entry.record.id === record.id)?.blockId;
-        if ((options.preserveFirstBlock ?? true) && displayId === 1) {
-            return "Cleanup preserves load-bearing block 1, including paired owners.";
+        if ((options.preserveFirstBlock ?? true) && record.id === loadBearingRecord(records)?.id) {
+            return PRESERVE_FIRST_BLOCK_REASON;
         }
         if (!actions.has(record.id))
             actions.set(record.id, { record, reason });
@@ -379,6 +378,7 @@ export function planCleanup(records, parsed, requested, options = {}) {
         targetId: record.id,
         replacement: null,
         reason: "omit",
+        provenance: "runtime-cleanup",
     }));
     return {
         status: "applied",
@@ -528,12 +528,15 @@ export function formatCleanupToolResult(result, copy = result.copy ?? "full") {
         // suppress it; only the one-line mutation confirmation is optional.
         return result.rows ?? "";
     }
-    if (copy === "none")
-        return "";
     if (result.status !== "applied") {
+        // A rejection must always reach the model with its reason, even when
+        // `none` suppresses success confirmations: otherwise the model cannot
+        // take a next step.
         const rejected = `cleanup rejected; ${result.reason}`;
         return copy === "full" && result.blockIndex ? `${rejected}\n\n${result.blockIndex}` : rejected;
     }
+    if (copy === "none")
+        return "";
     const removed = formatBlockIdRuns(result.removedBlockIds);
     const paired = result.pairedRemovalIds ?? [];
     const summary = `cleanup applied; removed ${result.removedBlockIds.length} block(s): ${removed}.` +

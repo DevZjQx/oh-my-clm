@@ -162,7 +162,7 @@ the dump showed
 
 ### 4.1 保护初始任务
 
-没有 compaction summary 时，首个 user entry 以及它之前的 records 被标记为 protected：它们参与 snapshot 和 token 估算，但不显示为可编辑 block，也不会因为 block 缺失而被删除。Pi 原生 `/compact` 产生新的 compaction boundary 后，projection 以新的边界为准。
+没有 compaction summary 时，首个 user entry 以及它之前的 records 被标记为 protected：它们参与 snapshot 和 token 估算，但不显示为可编辑 block，也不会因为 block 缺失而被删除。Pi 原生 `/compact` 产生新的 compaction boundary 后，projection 以新的边界为准，protected 前缀被释放——此时**首个可编辑 block（block 1）成为 load-bearing anchor**：`planCleanup` 与 `planContextEdits` 共用 `loadBearingRecord()` 守卫，禁止删除它（包括配对级联产生的省略），所以初始任务不会因为 compaction 进入可编辑区而被删掉。
 
 ### 4.2 Preview 和 canonical source
 
@@ -172,7 +172,7 @@ the dump showed
 - 所有可编辑 preview 最多约 96,000 字符；
 - block 较多时按 editable block 数量分配 fair share。
 
-截断 marker 只属于 `renderText`。`MirrorRecord.text` 仍保留 canonical source；模型原样保留 preview 时，解析器将其视为未编辑，真正改写后才产生 replacement。
+截断 marker 只属于 `renderText`。`MirrorRecord.text` 仍保留 canonical source；模型原样保留 preview 时，解析器将其视为未编辑。**但改写截断（或自引用省略）的块会被 `planContextEdits` 拒绝**：mirror 里没有完整正文，若把 head+tail 截断副本当成 replacement 写回，中间未显示内容会永久丢失，且因为变短而通过 shrink 门。要处理这类块只能省略它或用 `cleanup`。同样，body 里若出现保留的截断 marker 或 `[oh-my-clm ... source=/owner=/trusted=/provenance=]` 的来源声明，也会被拒绝——来源字段由运行时写入，不从正文解析。
 
 ## 5. 编辑校验和安全边界
 
@@ -185,11 +185,13 @@ the dump showed
 3. 没有重复或未知 ID（body 里转义过的标记不算 ID）；
 4. role 没有变化，closing marker 没有缺失；
 5. user-authored block 不能被改写，只能保留或省略；
-6. 编辑后的估算 context 必须严格短于编辑前。
+6. 截断 / 自引用省略的块不能被改写，body 也不能包含保留的截断 marker 或伪造的来源声明；
+7. 首个可编辑 block（block 1）始终保留，两条删除路径一致；
+8. 编辑后的估算 context 必须严格短于编辑前。
 
 因为 gate 只允许严格收缩，改写是单向棘轮：一个 body 一旦被换成更短的文本，把原文写回去会以"必须更短"被拒绝。恢复原文只能靠原始 session 日志或 branch 切换，这也是 mirror 只作为显示/编辑面、而原始 JSONL 始终是事实源的原因。
 
-固定的 shrink-only 策略不通过环境变量切换。共享格式层的 `estimateMessageTokens(message)` 对当前 Pi 支持的消息形状采用与 Pi host 一致的 `3.5 chars/token` 近似和按消息 rounding，并同时接受 DSH 的 `reasoning`、`tool-call`/`tool` 等词汇；system sections 和 tool declarations 在结构化 system message 中也按 host 规则估算。当前 Pi extension 的公开 `ExtensionContext` 只提供 effective system prompt，因此 `fixedRequestTokens` 只计可取得的 prompt；host 未提供的 tool declaration overhead 必须标记为 incomplete approximation，而不能假定已计入。它用于 before/after 比较；Pi context window 仍是最终约束。
+固定的 shrink-only 策略不通过环境变量切换。共享格式层的 `estimateMessageTokens(message)` 对 ASCII 文本采用与 Pi host 一致的 `3.5 chars/token` 近似和按消息 rounding；非 ASCII（CJK、emoji 等）字符按约 1 token/字符加权，避免"字符更少、真实 token 更多"的换语种编辑蒙混过关；assistant 的字符串正文也按正文计入（旧实现计 0，导致删除该块被误拒）。它同时接受 DSH 的 `reasoning`、`tool-call`/`tool` 等词汇，system sections 和 tool declarations 在结构化 system message 中按 host 规则估算。当前 Pi extension 的公开 `ExtensionContext` 只提供 effective system prompt，因此 `fixedRequestTokens` 只计可取得的 prompt；host 未提供的 tool declaration overhead 必须标记为 incomplete approximation，而不能假定已计入。它用于 before/after 比较，**不是 provider 的精确 tokenizer**，宿主 usage 校准与"估算 + 宿主上限"双检尚未实现；Pi context window 仍是最终约束。
 
 ### 5.2 Tool call / tool result 配对
 

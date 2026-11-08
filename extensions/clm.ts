@@ -41,6 +41,9 @@ const PROMPT_MARKER = "<pi-clm-live-context>";
 const CONTEXT_NUDGE_MARKER = "<pi-clm-budget-nudge>";
 const CONTEXT_RESERVE_TOKENS = 2_048;
 const CONTEXT_NUDGE_FRACTION = 0.75;
+/** Stop conditions for the synthetic, non-history budget nudge (plan I-2). */
+const MAX_NUDGE_ROUNDS = 2;
+const MAX_NUDGE_NO_PROGRESS = 2;
 
 interface Config {
 	budgetTokens: number;
@@ -105,6 +108,7 @@ function projectionSignature(records: readonly MirrorRecord[]): string {
 }
 
 function syncMirror(ctx: ExtensionContext, force = false): MirrorSnapshot {
+	const state = sessionState(ctx);
 	const filePath = mirrorPath(ctx);
 	const projection = getProjection(ctx);
 	const settings = config();
@@ -245,11 +249,36 @@ function mirrorReadContextEdits(event: TurnEndEvent, ctx: ExtensionContext, file
 	return entries;
 }
 
-const state: {
+interface SessionState {
 	snapshot?: MirrorSnapshot;
 	/** One-shot rejection note delivered with the next request. */
 	pendingNotice?: string;
-} = {};
+	/** A synthetic nudge never enters history, so its dedup guard needs state. */
+	nudgeRounds: number;
+	noProgressRounds: number;
+	lastNudgeTokens?: number;
+}
+
+/** State is keyed by session id: interleaved sessions must not share a mirror snapshot or notice. */
+const states = new Map<string, SessionState>();
+
+function freshState(): SessionState {
+	return { nudgeRounds: 0, noProgressRounds: 0 };
+}
+
+function sessionKey(ctx: ExtensionContext): string {
+	return ctx.sessionManager.getSessionId() || "default";
+}
+
+function sessionState(ctx: ExtensionContext): SessionState {
+	const key = sessionKey(ctx);
+	let state = states.get(key);
+	if (!state) {
+		state = freshState();
+		states.set(key, state);
+	}
+	return state;
+}
 
 const cleanupParameters = Type.Object({
 	blockIds: Type.Optional(Type.Array(
@@ -290,6 +319,7 @@ function rejectedCleanupResult(requestedBlockIds: readonly number[], reason: str
 }
 
 function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolResult {
+	const state = sessionState(ctx);
 	const parsedArgs = parseCleanupArgs(params);
 	if (!parsedArgs.ok) return rejectedCleanupResult([], parsedArgs.reason);
 
@@ -361,13 +391,24 @@ function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolRe
 	return cleanupToolResult(plan);
 }
 
-function contextBudgetNudge(ctx: ExtensionContext, messages: readonly unknown[]): string | undefined {
+function contextBudgetNudge(ctx: ExtensionContext, messages: readonly unknown[], state: SessionState): string | undefined {
 	const budget = config().budgetTokens;
 	if (budget <= 0) return undefined;
 	if (messages.some((message) => messageText(message).includes(CONTEXT_NUDGE_MARKER))) return undefined;
+	// The nudge is synthetic and never written to session history, so its own
+	// marker guard can never see a previous nudge. Bound it in state instead:
+	// stop after a fixed number of rounds or after two rounds with no progress.
+	if (state.nudgeRounds >= MAX_NUDGE_ROUNDS || state.noProgressRounds >= MAX_NUDGE_NO_PROGRESS) return undefined;
 	const target = Math.max(1, budget - CONTEXT_RESERVE_TOKENS);
 	const tokens = fixedRequestTokens(ctx) + messages.reduce<number>((total, message) => total + estimateMessageTokens(message), 0);
-	if (tokens < Math.floor(target * CONTEXT_NUDGE_FRACTION)) return undefined;
+	if (tokens < Math.floor(target * CONTEXT_NUDGE_FRACTION)) {
+		// Budget pressure is gone: a later episode must get a fresh loop budget,
+		// otherwise a long session could never be nudged again.
+		state.nudgeRounds = 0;
+		state.noProgressRounds = 0;
+		state.lastNudgeTokens = undefined;
+		return undefined;
+	}
 
 	const nudge = `${CONTEXT_NUDGE_MARKER}
 You are at approximately ${tokens}/${budget} context tokens; this is a context-only turn.
@@ -376,6 +417,17 @@ ${CONTEXT_NUDGE_MARKER}`;
 	const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 	const nudgeTokens = estimateMessageTokens({ role: "user", content: nudge });
 	if (contextWindow > 0 && tokens + nudgeTokens + CONTEXT_RESERVE_TOKENS > contextWindow) return undefined;
+
+	const previous = state.lastNudgeTokens;
+	if (previous !== undefined && tokens < previous) {
+		// Real progress (a cleanup shrank the request) earns a fresh budget.
+		state.nudgeRounds = 0;
+		state.noProgressRounds = 0;
+	} else if (previous !== undefined) {
+		state.noProgressRounds += 1;
+	}
+	state.nudgeRounds += 1;
+	state.lastNudgeTokens = tokens;
 	return nudge;
 }
 
@@ -388,7 +440,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		state.snapshot = undefined;
+		states.set(sessionKey(ctx), freshState());
 		// A session switch (including `/resume`) does not necessarily trigger a
 		// model request immediately. Rebuild the external mirror here, after Pi
 		// has bound the new SessionManager, so it cannot retain the previous
@@ -396,37 +448,42 @@ export default function (pi: ExtensionAPI) {
 		syncMirror(ctx);
 	});
 
-	pi.on("session_tree", async () => {
-		state.snapshot = undefined;
+	pi.on("session_tree", async (_event, ctx) => {
+		states.set(sessionKey(ctx), freshState());
 	});
 
-	pi.on("session_shutdown", async () => {
-		state.snapshot = undefined;
+	pi.on("session_shutdown", async (_event, ctx) => {
+		states.delete(sessionKey(ctx));
 	});
 
 	pi.on("context", async (event: ContextEvent, ctx): Promise<ContextEventResult | void> => {
+		const state = sessionState(ctx);
 		const snapshot = syncMirror(ctx);
-		const additions: { role: "user"; content: string; timestamp: number }[] = [];
+		// Runtime notices are system-role messages, not synthetic human turns.
+		// Pi supports mid-conversation system messages and restores the leading
+		// prompt around any context-handler result.
+		const additions: { role: "system"; content: string; timestamp: number }[] = [];
 		// A rejected or reverted mirror edit is reported once, on the request after
 		// it happened. Without this the model sees a successful write that silently
 		// disappeared from the next mirror render.
 		if (state.pendingNotice) {
 			additions.push({
-				role: "user",
+				role: "system",
 				content: `<pi-clm-edit-notice>\n${state.pendingNotice}\n</pi-clm-edit-notice>`,
 				timestamp: Date.now(),
 			});
 			state.pendingNotice = undefined;
 		}
 		if (snapshot.records.some((record) => !record.protected)) {
-			const nudge = contextBudgetNudge(ctx, Array.isArray(event.messages) ? event.messages : []);
-			if (nudge) additions.push({ role: "user", content: nudge, timestamp: Date.now() });
+			const nudge = contextBudgetNudge(ctx, Array.isArray(event.messages) ? event.messages : [], state);
+			if (nudge) additions.push({ role: "system", content: nudge, timestamp: Date.now() });
 		}
 		if (additions.length === 0) return;
 		return { messages: [...event.messages, ...additions] };
 	});
 
 	pi.on("turn_end", async (event: TurnEndEvent, ctx) => {
+		const state = sessionState(ctx);
 		const snapshot = state.snapshot;
 		if (!snapshot) return;
 		const selfReadEntries = mirrorReadContextEdits(event, ctx, snapshot.filePath);
@@ -514,7 +571,7 @@ export default function (pi: ExtensionAPI) {
 				notify(ctx, "Usage: /clm status", "warning");
 				return;
 			}
-			notify(ctx, statusText(ctx, state.snapshot), "info");
+			notify(ctx, statusText(ctx, sessionState(ctx).snapshot), "info");
 		},
 	});
 }
