@@ -12,4 +12,4 @@ It checks the plain cleanup tool definition and shared argument parser (not `def
 
 The superseded mirror-only/proposal implementation's artifacts (`dsh-plugin-test-report.md`, `dsh-host-test-report.txt`, and `test/harness/clm-mount-probe.mjs`) have been removed; their history remains in git. Their old `LIVE_CTX_MAIN.patch.json` and non-mutating behavior must not be used as evidence for the current build.
 
-The current source/mock evidence is recorded in `docs/reckless/evidence-ledger.md` (E-016, E-020, E-021, E-028, E-030, E-031), and the latest local output is `dsh-host-test-report-current.txt` (99 passed, 0 failed, 1 observation). Real DSH profile installation, `session/flush`, restart recovery, and fork behavior remain unverified under the repository constraints.
+The latest local harness output is `dsh-host-test-report-current.txt` (99 passed, 0 failed, 1 observation). Real DSH profile installation, `session/flush`, restart recovery, and fork behavior remain unverified under the repository constraints.

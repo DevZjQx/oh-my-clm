@@ -39,8 +39,7 @@ oh-my-clm
 │   ├── reference                # 论文、上游实现和宿主机制的背景资料
 │   │   ├── clm-technical-analysis.md
 │   │   └── dsh-prefix-cache.md
-│   ├── reports                  # 历史验证报告 + 报告说明
-│   └── reckless                 # 内部决策记录/证据账本/路线图（不发布）
+│   └── reports                  # 历史验证报告 + 报告说明
 ├── dist                         # tsc 构建产物（随仓库提交）
 ├── artifacts                    # DSH tgz 输出目录（构建生成，gitignore）
 ├── dsh-plugin.json              # DSH Community v0.15 manifest
@@ -48,7 +47,7 @@ oh-my-clm
 └── package.json
 ```
 
-文档按用途分组：`features/` 描述当前行为契约，`reference/` 放外部资料和背景，`reports/` 放验证证据，`reckless/` 是本地决策记录。新增功能文档放进 `docs/features/` 并在 [docs/README.md](./README.md) 登记；根 README 只保留概览和入口链接，详细契约放在功能文档中。
+文档按用途分组：`features/` 描述当前行为契约，`reference/` 放外部资料和背景，`reports/` 放验证证据。新增功能文档放进 `docs/features/` 并在 [docs/README.md](./README.md) 登记；根 README 只保留概览和入口链接，详细契约放在功能文档中。
 
 ## 分层与导入规则
 
