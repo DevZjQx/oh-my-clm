@@ -830,3 +830,120 @@ test("plan §3.9 (I-2): repeated no-progress nudge rounds are bounded", async ()
 		else process.env.CLM_CONTEXT_BUDGET = previousBudget;
 	}
 });
+
+// P1-1 follow-up: normalizeText() trims trailing whitespace, which sets a
+// renderText that hides nothing. That common case must still produce a
+// context_edit at turn_end instead of a rejection notice.
+test("Pi mirror rewrites a block whose preview was only whitespace-normalized", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-normalized-preview-"));
+	const sessionId = "normalized-preview-session";
+	const projection = {
+		entries: [
+			{
+				sourceEntry: { id: "task", type: "message" },
+				messages: [{ role: "user", content: "Keep the task." }],
+			},
+			{
+				sourceEntry: { id: "answer", type: "message" },
+				messages: [{ role: "assistant", content: [{ type: "text", text: "A normal assistant answer.\n" }] }],
+			},
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerCommand: () => undefined,
+		registerTool: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: false,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: () => undefined },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => sessionId,
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+	const mirrorPath = sessionMirrorPath(sessionId);
+	const mirror = fs.readFileSync(mirrorPath, "utf8");
+	assert.doesNotMatch(mirror, /preview truncated|Self-referential/, "nothing was hidden from the model");
+	const edited = mirror.replace("A normal assistant answer.", "Short answer.");
+	assert.notEqual(edited, mirror);
+	fs.writeFileSync(mirrorPath, edited, "utf8");
+
+	const result = await handlers.get("turn_end")?.({ entries: [] }, ctx) as
+		{ entries: Array<Record<string, unknown>> } | undefined;
+	assert.ok(
+		result?.entries.some((entry) => entry.type === "context_edit" && entry.targetId === "answer" && entry.replacement !== null),
+		"a fully visible block must still be folded by a model edit",
+	);
+});
+
+// I-2 follow-up: hitting the nudge cap must not make the loop permanently deaf.
+// The "budget pressure is gone" reset has to run before the stop check, so a
+// later high-pressure episode gets a fresh budget after a real shrink.
+test("plan I-2 follow-up: a low-pressure round resets an exhausted nudge loop", async () => {
+	const previousBudget = process.env.CLM_CONTEXT_BUDGET;
+	process.env.CLM_CONTEXT_BUDGET = "100000";
+	try {
+		const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+		const api = {
+			on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+				handlers.set(name, handler);
+				return () => undefined;
+			},
+			registerCommand: () => undefined,
+			registerTool: () => undefined,
+		};
+		extension(api as any);
+		const projection = {
+			entries: [
+				{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+				{ sourceEntry: { id: "a1", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "An old answer." }] }] },
+			],
+			messages: [],
+		};
+		const ctx = {
+			cwd: fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-nudge-reset-")),
+			hasUI: false,
+			mode: "print",
+			model: undefined,
+			getContextUsage: () => undefined,
+			ui: { notify: () => undefined },
+			sessionManager: {
+				buildSessionProjection: () => projection,
+				getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+				getSessionId: () => "nudge-reset-session",
+			},
+		};
+		await handlers.get("session_start")?.({}, ctx);
+		const high = [{ role: "user", content: "x".repeat(300_000) }];
+		const low: unknown[] = [];
+		const countNudges = async (messages: unknown[]) => {
+			const result = await handlers.get("context")?.({ messages }, ctx) as
+				{ messages?: Array<{ role: string; content: string }> } | undefined;
+			return (result?.messages ?? []).filter((message) => String(message.content).includes("<pi-clm-budget-nudge>")).length;
+		};
+
+		assert.equal(await countNudges(high), 1, "first high-pressure round nudges");
+		assert.equal(await countNudges(high), 1, "second high-pressure round nudges");
+		assert.equal(await countNudges(high), 0, "the cap stops a third consecutive nudge");
+		assert.equal(await countNudges(low), 0, "a low-pressure round emits no nudge but resets state");
+		assert.equal(await countNudges(high), 1, "a later high-pressure episode gets a fresh loop budget");
+	} finally {
+		if (previousBudget === undefined) delete process.env.CLM_CONTEXT_BUDGET;
+		else process.env.CLM_CONTEXT_BUDGET = previousBudget;
+	}
+});

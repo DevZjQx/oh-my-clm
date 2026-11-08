@@ -17,6 +17,10 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # No `environment` here on purpose: npm Trusted Publisher config must use
+    # the exact same environment name. Adding one without coordinating the
+    # npmjs.com side would silently break OIDC publishing.
     steps:
       - uses: actions/checkout@v6
 
@@ -40,8 +44,11 @@ jobs:
           fi
 
       - run: npm ci
+      # Keep the tag gate identical to the local baseline in docs/plan.md §3.
       - run: npm test
       - run: npm run check
+      - run: npm run typecheck
+      - run: npm pack --dry-run
 
       - name: Publish with OIDC
         run: npm publish --access public

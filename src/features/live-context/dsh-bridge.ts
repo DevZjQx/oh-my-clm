@@ -21,19 +21,30 @@ import {
 	renderMirror,
 	type BlockIndexOptions,
 	type ContextEditDraft,
+	type ContextEditProvenance,
 	type EditPlan,
 	type MirrorRecord,
 	type ProjectionEntryLike,
 } from "./context-format.ts";
 
 /**
- * Closed source tag for DSH replacement nodes. A model-driven edit must never
- * be attributed to a human user: this field is owned by the runtime and cannot
- * be declared from a mirror body (see RESERVED_PROVENANCE_PATTERN). DSH's
- * MessageSourceMap is merge-extensible, so a plugin-specific kind is the
- * intended way to name a non-human producer.
+ * Closed source tags for DSH replacement nodes, derived from the planner-owned
+ * `ContextEditDraft.provenance`. A model-driven edit must never be attributed to
+ * a human user: these fields are written by the runtime and cannot be declared
+ * from a mirror body (see RESERVED_PROVENANCE_PATTERN). DSH's
+ * `MessageSourceMap` is a merge-extensible sum type — each producer declares its
+ * own `kind` and consumers fall through unknown kinds (see `@deepseek-ai/dsh-llm`
+ * `lib/types/message.d.ts`) — so the persisted event records which runtime
+ * planner produced the edit instead of a single opaque label.
  */
-const DSH_EDIT_SOURCE = { kind: "oh-my-clm" } as const;
+const DSH_EDIT_SOURCES = {
+	"model-mirror-edit": { kind: "oh-my-clm:model-mirror-edit" },
+	"runtime-cleanup": { kind: "oh-my-clm:runtime-cleanup" },
+} as const satisfies Record<ContextEditProvenance, { readonly kind: string }>;
+
+function dshEditSource(provenance: ContextEditProvenance) {
+	return DSH_EDIT_SOURCES[provenance];
+}
 
 export interface DshSessionEventLike {
 	seq: number;
@@ -405,6 +416,7 @@ function appendOmission(
 	session: DshSessionLike,
 	targetSeq: number,
 	coordinates: { turn: number; step: number },
+	provenance: ContextEditProvenance,
 ): void {
 	session.append("developer/message", {
 		turn: coordinates.turn,
@@ -413,7 +425,7 @@ function appendOmission(
 			id: mutationMessageId(session, targetSeq, "omit"),
 			role: "developer",
 			content: [],
-			source: DSH_EDIT_SOURCE,
+			source: dshEditSource(provenance),
 		},
 	}, {
 		surfaceOp: { op: "replace", startSeq: targetSeq, endSeq: targetSeq },
@@ -465,7 +477,7 @@ function appendContentReplacement(
 				id: mutationMessageId(session, targetSeq, "developer"),
 				role: "developer",
 				content,
-				source: DSH_EDIT_SOURCE,
+				source: dshEditSource(action.provenance),
 			},
 		}, {
 			surfaceOp: { op: "replace", startSeq: targetSeq, endSeq: targetSeq },
@@ -545,11 +557,13 @@ function applyDshContextEdits(
 		if (record.role === "toolResult" && record.toolCallId) byResultCallId.set(record.toolCallId, record);
 	}
 
-	const omit = (record: MirrorRecord, reason: string): DshMutationResult | undefined => {
+	const omit = (record: MirrorRecord, reason: string, provenance: ContextEditProvenance): DshMutationResult | undefined => {
 		if (record.protected) return rejectMutation(`Protected DSH record ${record.id} cannot be omitted: ${reason}`);
 		const existing = actions.get(record.id);
 		if (existing?.replacement === null) return undefined;
-		actions.set(record.id, { targetId: record.id, replacement: null, reason: "omit", provenance: "model-mirror-edit" });
+		// A paired omission inherits the triggering planner's provenance, so a
+		// cleanup cascade is not mislabelled as a model mirror edit.
+		actions.set(record.id, { targetId: record.id, replacement: null, reason: "omit", provenance });
 		return undefined;
 	};
 
@@ -565,25 +579,25 @@ function applyDshContextEdits(
 					`Cannot mutate assistant ${record.id} while tool call ${callId} has no current result; retry after the tool step settles.`,
 				);
 			}
-			const failure = omit(result, `assistant tool call ${callId} was rewritten`);
+			const failure = omit(result, `assistant tool call ${callId} was rewritten`, action.provenance);
 			if (failure) return failure;
 		}
 	}
 	for (const record of records) {
 		const action = actions.get(record.id);
-		if (record.role !== "toolResult" || action?.replacement !== null || !record.toolCallId) continue;
+		if (record.role !== "toolResult" || !action || action.replacement !== null || !record.toolCallId) continue;
 		const owner = byToolCallId.get(record.toolCallId);
 		if (!owner || actions.has(owner.id)) continue;
-		const failure = omit(owner, `tool result ${record.id} was omitted`);
+		const failure = omit(owner, `tool result ${record.id} was omitted`, action.provenance);
 		if (failure) return failure;
 	}
 	for (const record of records) {
 		const action = actions.get(record.id);
-		if (record.role !== "assistant" || action?.replacement !== null) continue;
+		if (record.role !== "assistant" || !action || action.replacement !== null) continue;
 		for (const callId of record.toolCallIds) {
 			const result = byResultCallId.get(callId);
 			if (result) {
-				const failure = omit(result, `assistant ${record.id} was omitted`);
+				const failure = omit(result, `assistant ${record.id} was omitted`, action.provenance);
 				if (failure) return failure;
 			}
 		}
@@ -619,7 +633,7 @@ function applyDshContextEdits(
 		const target = targets.get(record.id);
 		if (!action || !target) continue;
 		if (action.replacement === null) {
-			appendOmission(session, target.targetSeq, coordinates);
+			appendOmission(session, target.targetSeq, coordinates, action.provenance);
 		} else {
 			appendContentReplacement(session, record, target.event, action, target.targetSeq, coordinates);
 		}

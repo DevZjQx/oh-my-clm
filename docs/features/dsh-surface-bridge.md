@@ -12,6 +12,7 @@
 - cleanup 直接对当前 session surface 执行按 ID 的 native replacement，不读取 mirror 文件。
 - `systemPrompt.context()` 负责把 block index 放进模型可见的 runtime context；`source.kind === "runtime-context"` 的 snapshot 会从 mirror records 中排除，避免 index 递归列出自身。
 - 在 DSH 0.2.0-rc.2 与 0.2.2-rc.1 中，实际生效的都是 bundle 元数据；`dsh-plugin.json` 的 Community permissions 按真实写入位置声明为 `host-temp`（`/tmp/clm-<session>/`），只描述位置，不提供 workspace 隔离或运行时强制边界。
+- `developer/message` replacement 的 `source.kind` 由规划器来源派生：`oh-my-clm:model-mirror-edit`（mirror 编辑）或 `oh-my-clm:runtime-cleanup`（cleanup），不冒充 `user`。本地 `@deepseek-ai/dsh-llm` 类型把 `MessageSourceMap` 定义为 merge-extensible（各生产者自定义 `kind`、消费者对未知 kind fall through），这是自定义 kind 的依据；**真实 DSH profile 上 `Session.append()` 对这两个 kind 的接受度尚未验证**，发版前需复核（§2 I-5）。
 
 ## 2. 生命周期与 surface 适配
 
@@ -56,7 +57,7 @@ DSH 明确禁止 `assistant/message` 携带 `sourceEventSeqs`，而每个 replac
 
 ## 4. 安装与打包
 
-安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()` / surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。该契约已对照上游 `@deepseek-ai/dsh` 0.2.2-rc.1（harness master `fcc0ad46`）复核：`Session.append()`、`surfaceOp`、`sourceEventSeqs` 与 `source.kind` 校验均未变化；E-012 报告与上述 commit 仍作为最初实现时的历史依据保留。
+安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()` / surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。该契约已对照上游 `@deepseek-ai/dsh` 0.2.2-rc.1（harness master `fcc0ad46`）复核：`Session.append()`、`surfaceOp`、`sourceEventSeqs` 与 `source.kind` 校验规则均未变化；E-012 报告与上述 commit 仍作为最初实现时的历史依据保留。自定义 `source.kind` 在真实 DSH profile 上的接受度仍需发版前复核（§2 I-5）。
 
 如果要交给 DSH 插件管理器安装，使用专门的 DSH 打包脚本：
 

@@ -486,6 +486,11 @@ test("DSH bridge restores the canonical mirror after an applied edit", () => {
 	);
 	assert.ok(rewritten);
 	assert.deepEqual((rewritten as any).sourceEventSeqs, [2]);
+	assert.equal(
+		(rewritten as any).data?.message?.source?.kind,
+		"oh-my-clm:model-mirror-edit",
+		"a model mirror edit must be persisted with its planner provenance, not a user source",
+	);
 	assert.equal([...files.files.keys()].some((filePath) => filePath.endsWith(".patch.json")), false);
 
 	const canonical = files.readText(options.mirrorPath);
@@ -1076,8 +1081,10 @@ test("DSH /clm mode switches the index shape live and clears the cached preview"
 });
 
 // docs/plan.md §3 case 4b / P1-3: the source field is owned by the runtime, so a
-// model-driven replacement must not be attributed to a human user.
-test("plan §3.4b (P1-3): DSH replacement messages do not impersonate a user source", () => {
+// model-driven replacement must not be attributed to a human user. Assert the
+// exact planner-derived kind: `notEqual(..., "user")` alone passed when the
+// source was missing entirely, and did not prove provenance reached the event.
+test("plan §3.4b (P1-3): DSH cleanup replacements carry the runtime provenance", () => {
 	const session = dshSession();
 	const files = new MemoryFiles();
 	const options = bridgeOptions(String(session.id));
@@ -1086,10 +1093,10 @@ test("plan §3.4b (P1-3): DSH replacement messages do not impersonate a user sou
 	const mutations = session.snapshotEvents().filter((event) => event.type === "developer/message");
 	assert.ok(mutations.length > 0);
 	for (const mutation of mutations) {
-		assert.notEqual(
+		assert.equal(
 			(mutation.data as any).message?.source?.kind,
-			"user",
-			"a runtime developer replacement must not be labelled as user-authored",
+			"oh-my-clm:runtime-cleanup",
+			"a cleanup replacement must record which runtime planner produced it",
 		);
 	}
 });

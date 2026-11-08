@@ -4,22 +4,29 @@
 
 ## 0.1.13（当前版本）
 
-依据 [`docs/plan.md`](./docs/plan.md) 的 6 条打回项与 §3 的 11 条回归用例整改；`npm test` 109/109、`npm run check`、`npm run typecheck` 全通过。
+依据 [`docs/plan.md`](./docs/plan.md) 的第 1 节复现与 §3 回归用例整改，并包含一次推送前复核的补充修复；`npm test` 114/114、`npm run check`、`npm run typecheck` 全通过。需明确：`docs/plan.md` §1 的 P1-2「宿主 usage 校准 + 上限双检」与 P1-3「编辑 diff/审计/最小回滚、审批/签名」仍未实现，不因回归用例转绿而结案；§2 的 I-3~I-9 同样仍是待排期项。
 
 ### 修复
 
-- **改写截断 preview 不再毁掉 canonical 正文（P1-1）。** `planContextEdits` 现在拒绝改写任何 `renderText` 非空的块（截断或自引用省略），并要求 body 不含保留的截断 marker；否则 head+tail 副本会成为新的 canonical 正文，中间内容永久丢失且因变短而通过 shrink 门。
+- **改写截断 preview 不再毁掉 canonical 正文（P1-1）。** `planContextEdits` 现在拒绝改写内容被省略的 preview（截断或自引用省略），并要求 body 不含保留的截断 marker；否则 head+tail 副本会成为新的 canonical 正文，中间内容永久丢失且因变短而通过 shrink 门。守卫只针对真正有损的 preview：`renderText` 也会因 `normalizeText` 的空白/CRLF 归一化而与 canonical 不同，这类块内容完整、仍可正常改写（回归用例固定了这一点）。
 - **shrink 门的 token 估算（P1-2）。** `estimateMessageTokens` 修复 assistant 字符串正文计 0 的分支，并对非 ASCII 字符（CJK、emoji 等）按约 1 token/字符加权，使"换语种导致真实 token 增长"的编辑不再被误判为收缩。估算仍是近似，不是 provider tokenizer；宿主 usage 校准与上限双检尚未实现，已在文档中标明。
-- **写入时溯源与来源伪造（P1-3）。** 新增 `ContextEditDraft.provenance` 封闭字段（规划器写入、不从正文解析）；mirror body 中伪造 `[oh-my-clm ... source=/owner=/trusted=/provenance=]` 的编辑被拒绝；DSH 的 omission 与 assistant 改写改用 `source: { kind: "oh-my-clm" }`，不再冒充 `user`；Pi 的 `<pi-clm-edit-notice>` 与 budget nudge 改为 `system` 角色消息，不注入合成 `user`。系统提示/索引不进可编辑 mirror，模型可改区只放历史正文。审批/签名、diff/审计、回滚仍未实现。
+- **写入时溯源与来源伪造（P1-3）。** 新增 `ContextEditDraft.provenance` 封闭字段（规划器写入、不从正文解析）；mirror body 中伪造 `[oh-my-clm ... source=/owner=/trusted=/provenance=]` 的编辑被拒绝；DSH 的 omission 与 assistant 改写按该字段派生 `source.kind`（`oh-my-clm:model-mirror-edit` / `oh-my-clm:runtime-cleanup`），不再冒充 `user`；Pi 的 `<pi-clm-edit-notice>` 与 budget nudge 改为 `system` 角色消息，不注入合成 `user`。系统提示/索引不进可编辑 mirror，模型可改区只放历史正文。这里的保护是「来源标签由运行时写入 + 显式保留字黑名单」，**不是对任意注入指令的内容审计**；审批/签名、diff/审计、回滚仍未实现。
 - **block-1 守卫下沉到共享编辑规划层（P1-4）。** 新增 `loadBearingRecord()`，`planCleanup` 与 `planContextEdits` 共用；compaction 释放 protected 前缀后，首个可编辑 block 仍不可删除（含配对级联与显式 `CLM_EMPTY` 全清）。一条旧的"空 mirror 省略全部"断言按新不变量更新。
 - **`CLM_CLEANUP_RESULT=none` 不再吞掉拒绝（P1-5）。** `none` 只抑制成功确认；`rejected` 始终返回可行动 reason，`listed` 始终返回行内容。README / cleanup-tool 文档的 `none` 与 Pi 结果模式口径同步（Pi 实为 `compact`）。
 - **权限声明与实际写入位置一致（P1-6）。** `dsh-plugin.json` 的 fs 权限 scope 从装饰性的 `workspace` 改为 `host-temp`，并去掉隔离暗示；新增回归断言 scope 与 `CLM_TEMP_ROOT` 一致。
 - **Pi 扩展状态按 session 分键（I-1）。** 模块级全局 `state` 改为 `Map<sessionId, SessionState>`，交错 session 的 mirror snapshot 与一次性 notice 不再串台。
-- **budget nudge 有停止条件（I-2）。** 合成 nudge 不进 history，原 marker 去重永远看不到自己；现在按 session 记录轮数与"连续两轮无进展"，达到上限即中止，真实收缩后可重置。
+- **budget nudge 有停止条件（I-2）。** 合成 nudge 不进 history，原 marker 去重永远看不到自己；现在按 session 记录 nudge 轮数，连续两轮没有真实收缩即到上限中止，真实收缩会把计数清零。
+
+### 推送前复核补充修复
+
+- **P1-1 守卫收窄到真正有损的 preview。** 原守卫用 `renderText !== undefined` 判断不可改写，但 `normalizeText` 的空白/CRLF 归一化也会置上 `renderText`，导致带尾随换行或 CRLF 的普通 assistant 消息无法被改写，且收到误导性的「预览被截断」理由。现在只有含截断 marker 或自引用省略 marker 的 preview 才禁止改写；新增 4 条回归（含 Pi 端到端）固定「归一化预览可改写、原样不动为 noop、截断/自引用省略仍拒绝」。
+- **I-2 触顶后可重置。** 上限判断原先排在「预算压力消失 → 重置」之前，触顶后该会话再也不会收到 nudge，与「真实收缩后可重置」的承诺矛盾；现把低压重置移到停止判断之前，并去掉永远不可达的 `noProgressRounds` 计数器。新增回归覆盖「两轮 nudge → 触顶 → 低压轮 → 再次高压轮重新 nudge」。
+- **`provenance` 不再只写不读。** 原先该字段只在规划器赋值、没有任何消费方，DSH 的来源标签是独立常量；现在 DSH 写边界从 `ContextEditDraft.provenance` 派生 `developer/message` 的 `source.kind`，配对级联省略也继承触发它的规划器来源，持久化事件能区分 `model-mirror-edit` 与 `runtime-cleanup`。回归断言改为核对具体 kind（旧断言 `!== "user"` 在来源缺失时也会通过）。
+- **发布与文档口径。** `publish.yml` 补上 `npm run typecheck` 与 `npm pack --dry-run`；`docs/reports/README.md` 不再把旧 harness 产物称为最新；`docs/plan.md` 与自评表的结案措辞改为如实标注仍未实现项。
 
 ### 宿主版本对齐
 
-- 对照 Pi `1.3.0 → 1.5.0`、`@deepseek-ai/dsh` `0.2.0-rc.2 → 0.2.2-rc.1`（harness master `fcc0ad46`）、cordis `4.0.5 → 4.1.0` 的上游源码复核契约：`context` handler 追加 `system` 角色消息的保留逻辑、`MessageSourceMap` / `source.kind` 校验、`surfaceOp: { op: "replace" }` 与 `sourceEventSeqs` 约束、以及 `agent/created`、`agent/pre-step`、`session/event`、`systemPrompt.section()`、`systemPrompt.context()`、`tools.register()` 扩展点均未变化；`npm run typecheck` 在 Pi 1.5.0 类型下同样通过。Pi 1.5.0 的工具参数校验改走 `@earendil-works/pi-schema` 不影响本插件：参数 schema 只用标准 JSON Schema，`typebox` 仍是受支持的扩展导入。
+- 对照 Pi `1.3.0 → 1.5.0`、`@deepseek-ai/dsh` `0.2.0-rc.2 → 0.2.2-rc.1`（harness master `fcc0ad46`）、cordis `4.0.5 → 4.1.0` 的上游源码复核契约：`context` handler 追加 `system` 角色消息的保留逻辑、`MessageSourceMap` / `source.kind` 校验、`surfaceOp: { op: "replace" }` 与 `sourceEventSeqs` 约束、以及 `agent/created`、`agent/pre-step`、`session/event`、`systemPrompt.section()`、`systemPrompt.context()`、`tools.register()` 扩展点均未变化；`npm run typecheck` 在 Pi 1.5.0 类型下同样通过。Pi 1.5.0 的工具参数校验改走 `@earendil-works/pi-schema` 不影响本插件：参数 schema 只用标准 JSON Schema，`typebox` 仍是受支持的扩展导入。本地已安装的 `@deepseek-ai/dsh-llm` 类型明确把 `MessageSourceMap` 写成 merge-extensible sum type（各生产者自定义 `kind`、消费者对未知 kind fall through），这是插件自定义 `source.kind` 的依据；但**真实 DSH profile 上 `Session.append()` 对这两个新 kind 的接受度仍未验证**，需要在发版前用真实宿主复核（见 §2 I-5）。
 - `@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-tools` 的 peer 范围放宽为 `^0.2.0-rc.2 || ^0.2.2-rc.1`：semver 预发布规则下 `^0.2.0-rc.2` 并不匹配 `0.2.2-rc.1`，而旧宿主仍需继续支持。`cordis ^4.0.4` 已覆盖 `4.1.0`，保持不变。
 - 构建期 `devDependencies` 保持在 `pi-coding-agent ^1.3.0` / `dsh-tools 0.2.0-rc.2` 这条已验证的基线，不随宿主升级：这些是本地 typecheck 与打包产物校验用的钉死基线，`^1.3.0` 已覆盖 1.5.0，且升级 `dsh-tools` 到 0.2.2-rc.1 会因它要求 `cordis ~4.1.0` 触发依赖冲突、连锁重建整条 `@deepseek-ai` 依赖树。插件源码本身不导入任何 `@deepseek-ai/*` 运行时包，宿主版本兼容由 peer 声明与上面的契约复核覆盖。
 - 外部 E-012 报告与官方 Harness 契约提交仍是历史依据：前者验证的是 DSH 0.2.0-rc.2 的真实安装与路径，后者是本地 `Session.append()` 契约的取值来源，文档保留原记录并补充本次在新版上的复核说明，不改写历史。

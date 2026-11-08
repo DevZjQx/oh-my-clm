@@ -47,6 +47,8 @@ const MIRROR_ESCAPE = "\\";
 /** Marker only the renderer writes into a truncated preview body. */
 export const MIRROR_PREVIEW_TRUNCATED_MARKER = "oh-my-clm mirror preview truncated";
 const MIRROR_PREVIEW_TRUNCATED_PATTERN = /oh-my-clm mirror preview truncated/;
+/** Marker only the renderer writes when it elides a self-referential tool result. */
+const MIRROR_SELF_REFERENCE_ELIDED_MARKER = "[oh-my-clm] Self-referential live-context output omitted from the editable mirror";
 /**
  * Provenance is a closed field written by the runtime, never parsed from a
  * body. A body that tries to declare one of these reserved attributes is not a
@@ -248,7 +250,7 @@ function selfReferenceText(text, mirrorPath) {
     const namesTheMirror = Boolean(mirrorPath && normalized.includes(mirrorPath));
     if (!looksLikeMirror && !namesTheMirror)
         return undefined;
-    return "[oh-my-clm] Self-referential live-context output omitted from the editable mirror (" +
+    return MIRROR_SELF_REFERENCE_ELIDED_MARKER + " (" +
         normalized.length +
         " source characters). The canonical tool result remains available for explicit context editing.";
 }
@@ -905,13 +907,25 @@ function contentReplacement(role, text) {
     return text;
 }
 /**
+ * A preview that dropped canonical content must never become a replacement:
+ * the model cannot see what it would overwrite. `renderText` is also set when
+ * `normalizeText` only trims whitespace or converts CRLF, which hides nothing
+ * and stays rewritable, so `renderText !== undefined` is too broad a guard.
+ */
+function hasLossyPreview(record) {
+    if (record.renderText === undefined)
+        return false;
+    return MIRROR_PREVIEW_TRUNCATED_PATTERN.test(record.renderText)
+        || record.renderText.includes(MIRROR_SELF_REFERENCE_ELIDED_MARKER);
+}
+/**
  * Why a `replace` body must never be written back into the session. A mirror
  * body is untrusted history text: it is not allowed to overwrite canonical
  * content it cannot see, smuggle the renderer's truncation marker, or declare
  * privileged provenance that only the runtime may assign.
  */
 function unsafeReplacementReason(record, body) {
-    if (record.renderText !== undefined) {
+    if (hasLossyPreview(record)) {
         return "this block shows a truncated or elided preview, so rewriting it would discard unseen canonical text; omit the block or use cleanup instead";
     }
     if (MIRROR_PREVIEW_TRUNCATED_PATTERN.test(body)) {

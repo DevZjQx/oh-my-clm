@@ -204,9 +204,9 @@ bridge 会对 mirror 编辑执行与 Pi 侧相同的 snapshot、结构安全和 
 
 当前 bridge 会改变 DSH active surface，这与 Pi 的 branch-local `context_edit` 不是一回事：cleanup 的删除计划全部是 `replacement: null`，因此只追加空 `developer/message` omission；普通 mirror 编辑在改写 tool result 时追加 `tool/result` content replacement，在改写/删除 assistant 时追加 `developer/message`（assistant 改写用缩短后的文本，删除用空 content）。原始事件仍保留在 append-only session log 中，`deriveMessages()` 使用新的 surface。
 
-DSH 明确禁止 `assistant/message` 携带 `sourceEventSeqs`，而每个 replacement 又必须引用所有被遮蔽的节点，所以 assistant block 不能原地替换成另一个 assistant message。改写后的文本以 developer 身份进入模型可见历史，不再归属原模型回复；其 `source.kind` 为插件自有的 `oh-my-clm`，不再标记为 `user`。
+DSH 明确禁止 `assistant/message` 携带 `sourceEventSeqs`，而每个 replacement 又必须引用所有被遮蔽的节点，所以 assistant block 不能原地替换成另一个 assistant message。改写后的文本以 developer 身份进入模型可见历史，不再归属原模型回复；其 `source.kind` 由规划器来源派生（`oh-my-clm:model-mirror-edit` / `oh-my-clm:runtime-cleanup`），不再标记为 `user`。
 
-写入时溯源：`ContextEditDraft.provenance` 是规划器写入的封闭字段（`model-mirror-edit` / `runtime-cleanup`），不从正文解析；mirror body 中出现 `[oh-my-clm ... source=/owner=/trusted=/provenance=]` 之类的保留来源声明会被整体拒绝。Pi 侧运行时通知和 budget nudge 改为 `system` 角色消息，不冒充合成 `user` 消息。系统提示、安全策略和 block index 从不进入可编辑 mirror，模型可改区只放历史正文。仍缺审批/签名、编辑 diff/审计与最小回滚（见"设计边界"）。
+写入时溯源：`ContextEditDraft.provenance` 由规划器写入（`model-mirror-edit` / `runtime-cleanup`），不从正文解析，并在 DSH 写边界映射为 `developer/message` 的 `source.kind`，因此持久化事件能区分是哪条规划路径产生了这次编辑；mirror body 中出现 `[oh-my-clm ... source=/owner=/trusted=/provenance=]` 之类的保留来源声明会被整体拒绝。Pi 侧运行时通知和 budget nudge 改为 `system` 角色消息，不冒充合成 `user` 消息。系统提示、安全策略和 block index 从不进入可编辑 mirror，模型可改区只放历史正文。这里的正文黑名单只拦显式保留字，不等于对任意注入指令做内容审计；仍缺审批/签名、编辑 diff/审计与最小回滚（见"设计边界"）。
 
 它不生成 proposal/receipt 文件，也不注册自定义 session event；reconcile 在事件回调之外串行执行，避免 `Session.append()` reentrant failure。所有 omission 和 assistant 改写都使用 append 时真正打开的 `turn`/`step`（正数），`tool/result` replacement 保持原 event envelope、只改 `content`，并带 `sourceEventSeqs: [targetSeq]`。
 
@@ -214,7 +214,7 @@ host entry 不复制 `dsh-ops` 的 Rust 工具、shell、PTC 或 TUI 矩阵，�
 
 ### 安装与打包
 
-安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()`/surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。该契约已对照上游 `@deepseek-ai/dsh` 0.2.2-rc.1（harness master `fcc0ad46`）复核：`Session.append()`、`surfaceOp`、`sourceEventSeqs` 与 `source.kind` 校验均未变化；E-012 报告与上述 commit 仍作为最初实现时的历史依据保留。
+安装 DSH bundle 时，按官方 Harness 的插件管理流程把本仓库目录（或 `npm pack` 产物）交给当前 profile；不要手写 profile 的 `package.json`、`dsh.profile` 或 `cordis.patch.yml`。外部 E-012 报告验证了 DSH 0.2.0-rc.2 的安装、Cordis activation、system prompt 和真实 mirror/file-tool 路径；本地实现另外依据官方 Harness commit `1517a4dbca0a2789ff1d41ba439600f8547d23fa` 的 `Session.append()`/surface replacement 契约，通过 mock seam 回归测试验证 active-surface mutation。该契约已对照上游 `@deepseek-ai/dsh` 0.2.2-rc.1（harness master `fcc0ad46`）复核：`Session.append()`、`surfaceOp`、`sourceEventSeqs` 与 `source.kind` 校验规则均未变化；E-012 报告与上述 commit 仍作为最初实现时的历史依据保留。本地 `@deepseek-ai/dsh-llm` 类型把 `MessageSourceMap` 定义为 merge-extensible（各生产者自定义 `kind`、消费者对未知 kind fall through），这是插件自定义 `source.kind` 的依据；但这两个 kind 在真实 DSH profile 上的接受度仍需发版前复核（§2 I-5）。
 
 如果要交给 DSH 插件管理器安装，使用专门的 DSH 打包脚本：
 

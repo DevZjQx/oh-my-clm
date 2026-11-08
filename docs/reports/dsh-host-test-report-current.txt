@@ -1,6 +1,6 @@
 oh-my-clm host harness
-entry: /home/deepseek-agent/oh-my-clm/dist/dsh/index.js
-node:  v26.11.1
+entry: /home/glm-agent/oh-my-clm/dist/dsh/index.js
+node:  v26.13.0
 
 == 1. module contract ==
   PASS  exports name = oh-my-clm

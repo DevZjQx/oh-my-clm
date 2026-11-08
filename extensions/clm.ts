@@ -41,9 +41,12 @@ const PROMPT_MARKER = "<pi-clm-live-context>";
 const CONTEXT_NUDGE_MARKER = "<pi-clm-budget-nudge>";
 const CONTEXT_RESERVE_TOKENS = 2_048;
 const CONTEXT_NUDGE_FRACTION = 0.75;
-/** Stop conditions for the synthetic, non-history budget nudge (plan I-2). */
+/**
+ * Stop condition for the synthetic, non-history budget nudge (plan I-2).
+ * Two consecutive rounds without a real shrink stop the loop; real progress
+ * resets the counter, so a long session can be nudged again in a later episode.
+ */
 const MAX_NUDGE_ROUNDS = 2;
-const MAX_NUDGE_NO_PROGRESS = 2;
 
 interface Config {
 	budgetTokens: number;
@@ -255,7 +258,6 @@ interface SessionState {
 	pendingNotice?: string;
 	/** A synthetic nudge never enters history, so its dedup guard needs state. */
 	nudgeRounds: number;
-	noProgressRounds: number;
 	lastNudgeTokens?: number;
 }
 
@@ -263,7 +265,7 @@ interface SessionState {
 const states = new Map<string, SessionState>();
 
 function freshState(): SessionState {
-	return { nudgeRounds: 0, noProgressRounds: 0 };
+	return { nudgeRounds: 0 };
 }
 
 function sessionKey(ctx: ExtensionContext): string {
@@ -395,20 +397,20 @@ function contextBudgetNudge(ctx: ExtensionContext, messages: readonly unknown[],
 	const budget = config().budgetTokens;
 	if (budget <= 0) return undefined;
 	if (messages.some((message) => messageText(message).includes(CONTEXT_NUDGE_MARKER))) return undefined;
-	// The nudge is synthetic and never written to session history, so its own
-	// marker guard can never see a previous nudge. Bound it in state instead:
-	// stop after a fixed number of rounds or after two rounds with no progress.
-	if (state.nudgeRounds >= MAX_NUDGE_ROUNDS || state.noProgressRounds >= MAX_NUDGE_NO_PROGRESS) return undefined;
 	const target = Math.max(1, budget - CONTEXT_RESERVE_TOKENS);
 	const tokens = fixedRequestTokens(ctx) + messages.reduce<number>((total, message) => total + estimateMessageTokens(message), 0);
 	if (tokens < Math.floor(target * CONTEXT_NUDGE_FRACTION)) {
-		// Budget pressure is gone: a later episode must get a fresh loop budget,
-		// otherwise a long session could never be nudged again.
+		// Budget pressure is gone: a later episode must get a fresh loop budget.
+		// This reset must run before the stop check, otherwise a session that hit
+		// the cap can never be nudged again even after a large shrink.
 		state.nudgeRounds = 0;
-		state.noProgressRounds = 0;
 		state.lastNudgeTokens = undefined;
 		return undefined;
 	}
+	// The nudge is synthetic and never written to session history, so its own
+	// marker guard can never see a previous nudge. Bound the loop in state:
+	// two consecutive rounds without a real shrink stop it.
+	if (state.nudgeRounds >= MAX_NUDGE_ROUNDS) return undefined;
 
 	const nudge = `${CONTEXT_NUDGE_MARKER}
 You are at approximately ${tokens}/${budget} context tokens; this is a context-only turn.
@@ -422,9 +424,6 @@ ${CONTEXT_NUDGE_MARKER}`;
 	if (previous !== undefined && tokens < previous) {
 		// Real progress (a cleanup shrank the request) earns a fresh budget.
 		state.nudgeRounds = 0;
-		state.noProgressRounds = 0;
-	} else if (previous !== undefined) {
-		state.noProgressRounds += 1;
 	}
 	state.nudgeRounds += 1;
 	state.lastNudgeTokens = tokens;
@@ -461,7 +460,10 @@ export default function (pi: ExtensionAPI) {
 		const snapshot = syncMirror(ctx);
 		// Runtime notices are system-role messages, not synthetic human turns.
 		// Pi supports mid-conversation system messages and restores the leading
-		// prompt around any context-handler result.
+		// prompt around any context-handler result. The handler runs as Pi's
+		// request-scoped `transformContext`: the returned list is used for this
+		// provider request and never appended to session history, so a one-shot
+		// notice cannot become a persistent system instruction on later requests.
 		const additions: { role: "system"; content: string; timestamp: number }[] = [];
 		// A rejected or reverted mirror edit is reported once, on the request after
 		// it happened. Without this the model sees a successful write that silently

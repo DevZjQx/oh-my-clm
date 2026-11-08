@@ -816,3 +816,117 @@ test("plan §3.5b (P1-4): a mirror edit cannot delete load-bearing block 1", () 
 	const plan = planContextEdits(records, parseMirror(edited), { allowGrowth: false });
 	assert.equal(plan.status, "rejected", "block 1 must be preserved on the mirror-edit path too");
 });
+
+// ---------------------------------------------------------------------------
+// P1-1 follow-up. `normalizeText` trims whitespace and converts CRLF, which
+// also sets `renderText` without hiding any canonical content. Guarding on
+// `renderText !== undefined` therefore rejected ordinary, fully visible blocks
+// (assistant messages routinely end in a newline). Only a truncated or
+// self-reference-elided preview is lossy and must stay non-rewritable.
+// ---------------------------------------------------------------------------
+
+test("P1-1 follow-up: a whitespace-normalized preview stays rewritable", () => {
+	const cases = [
+		{ label: "trailing newline", text: "Here is a normal assistant answer.\n", needle: "Here is a normal assistant answer." },
+		{ label: "CRLF line breaks", text: "First line\r\nSecond line", needle: "First line" },
+	];
+	for (const { label, text, needle } of cases) {
+		const projected = buildMirrorRecords([
+			{
+				sourceEntry: { id: "task", type: "message" },
+				messages: [{ role: "user", content: "Task" }],
+			},
+			{
+				sourceEntry: { id: "answer", type: "message" },
+				messages: [{ role: "assistant", content: [{ type: "text", text }] }],
+			},
+		]);
+		assert.notEqual(projected[1]?.renderText, undefined, `${label}: normalization should still set renderText`);
+		assert.doesNotMatch(
+			projected[1]?.renderText ?? "",
+			/preview truncated|Self-referential/,
+			`${label}: the preview must not be lossy`,
+		);
+
+		const edited = renderMirror(projected).replace(needle, "Short.");
+		const plan = planContextEdits(projected, parseMirror(edited), { allowGrowth: false });
+		assert.equal(plan.status, "applied", `${label}: a faithful preview must be rewritable`);
+		assert.ok(
+			plan.edits.some((edit) => edit.targetId === "answer" && edit.replacement !== null),
+			`${label}: the rewritten body must reach the planner`,
+		);
+		assert.equal(projected[1]?.text, text, `${label}: the canonical source is untouched by planning`);
+	}
+});
+
+test("P1-1 follow-up: an unchanged normalized preview is a noop", () => {
+	const projected = buildMirrorRecords([
+		{
+			sourceEntry: { id: "task", type: "message" },
+			messages: [{ role: "user", content: "Task" }],
+		},
+		{
+			sourceEntry: { id: "answer", type: "message" },
+			messages: [{ role: "assistant", content: [{ type: "text", text: "A normal answer.\n" }] }],
+		},
+	]);
+	assert.notEqual(projected[1]?.renderText, undefined);
+	const plan = planContextEdits(projected, parseMirror(renderMirror(projected)), { allowGrowth: false });
+	assert.equal(plan.status, "noop", "normalization must not appear as a phantom edit");
+});
+
+test("P1-1 follow-up: truncated and self-referential previews are still rejected", () => {
+	const truncated = buildMirrorRecords([
+		{
+			sourceEntry: { id: "task", type: "message" },
+			messages: [{ role: "user", content: "Task" }],
+		},
+		{
+			sourceEntry: { id: "huge", type: "message" },
+			messages: [{ role: "toolResult", content: [{ type: "text", text: "x".repeat(20_018) }] }],
+		},
+	], { maxBlockChars: 500, maxMirrorChars: 500 });
+	assert.match(truncated[1]?.renderText ?? "", /preview truncated/);
+	const truncatedEdit = renderMirror(truncated).replace(
+		/(\[\[CLM_ENTRY id=1 role=toolResult\]\]\n)/,
+		"$1injected short line\n",
+	);
+	assert.equal(
+		planContextEdits(truncated, parseMirror(truncatedEdit), { allowGrowth: false }).status,
+		"rejected",
+		"a truncated head+tail preview must never become canonical text",
+	);
+
+	// Strip the marker from the body as well: this isolates `hasLossyPreview`
+	// from the body-marker denylist. A model that deletes the marker and writes
+	// a short head+tail body must still be refused.
+	const markerlessEdit = truncatedEdit.replace(
+		/\n\.\.\.\[oh-my-clm mirror preview truncated;[^\n]*\]\.\.\.\n/,
+		"\n",
+	);
+	assert.doesNotMatch(markerlessEdit, /preview truncated/);
+	assert.equal(
+		planContextEdits(truncated, parseMirror(markerlessEdit), { allowGrowth: false }).status,
+		"rejected",
+		"removing the marker must not make a truncated preview writable",
+	);
+
+	const selfReference = buildMirrorRecords([
+		{
+			sourceEntry: { id: "task", type: "message" },
+			messages: [{ role: "user", content: "Task" }],
+		},
+		{
+			sourceEntry: { id: "self", type: "message" },
+			messages: [{ role: "toolResult", content: [{ type: "text", text: "<!-- clm-v2 --> [[CLM_ENTRY id=old role=assistant]]" }] }],
+		},
+	], { mirrorPath: "/tmp/clm-test-session/LIVE_CTX_MAIN.md" });
+	assert.match(selfReference[1]?.renderText ?? "", /Self-referential/);
+	const selfEdit = renderMirror(selfReference).replace(
+		"Self-referential live-context output omitted",
+		"Self-referential output omitted",
+	);
+	const selfPlan = planContextEdits(selfReference, parseMirror(selfEdit), { allowGrowth: false });
+	assert.equal(selfPlan.status, "rejected", "an elided preview must stay non-rewritable");
+	assert.match(selfPlan.reason ?? "", /truncated or elided/);
+});
