@@ -13,6 +13,7 @@
 - `systemPrompt.context()` 负责把 block index 放进模型可见的 runtime context；`source.kind === "runtime-context"` 的 snapshot 会从 mirror records 中排除，避免 index 递归列出自身。
 - 在 DSH 0.2.0-rc.2 与 0.2.2-rc.1 中，实际生效的都是 bundle 元数据；`dsh-plugin.json` 的 Community permissions 按真实写入位置声明为 `host-temp`（`/tmp/clm-<session>/`），只描述位置，不提供 workspace 隔离或运行时强制边界。
 - `developer/message` replacement 的 `source.kind` 由规划器来源派生：`oh-my-clm:model-mirror-edit`（mirror 编辑）或 `oh-my-clm:runtime-cleanup`（cleanup），不冒充 `user`。本地 `@deepseek-ai/dsh-llm` 类型把 `MessageSourceMap` 定义为 merge-extensible（各生产者自定义 `kind`、消费者对未知 kind fall through），这是自定义 kind 的依据；**真实 DSH profile 上 `Session.append()` 对这两个 kind 的接受度尚未验证**，发版前需复核（§2 I-5）。
+- `sessionProjections`（`@deepseek-ai/dsh-session-projection`）**不进 `inject`**：老宿主没有这个服务，进 `inject` 会让插件整体不激活。因此也不能直接读 `ctx.sessionProjections`——Cordis 对未声明的服务读取会抛 `cannot get property "sessionProjections" without inject`。统一走 `ctx.get("sessionProjections")`（Cordis 文档规定的免 inject 读取路径，`dsh-tools` 的 `ctx.get("approval")` 就是同一用法）；服务缺失时返回 `undefined`，用量行退回带 `~` 的估算，而不是让 `/clm status` 与 runtime block index 一起失败。
 
 ## 2. 生命周期与 surface 适配
 
@@ -92,7 +93,7 @@ host bridge 可选读取以下变量；它们只影响 mirror preview、shrink-o
 
 所有 `CLM_TRIGGER_*` 默认关闭：阈值尚未在真实 DeepSeek-V4.1-Flash 会话上标定，机制先以可关闭形态交付（见 `docs/plan.md` §5.2）。命中后在 `systemPrompt.context()` 的同一个 `<oh-my-clm-block-index>` 里追加一行用量和一条可直接确认的候选：
 
-- 用量行 `Usage: X/Y tokens (Z%) · N editable blocks · last cleanup at turn K` 的 `X` 优先取宿主精确值（`sessionProjections` 的 `tokenUsage`），取不到才退回 `~` 估算，窗口未知时显式写 `window unknown`，不静默冒充精确值。Pi 侧的 budget nudge 复用同一套用量行与候选格式（§5.3），只是触发源换成 Pi 的预算水位。
+- 用量行 `Usage: X/Y tokens (Z%) · N editable blocks · last cleanup at turn K` 的 `X` 优先取宿主精确值（`sessionProjections` 的 `tokenUsage`），取不到才退回 `~` 估算，窗口未知时显式写 `window unknown`，不静默冒充精确值。该服务通过 `ctx.get("sessionProjections")` 读取（免 inject，见 §1），缺失时只降级用量行，不影响 `/clm status` 或 block index。Pi 侧的 budget nudge 复用同一套用量行与候选格式（§5.3），只是触发源换成 Pi 的预算水位。
 - 候选只取已完成的 turn（正在进行的 turn 仍可能补齐 tool 配对），按“可省 token × 陈旧度”排序，并永不包含 block 1；候选以“区间 + 保留规则”的形式给出（`ranges` 加 `skipRoles: ["user"]`），因为 turn 以 user 块开头，裸区间会连人类请求一起删掉，而引用的节省数字已经扣除了被保留的 user 块；模型只做确认或改范围，开放题变成核对。
 - 用量行与候选按 turn 边界渲染并按 `(已完成 turn 数, 触发配置)` 缓存，同一 turn 内逐字节不变，因此 DSH 仍然只在 turn 边界追加一次快照；`cleanup` / mirror edit 生效或 compaction 后清空缓存（删除会重排 ID）。
 | `CLM_CLEANUP_RESULT` | `compact` | `compact` / `full` / `none`，只影响 cleanup 的模型可见结果。 |

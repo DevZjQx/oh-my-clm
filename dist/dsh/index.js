@@ -104,6 +104,34 @@ function cleanupResultCopy() {
 /** Process-scoped host Context, like indexModeOverride; set by apply(). */
 let activeContext;
 /**
+ * Read an optional host service.
+ *
+ * `sessionProjections` stays out of `inject` so the plugin still loads on hosts
+ * without it, but Cordis resolves every undeclared service through a proxy that
+ * throws `cannot get property "<name>" without inject`. `ctx.get(name)` is the
+ * documented inject-free read; older or synthetic contexts that expose the
+ * service as a plain property are still supported behind a try/catch, because
+ * an absent service must degrade to the `~` estimate, never fail silently.
+ */
+function optionalService(ctx, name) {
+    if (!ctx)
+        return undefined;
+    if (typeof ctx.get === "function") {
+        try {
+            return ctx.get(name) ?? undefined;
+        }
+        catch {
+            return undefined;
+        }
+    }
+    try {
+        return ctx[name] ?? undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
  * Exact usage from the DSH host's projection service. dsh-context reads the
  * same kernel values via `sessionProjections.snapshot(session, KERNEL_KEYS)`
  * (KERNEL_KEYS = sessionStats / tokenUsage / contextBreakdown); the official
@@ -114,7 +142,7 @@ let activeContext;
  * `~` instead of being passed off as exact.
  */
 function hostUsageFor(session) {
-    const projections = activeContext?.sessionProjections;
+    const projections = optionalService(activeContext, "sessionProjections");
     if (typeof projections?.snapshot !== "function")
         return undefined;
     let block;
@@ -544,4 +572,10 @@ export function apply(ctx) {
         states.delete(String(agent.session?.id ?? agent.id));
     });
 }
+/**
+ * Required services only. `sessionProjections` is deliberately absent so the
+ * plugin still activates on hosts without @deepseek-ai/dsh-session-projection;
+ * it is read through `ctx.get()` (see `optionalService`), never as a property,
+ * because Cordis throws on undeclared service reads.
+ */
 export const inject = ["systemPrompt", "tools", "commands"];

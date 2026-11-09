@@ -92,12 +92,18 @@ interface DshContext {
 	 * Optional host projection service (@deepseek-ai/dsh-session-projection).
 	 * Not added to `inject`: older hosts must still load this plugin, and a
 	 * missing service is reported as an `~` estimate rather than exact usage.
+	 * Because it is not injected, it must be read through `ctx.get()` — a direct
+	 * `ctx.sessionProjections` read throws in Cordis.
 	 */
-	readonly sessionProjections?: {
-		snapshot(session: unknown, keys?: readonly string[]): unknown;
-	};
+	readonly sessionProjections?: DshProjectionService;
+	/** Cordis service lookup without the `inject` requirement. */
+	get?(name: string, strict?: boolean): unknown;
 	on(name: string, listener: (...args: any[]) => any): () => boolean | void;
 	effect?(effect: (() => unknown) | (() => Generator<unknown, unknown, unknown>), label?: string): unknown;
+}
+
+interface DshProjectionService {
+	snapshot(session: unknown, keys?: readonly string[]): unknown;
 }
 
 interface DshAgent {
@@ -207,6 +213,32 @@ function cleanupResultCopy(): CleanupResultCopy {
 /** Process-scoped host Context, like indexModeOverride; set by apply(). */
 let activeContext: DshContext | undefined;
 
+/**
+ * Read an optional host service.
+ *
+ * `sessionProjections` stays out of `inject` so the plugin still loads on hosts
+ * without it, but Cordis resolves every undeclared service through a proxy that
+ * throws `cannot get property "<name>" without inject`. `ctx.get(name)` is the
+ * documented inject-free read; older or synthetic contexts that expose the
+ * service as a plain property are still supported behind a try/catch, because
+ * an absent service must degrade to the `~` estimate, never fail silently.
+ */
+function optionalService<T>(ctx: DshContext | undefined, name: string): T | undefined {
+	if (!ctx) return undefined;
+	if (typeof ctx.get === "function") {
+		try {
+			return (ctx.get(name) as T | undefined) ?? undefined;
+		} catch {
+			return undefined;
+		}
+	}
+	try {
+		return ((ctx as unknown as Record<string, unknown>)[name] as T | undefined) ?? undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 interface DshTokenUsage {
 	readonly cacheReadTokens?: unknown;
 	readonly uncachedInputTokens?: unknown;
@@ -230,7 +262,7 @@ interface DshWindowProjection {
  * `~` instead of being passed off as exact.
  */
 function hostUsageFor(session: DshSessionLike): HostUsage | undefined {
-	const projections = activeContext?.sessionProjections;
+	const projections = optionalService<DshProjectionService>(activeContext, "sessionProjections");
 	if (typeof projections?.snapshot !== "function") return undefined;
 	let block: unknown;
 	try {
@@ -678,4 +710,10 @@ export function apply(ctx: DshContext): void {
 	});
 }
 
+/**
+ * Required services only. `sessionProjections` is deliberately absent so the
+ * plugin still activates on hosts without @deepseek-ai/dsh-session-projection;
+ * it is read through `ctx.get()` (see `optionalService`), never as a property,
+ * because Cordis throws on undeclared service reads.
+ */
 export const inject = ["systemPrompt", "tools", "commands"] as const;

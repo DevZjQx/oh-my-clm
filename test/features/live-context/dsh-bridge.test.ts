@@ -1146,6 +1146,74 @@ test("DSH reads host-exact tokenUsage from sessionProjections and labels the fal
 	}
 });
 
+test("DSH reads sessionProjections through ctx.get, not an undeclared property", async () => {
+	// Reproduce Cordis: an undeclared service read on the context proxy throws
+	// `cannot get property "<name>" without inject`, while `ctx.get(name)` is the
+	// supported inject-free path. A direct property read here stranded `/clm
+	// status` on `could not render status` and silently emptied the runtime
+	// block index (both call sites share this read).
+	const root = listenerContext();
+	const projections = {
+		snapshot() {
+			return {
+				asOfSeq: 12,
+				values: {
+					tokenUsage: { uncachedInputTokens: 800, cacheReadTokens: 9_000 },
+					contextPressure: { contextWindow: 10_000 },
+				},
+			};
+		},
+	};
+	const readKeys: string[] = [];
+	const cordisLike = new Proxy(
+		{
+			...root,
+			get(name: string) {
+				readKeys.push(name);
+				return name === "sessionProjections" ? projections : undefined;
+			},
+		},
+		{
+			get(target, prop, receiver) {
+				if (prop === "sessionProjections") {
+					throw new Error(`cannot get property "${String(prop)}" without inject`);
+				}
+				return Reflect.get(target, prop, receiver);
+			},
+		},
+	);
+	dshHost(cordisLike as any);
+	const command = root.commands.definitions.get("clm");
+	assert.ok(command, "/clm was not registered");
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-dsh-inject-free-"));
+	const sessionId = `dsh-inject-free-${process.pid}-${Date.now()}`;
+	const mirrorPath = sessionMirrorPath(sessionId);
+	const session = dshSession(cwd, sessionId);
+	const invocation = {
+		agent: { id: sessionId, session },
+		commandId: "command-1",
+		rawInput: "status",
+		attachments: [],
+		signal: new AbortController().signal,
+	};
+	try {
+		const status = await command.handler(invocation);
+		assert.equal(status.kind, "success", status.text);
+		assert.match(status.text, /DSH tokenUsage: 9800\/10000 tokens \(host-exact/);
+		assert.ok(readKeys.includes("sessionProjections"), "usage must be read through ctx.get");
+
+		// The same read path feeds the runtime block index, so it must still render.
+		const agent = { id: `agent-${sessionId}`, session, ctx: listenerContext() };
+		await root.emit("agent/created", { agent });
+		const renderText = root.contexts[0]?.text;
+		if (typeof renderText !== "function") throw new Error("block index context is not dynamic");
+		assert.match(renderText({ agent }), /Usage: 9\.8k\/10k tokens \(98%\)/);
+	} finally {
+		fs.rmSync(path.dirname(mirrorPath), { recursive: true, force: true });
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
 test("DSH /clm command reports the live mirror status and validates arguments", async () => {
 	const root = listenerContext();
 	dshHost({ ...root } as any);

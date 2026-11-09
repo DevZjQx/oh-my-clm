@@ -184,7 +184,7 @@ Pi 侧的 mirror 显示上限是固定的：单 block 约 `12000` 字符，总 m
 
 token 计数使用共享格式层的 provider-independent `estimateMessageTokens(message)`，按消息分别估算。对当前 Pi 支持的 text、thinking、tool call、图片、system sections 和 tool declarations，ASCII 文本沿用与 Pi host 一致的 `3.5 chars/token` 近似及按消息 rounding；非 ASCII 字符（CJK、emoji 等）按约 1 token/字符加权，assistant 的字符串正文也按正文计入（此前计 0）。共享层不导入 Pi runtime，但会显式处理 DSH 的 `reasoning`、`tool-call`、`tool` 等形状；只有未识别的其他自有消息形状才走 fallback 估算。
 
-当前 Pi extension 的公开 `ExtensionContext` 只提供 effective system prompt，`fixedRequestTokens` 因此只计该 prompt；tool declaration overhead 只有在 host 传入结构化 system message 时才会被计入，否则这个估算就不完整。**它不是 provider 的精确 tokenizer**：加权只保证"换语种导致真实 token 增长"不再被误判为收缩；估算只用于编辑前后的有符号 delta，`beforeTokens` 与硬上限改取宿主精确用量（Pi `ctx.getContextUsage()`，DSH `sessionProjections` 的 `tokenUsage` / `contextPressure`）。校准后编辑用量仍高于窗口 95% 时拒绝（`HOST_CAP_HEADROOM`，待真实 V4.1-Flash 会话标定）；宿主用量取不到时 status 显式标 `~`，不静默当作精确值。
+当前 Pi extension 的公开 `ExtensionContext` 只提供 effective system prompt，`fixedRequestTokens` 因此只计该 prompt；tool declaration overhead 只有在 host 传入结构化 system message 时才会被计入，否则这个估算就不完整。**它不是 provider 的精确 tokenizer**：加权只保证"换语种导致真实 token 增长"不再被误判为收缩；估算只用于编辑前后的有符号 delta，`beforeTokens` 与硬上限改取宿主精确用量（Pi `ctx.getContextUsage()`；DSH 走免 inject 的 `ctx.get("sessionProjections")` 取 `tokenUsage` / `contextPressure`，见 [dsh-surface-bridge.md](./docs/features/dsh-surface-bridge.md) §1）。校准后编辑用量仍高于窗口 95% 时拒绝（`HOST_CAP_HEADROOM`，待真实 V4.1-Flash 会话标定）；宿主用量取不到时 status 显式标 `~`，不静默当作精确值。
 
 ### mirror 文件位置与权限
 
