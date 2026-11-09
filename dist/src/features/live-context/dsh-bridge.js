@@ -167,6 +167,8 @@ function triggerSignature(options) {
         trigger.turnsSinceCleanup ?? 0,
         trigger.maxCandidates ?? 0,
         trigger.minSavingsTokens ?? 0,
+        trigger.cacheDiscount ?? 0,
+        trigger.paybackTurns ?? 0,
     ]);
 }
 /**

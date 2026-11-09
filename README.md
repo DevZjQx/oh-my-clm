@@ -67,9 +67,10 @@ DSH 的 runtime context 会包含 `<oh-my-clm-block-index>`，有两种模式（
 每个 DSH 快照的头部还有一行用量，命中触发条件时索引末尾追加一条清理候选：
 
 - 用量行形如 `Usage: 12.3k/128k tokens (9.6%) · 18 editable blocks · last cleanup at turn 4`。token 数优先取宿主精确值：`sessionProjections` 的 `contextPressure.projectedTokens`（下一次请求的 prompt 估算价），缺失时退到同一投影的 `pressureTokens`（最近一次请求的 prompt 大小）。**不要用 `tokenUsage` 的 `cacheReadTokens + uncachedInputTokens`**——那是整段会话的累计计费账（DSH 文档原文 "durable cumulative provider usage for a complete session log"），跑几轮就会超过窗口，拿它当水位会让每次 cleanup 都显得不安全；取不到时显示 `~` 估算，窗口也不可知时写 `window unknown`，不会把估算冒充精确值（P1-2）。
-- 命中任一触发阈值时，`<oh-my-clm-block-index>` 末尾给出可直接确认的候选：`Suggested cleanup (usage 80% ≥ 70%): cleanup({ ranges: ["3-5"], skipRoles: ["user"] }) frees ~120 tok.`，随后一行列出每个区间的预计节省与陈旧度。候选带上已有的 `skipRoles: ["user"]`：turn 以 user 块开头，裸区间会连人类请求一起删掉，而引用的节省数字已经扣除了被保留的 user 块。候选只取**已完成的 turn**，永不包含 block 1 和当前 turn；模型只需要确认或改范围，不必自己判断何时清理。
+- 命中任一触发阈值时，`<oh-my-clm-block-index>` 末尾给出可直接确认的候选：`Suggested cleanup (usage 80% ≥ 70%): cleanup({ ranges: ["3-5"], skipRoles: ["user"] }) frees ~120 tok.`，随后一行列出每个区间的预计节省、陈旧度、断点后的 token 数与净收益。候选带上已有的 `skipRoles: ["user"]`：turn 以 user 块开头，裸区间会连人类请求一起删掉，而引用的节省数字已经扣除了被保留的 user 块。候选只取**已完成的 turn**，永不包含 block 1 和当前 turn；模型只需要确认或改范围，不必自己判断何时清理。
 - 用量行与候选按 **turn 边界** 计算并缓存，同一 turn 内逐字节不变，不会每步追加一份快照；`cleanup` 或 mirror edit 生效后清空缓存（删除会重排 ID），compaction 由宿主适配器清空。
 - 所有触发阈值默认关闭（`0`），因为尚未在真实 DeepSeek-V4.1-Flash 会话上标定；打开方式见下文 `CLM_TRIGGER_*`。
+- 候选按**断点后的净收益**排序，而不是按「省下多少 token」：一次就地改写会让被改位置之后的全部 token 失去缓存，按 `cost ≈ r·L + (1−r)·B` 计，省下的 token 打折、断掉的 `B` 打全价。所以 `cleanup` 的真实收益约等于 `net ≈ r·freed − (1−r)·suffix / N`（`r` 为缓存命中价比例，`N` 为这笔一次性成本要摊几轮），`net ≤ 0` 的区间不会出现在候选里——触发命中但所有区间都亏本时，只会显示用量行。`r` / `N` 默认 `0.1` / `10`，用 `CLM_CACHE_DISCOUNT`（百分比）与 `CLM_CACHE_PAYBACK_TURNS` 按端点覆盖；没有缓存（`r = 1`）时这两项退化成纯 token 比较，与「短上下文一定更便宜」的直觉一致。
 
 `cleanup` 接受 `ranges: ["3-16"]`（包含式区间）或 `blockIds: [...]`（单块），还可以用 `skipRoles: ["user"]` 在一个 turn 区间里保留人类消息。不确定是否还需要某个 block 时用 `cleanup({ offload: [{ blockId, note }] })`：保留 ID / role / 位置，正文换成一行严格更短的 `[offloaded: <note>]`，要点由模型自己写（插件不引入第二个 summarizer）；`offload` 可与删除混用，block 1、user 块和会变长的占位都会被拒绝。配对级联删除（assistant tool call 与结果）会单独报告为 `paired`，不会混进你请求的 ID。显式单块 ID 仍然严格校验，range 越界会夹取，range 覆盖 block 1 时保留 block 1。`cleanup({ list: "3-16" })` 是只读的展开：返回该区间的行（role + 短 preview），不做任何删除，因此“索引只给了省略行、但我想先看清楚”不需要读整个 mirror；它不能和删除目标同时出现。只有需要完整、未截断的正文做 rewrite 时才需要读 mirror。
 
@@ -126,7 +127,7 @@ dsh --profile <profile>
 dsh plugin --profile <profile> remove oh-my-clm
 ```
 
-需要固定版本时，npm 源在包名后加 `@<version>`（例如 `oh-my-clm@0.1.16`），GitHub 源在仓库后加 `#<ref>`（例如 `github:DevZjQx/oh-my-clm#<commit-sha>`）。DSH 不读取 `pi` 设置，Pi 的安装也不会自动把插件加入任何 DSH profile。
+需要固定版本时，npm 源在包名后加 `@<version>`（例如 `oh-my-clm@0.1.17`），GitHub 源在仓库后加 `#<ref>`（例如 `github:DevZjQx/oh-my-clm#<commit-sha>`）。DSH 不读取 `pi` 设置，Pi 的安装也不会自动把插件加入任何 DSH profile。
 
 ## 快速上手
 
@@ -248,7 +249,7 @@ Block index 的模式与尺寸开关：`CLM_INDEX_MODE`（`digest` 默认 / `blo
 
 DSH 只在 runtime-context 快照文本变化时追加新快照，因此节流能减少重复注入；`cleanup` 或 mirror edit 生效后会立即失效并重渲染，设为 `1` 可恢复每步刷新。节流按“打开中的 turn + 已关闭 step 数”计数：DSH 在 `agent/pre-step` 渲染索引，此时下一步的 `step/start` 还没写入，旧的 turn/step 键因此从未命中（E-027）。
 
-清理触发开关（默认全部关闭，尚未在真实 V4.1-Flash 会话标定，见 [`docs/plan.md`](./docs/plan.md) §5.2）：`CLM_TRIGGER_PCT`（用量达到窗口的百分比）、`CLM_TRIGGER_TURNS`（已完成 turn 数）、`CLM_TRIGGER_TOOL_RATIO`（toolResult 占可编辑 token 的百分比）、`CLM_TRIGGER_SINCE`（距上次成功清理的 turn 数）、`CLM_TRIGGER_CANDIDATES`（每次最多候选数，默认 3）、`CLM_TRIGGER_MIN_TOKENS`（最小可省 token）、`CLM_CONTEXT_WINDOW`（宿主不提供窗口时的兜底窗口）。任一命中即在该 turn 边界装配一次候选；未命中时只有用量行。
+清理触发开关（默认全部关闭，尚未在真实 V4.1-Flash 会话标定，见 [`docs/plan.md`](./docs/plan.md) §5.2）：`CLM_TRIGGER_PCT`（用量达到窗口的百分比）、`CLM_TRIGGER_TURNS`（已完成 turn 数）、`CLM_TRIGGER_TOOL_RATIO`（toolResult 占可编辑 token 的百分比）、`CLM_TRIGGER_SINCE`（距上次成功清理的 turn 数）、`CLM_TRIGGER_CANDIDATES`（每次最多候选数，默认 3）、`CLM_TRIGGER_MIN_TOKENS`（最小可省 token）、`CLM_CONTEXT_WINDOW`（宿主不提供窗口时的兜底窗口）。另有缓存计价口径：`CLM_CACHE_DISCOUNT`（缓存命中价占全价的比例，百分比，默认 `10` 即 1/10）、`CLM_CACHE_PAYBACK_TURNS`（断点成本摊到几轮，默认 `10`），用于候选的净收益排序。任一阈值命中即在该 turn 边界装配一次候选；未命中时只有用量行。
 
 用 `node scripts/measure-session-index.mjs --project .` 可以从真实 session 日志核对索引快照数、字节数、步间隔和 cleanup 调用形态；它同时给出 `blocks` 与 `digest` 的对比，以及 digest 的预测重渲染次数。
 

@@ -138,6 +138,8 @@ DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程里切换索引形状并
 | `CLM_TRIGGER_CANDIDATES` | `3` | 一次触发最多候选区间数。 |
 | `CLM_TRIGGER_MIN_TOKENS` | `0` | 小于该估算 token 的 turn 不作为候选。 |
 | `CLM_CONTEXT_WINDOW` | 无 | 宿主不提供窗口时的兜底；未知时用量行写 `window unknown`。 |
+| `CLM_CACHE_DISCOUNT` | `10` | 缓存命中价占全价的百分比（`10` = 1/10），即成本公式里的 `r`；按端点设置。 |
+| `CLM_CACHE_PAYBACK_TURNS` | `10` | 断点的一次性成本摊到几轮（公式里的 `N`）；`1` 表示只算眼前这一轮。 |
 | `CLM_CLEANUP_RESULT` | `compact` | DSH 结果模式：`compact` / `full` / `none`。 |
 
 用 `node scripts/measure-session-index.mjs --project .` 可以从真实 session 日志核对索引快照数、字节数、步间隔和 cleanup 调用形态；它同时给出 `blocks` 与 `digest` 的对比，以及 digest 的预测重渲染次数。

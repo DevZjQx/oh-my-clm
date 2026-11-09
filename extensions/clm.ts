@@ -60,6 +60,10 @@ interface Config {
 	budgetTokens: number;
 	maxBlockChars: number;
 	maxMirrorChars: number;
+	/** `r` in `r·L + (1−r)·B`, as a fraction: the cached-read price ratio. */
+	cacheDiscount: number;
+	/** Turns the one-time prefix-break cost is amortised over. */
+	paybackTurns: number;
 }
 
 interface MirrorSnapshot {
@@ -74,11 +78,20 @@ function positiveEnv(name: string, fallback: number): number {
 	return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+/** Price ratios accept `0`, so the positive-only parser cannot be reused. */
+function nonNegativeEnv(name: string, fallback: number): number {
+	const value = Number.parseInt(process.env[name] ?? "", 10);
+	return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
 function config(): Config {
 	return {
 		budgetTokens: positiveEnv("CLM_CONTEXT_BUDGET", 0),
 		maxBlockChars: DEFAULT_MAX_BLOCK_CHARS,
 		maxMirrorChars: DEFAULT_MAX_MIRROR_CHARS,
+		// Same knobs as DSH (`CLM_CACHE_DISCOUNT` is a percentage: 10 = 1/10).
+		cacheDiscount: Math.min(100, nonNegativeEnv("CLM_CACHE_DISCOUNT", 10)) / 100,
+		paybackTurns: positiveEnv("CLM_CACHE_PAYBACK_TURNS", 10),
 	};
 }
 
@@ -490,10 +503,18 @@ function contextBudgetNudge(
 		turnWord: "step",
 	});
 	// Same assembly and rendering as §5.2; only the threshold decision differs.
+	// The ranking prices the prefix break too: `net ≈ r·freed − (1−r)·suffix/N`.
 	const signals = [
 		`${hostUsage ? "" : "~"}usage ${formatPercent((tokens / budget) * 100)} ≥ ${formatPercent(CONTEXT_NUDGE_FRACTION * 100)}`,
 	];
-	const candidates = renderCleanupCandidates({ triggered: true, signals, ...assembleCleanupCandidates(records) });
+	const candidates = renderCleanupCandidates({
+		triggered: true,
+		signals,
+		...assembleCleanupCandidates(records, {
+			cacheDiscount: settings.cacheDiscount,
+			paybackTurns: settings.paybackTurns,
+		}),
+	});
 	const action = candidates
 		? `${candidates}\nConfirm it in this same request, then continue the task.`
 		: "Use one `cleanup` call or one mirror edit to free enough context, then continue the task.";

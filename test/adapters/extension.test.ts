@@ -1010,9 +1010,11 @@ test("plan §5.3 (case 12, Pi): pressure folds a candidate into the same request
 			entries: [
 				{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
 				{ sourceEntry: { id: "u1", type: "message" }, messages: [{ role: "user", content: "First request." }] },
-				{ sourceEntry: { id: "a1", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "First answer." }] }] },
+				// Settled turns must be big enough that deleting one saves more than the
+				// one-time prefix break costs; a 4-token answer is not worth rewriting.
+				{ sourceEntry: { id: "a1", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: `First answer: ${"A".repeat(4_000)}` }] }] },
 				{ sourceEntry: { id: "u2", type: "message" }, messages: [{ role: "user", content: "Second request." }] },
-				{ sourceEntry: { id: "a2", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "Second answer." }] }] },
+				{ sourceEntry: { id: "a2", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: `Second answer: ${"B".repeat(4_000)}` }] }] },
 				{ sourceEntry: { id: "u3", type: "message" }, messages: [{ role: "user", content: "The current request." }] },
 			],
 			messages: [],

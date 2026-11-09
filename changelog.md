@@ -2,7 +2,17 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/features/live-context-mirror.md`](./docs/features/live-context-mirror.md)。
 
-## 0.1.16（当前版本）
+## 0.1.17（当前版本）
+
+清理候选改为按**断点成本**排序：省下的 token 打折，断掉的前缀后缀打全价。对应《前缀断点决定成本》§7 的三个反例，先写红灯用例再改生产代码；`npm test` 141/141、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
+
+- **候选不再按「可省 token × 陈旧度」排序。** 该启发式把旧 turn 的「租」按全价计，而 `r = 0.1` 时旧 turn 的租只有 0.1×，断它的后缀却要付 0.9×；结果是最老最大的 turn 排第一，恰是回本最慢的那个（§7 反例一）。现在 `assembleCleanupCandidates` 为每个候选计算断点后缀 `suffixTokens`（应用 `skipRoles: ["user"]` 后第一个被改写/删除块之后的 token 数，即 `r·L + (1−r)·B` 里的 `B`）与 `netTokens = r·tokens − (1−r)·suffixTokens / N`，按 `net` 排序。
+- **亏本区间不再进候选。** `net ≤ 0` 的 turn 被过滤：触发命中但所有区间都回不了本时，只给用量行，不诱导模型做负收益编辑。回本轮数 `N` 让一次性断点成本可以摊到剩余 run 上——`N = 1` 时只算眼前一轮，`N` 越大越愿意为长 run 付一次断点。
+- **可配置的计价口径。** `CLM_CACHE_DISCOUNT`（百分比，默认 `10` = 1/10，即公式里的 `r`）与 `CLM_CACHE_PAYBACK_TURNS`（默认 `10`，即 `N`）。两者都是未标定的占位值，按端点调整；`r = 1`（无前缀缓存，如 Bedrock 上的 GLM-5）时公式退化为纯 token 比较，亏本区间重新变得划算。
+- **渲染如实报账。** 候选详情行从 `3-5 (~120 tok, 1 turn old)` 改为 `3-5 (~120 tok freed, 1 turn old, 40 tok after the break, net ~116)`，断点代价与净收益对模型可见。
+- **回归。** 新增三条：`r = 0.1` 时最新的大工具 turn 压过更老的 8k turn（旧排序会选后者）；回本超出 `N` 时零候选且不渲染；`r = 1` 时亏本区间重新划算且 `net == tokens`。既有两个用例的 fixture 补到真实规模——4-token 的 settled turn 在 `r = 0.1` 下确实不值得断，机制没有被削弱，只是账算清了。`npm test` 141/141（原 138）。
+
+## 0.1.16
 
 修复 DSH 宿主上 shrink 门永远拒绝 cleanup 的死锁：水位取错了投影。`npm test` 138/138、`npm run check`、`npm run typecheck` 全通过。
 

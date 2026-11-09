@@ -2,6 +2,7 @@
 
 > 追加（2026-11-09）：§5 新增「让 DeepSeek-V4.1-Flash 主动清理上下文」方向，六步按 1~6 顺序排期；**5.1 已实施**（用例 10 红灯转绿），**P1-2 的宿主 usage 校准 + 上限双检已补**（5.2 前置，见 §1 P1-2 实施记录），**5.2 已实施**（用例 11 红灯转绿；触发阈值默认关闭，待真实 V4.1-Flash 会话标定），**5.3 已实施**（用例 12）、**5.4 已实施**（用例 13），5.5~5.6 尚未实施；§1~§4 的结论不变。
 > 状态：评审草稿 / 整改已完成（验收部分）
+> 追加（2026-11-09，候选成本口径）：§5.2 的候选排序原来写成「可省 token × 陈旧度」，被《前缀断点决定成本》§7 列为反例一（旧 turn 的租按折扣价付，断点后缀却按全价重算）。现已改为按断点后的净节省排序、并过滤回本不成立的范围，新增 `CLM_CACHE_DISCOUNT` / `CLM_CACHE_PAYBACK_TURNS` 两个可配置口径（默认 `0.1` / `10`，均未标定）；§5.6 的遥测字段补上 `r`、`S` 与回本轮数；新增 §5.8（可写尾部与 handoff，待排期）。
 > 整改状态（2026-11-09）：§3 的 11 条回归用例，以及一次推送前复核新增的 5 条回归（P1-1 守卫收窄 4 条、I-2 触顶重置 1 条）全部转绿（`npm test` 114/114、`npm run check`、`npm run typecheck` 通过），生产代码与文档已同步；逐项说明见 `changelog.md` 的「0.1.13」。**回归用例转绿不等于第 1 节打回项全部结案**：P1-2 的「宿主 usage 校准 + 估算/上限双检」已实现（2026-11-09，Pi `getContextUsage()` 与 DSH `sessionProjections` 的 `contextPressure` 进入共享门；`npm test` 138/138；同日修正 DSH 采集口径，见 §1 P1-2 实施记录的补记），§5.2 的用量行与候选触发已做（5.2~5.4 已实施，0.1.14 发布）；P1-3 的「编辑 diff/审计/最小回滚、审批/签名」仍未实现（P1-3 只落地了运行时来源标签 + 显式保留字黑名单，不是对任意注入指令的内容审计）；§2 改进项中 I-1、I-2 已修，I-3~I-9 及「规则外清单」（安全姿态、真实宿主行为、撤除试验、维护代价）仍需人工复核 / 排期。
 > 审查对象：当前 checkout（`package.json` 0.1.12，HEAD `b14b187`）
 > 依据：`http://127.0.0.1:3080/dsh-zdiary-kit/view` 的 101 篇笔记（只读知识库，**仅作参考，不作准**）、本仓库源码与文档、仓库自带的 CLM 自评表。
@@ -191,11 +192,13 @@ npm pack --dry-run
 - **动作**：
   1. **用量可见**：动态 context 头部加一行 `~X/Y tokens (Z%) · N editable blocks · last cleanup at turn K`；X 优先取宿主真实占用（DSH `contextPressure.projectedTokens` / `pressureTokens`，或 API `prompt_cache_hit/miss_tokens`；`tokenUsage` 是会话累计计费桶，不能当水位），取不到才退回估算并保留 `~` 标记，绝不静默（对应《常驻记忆上限不能静默截断》Hermes 头部 "67% — 1,474/2,220 chars"）。
   2. **触发判定（代码）**：用量 ≥ 阈值、或已完成 turn 数 ≥ N、或 `toolResult` 占比超线、或距上次清理 ≥ M 个 turn，任一命中即在 **turn 边界**算一次；阈值与 Effort 档位挂钩，在 V4.1-Flash 会话上标定。
-  3. **候选装配**：命中后把已完成 turn 按「可省 token × 陈旧度」排序，取前几个组成 `ranges`，附预计节省与一句理由，写进同一个 `<oh-my-clm-block-index>`；模型只做确认 / 改范围，答案空间从开放生成降为核对（《不思考是能力不是开关》《召回是装配一份预算内的上下文》《预查注入》）。同源 V4-Flash 在《Thinking Inertia》里开放题显式推理率 99.9%、给候选答案时直答率大幅上升，是这一改形的直接理由。候选 ID 必须落在当前 editable 区间且不含 block 1。
+  3. **候选装配**：命中后把已完成 turn 按**断点后的净节省**排序（`net ≈ r·可省 token − (1−r)·断点后缀 / N`，`r` 为缓存命中价比例、`N` 为回本轮数），取前几个组成 `ranges`，附预计节省与一句理由，写进同一个 `<oh-my-clm-block-index>`；模型只做确认 / 改范围，答案空间从开放生成降为核对（《不思考是能力不是开关》《召回是装配一份预算内的上下文》《预查注入》）。同源 V4-Flash 在《Thinking Inertia》里开放题显式推理率 99.9%、给候选答案时直答率大幅上升，是这一改形的直接理由。候选 ID 必须落在当前 editable 区间且不含 block 1。**不能用「可省 token × 陈旧度」排序**：旧 turn 的租按折扣价付，断它的后缀却按全价重算（《前缀断点决定成本》§7 反例一）；也不能只比 token 前后不看断点位置（同节反例三）。
   4. **turn 内字节稳定**：候选与用量行按 turn 边界计算、turn 内不变，复用 `dsh-bridge.ts:246-266` 的节流与快照去重；compaction / cleanup 后按 `dsh/index.ts:536-540` 的既有逻辑失效缓存。
 - **红灯（用例 11）**：`test/features/live-context/dsh-bridge.test.ts` 断言「用量行含百分比」「命中阈值产出具体 ranges + 预计节省」「未命中不产出候选」「同一 turn 内渲染文本字节不变」「候选 ID 全部合法且不含 1」。
 - **依赖 / 风险**：依赖 5.1 的策略句；受前缀缓存约束，只能低频触发；真实 usage 取不到时的降级必须显式标注 `~`，否则退回静默估算等于没修 P1-2。
 - **实施记录（2026-11-09）**：用例 11 先写红灯断言并确认 `npm test` 失败，再改生产代码转绿。新增 `src/features/live-context/context-trigger.ts`（纯函数 `planCleanupTrigger` / `formatUsageLine` / `renderCleanupCandidates`），阈值全部默认 `0`（关闭）——`CLM_TRIGGER_PCT`、`CLM_TRIGGER_TURNS`、`CLM_TRIGGER_TOOL_RATIO`、`CLM_TRIGGER_SINCE`，另有 `CLM_TRIGGER_CANDIDATES`（默认 3）、`CLM_TRIGGER_MIN_TOKENS`（默认 0）与 `CLM_CONTEXT_WINDOW`（估算模式的窗口兜底）；机制先以可关闭形态交付，标定后再打开。`dshTriggerView` 在 DSH 动态 context 头部输出用量行（宿主精确值优先，缺失标 `~`，窗口未知写 `window unknown`）；命中阈值时把候选写进同一个 `<oh-my-clm-block-index>`：只取已完成 turn、按「可省 token × 陈旧度」排序、永不包含 block 1 与当前 turn，并给出可直接确认的 `cleanup({ ranges, skipRoles: ["user"] })` 与每区间理由（推送前复核补：turn 以 user 块开头，裸区间会连人类请求一起删掉，因此候选固定带 `skipRoles: ["user"]`，引用的节省数字也已扣除被保留的 user 块）。用量行与候选按 `(已完成 turn 数, 触发配置)` 缓存，同一 turn 内逐字节不变；`cleanup` / mirror edit 生效与 compaction 后失效。`npm test` 123/123、`npm run check`、`npm run typecheck`、`npm pack --dry-run`、`npm run build:dsh:plugin` 全通过。
+
+- **补记（2026-11-09，候选排序改为按断点成本）**：原排序 `tokens × turnsOld` 是《前缀断点决定成本》§7 点名的反例一——它把「租」按全价计，而 `r=0.1` 时旧 turn 的租只有 0.1×，断它的后缀却要付 0.9×。现在 `assembleCleanupCandidates` 为每个候选计算 `suffixTokens`（应用 `skipRoles` 后第一个被改写/删除块之后的 token 数，即公式里的 `B`）与 `netTokens = r·tokens − (1−r)·suffixTokens / N`：按 `net` 排序，`net ≤ 0` 的区间不进候选（触发命中但所有区间都亏本时只给用量行，不诱导模型做负收益编辑）；`N` 是回本轮数，默认 10，`r` 默认 0.1，二者可由 `CLM_CACHE_DISCOUNT`（百分比，10 = 1/10）与 `CLM_CACHE_PAYBACK_TURNS` 覆盖，DSH 的 per-turn 缓存签名与 Pi 的 nudge 都读同一口径。渲染详情行改为 `3-5 (~120 tok freed, 1 turn old, 40 tok after the break, net ~116)`，让断点代价对模型可见。三条红灯先红后绿：`r=0.1` 时最新大工具 turn 压过更老的 8k turn、回本超期时零候选、`r=1`（如 GLM-5）时亏本区间重新变得划算且 `net == tokens`；既有用例按新口径更新（fixture 里 4-token 的 settled turn 在 `r=0.1` 下确实不值得断，改为真实规模正文）。
 
 ### 5.3 收编 Pi 的独立 nudge 到同一次请求
 
@@ -237,11 +240,24 @@ npm pack --dry-run
 - **现状 / 证据**：`scripts/measure-session-index.mjs` 已能量索引快照数 / 字节 / 步间隔与真实 `cleanup` 调用形态（`:167-176`、`:243-254`），但**不含**缓存命中率、上下文峰值、任务成功率、触发决策；I-5（未验证「模型是否真会用 turn-level cleanup」）、I-6（代价不可观测，`docs/reference/clm-technical-analysis.md:34-36/43` 的 Prefix-reuse FLOPs / SCR / ATIF-CTX 全 ❌）仍未结案。
 - **动作**：
   1. **基线采集**（从第 1 步起并行、只读、不改生产代码）：在真实 V4.1-Flash 长会话日志上量四项——cleanup 自发 / 触发次数、上下文峰值、缓存命中率（`cacheReadTokens` 占比）、任务成功率；
-  2. **补遥测字段**：触发次数、确认 / 否决 / 改写比例、每次清理省下 token、清理位置距前缀头部的距离、命中率变化；
+  2. **补遥测字段**：触发次数、确认 / 否决 / 改写比例、每次清理省下 token、清理位置距前缀头部的距离（即断点后缀 `S`）、按端点实测的 `r`（`cacheReadTokens` 占比；注意命中率不等于折扣率——0.1× 命中 95.8% 仍是全 miss 的 13.8%）、命中率变化，以及由 `r`、`S`、`ΔL` 复算的回本轮数 `N ≈ (1−r)S/(rΔL)`；
   3. **撤除试验**：「关掉插件」与「开插件但关掉触发」两组跑同一批长任务 A/B（《可学性要在撤掉脚手架之后量》《配置按半衰期管理》），同时报准确率、成本、延迟、安全四类指标；
   4. 把「能力天花板」与验收口径写进 README：不承诺省算力、不迁移 CLM 论文的「更准更省」结论（I-9）。
 - **红灯（用例 15）**：断言「遥测字段可从 session 日志复算」「撤除对照可复现（同一批任务 / 同配置）」「缓存命中率退化超过阈值时告警或拒绝更激进的触发」。
 - **依赖 / 风险**：需要真实 V4.1-Flash 长任务样本；拿不到就明确写成「未验证边界」，不用合成日志下结论（I-5）。
+
+### 5.8 可写尾部与 handoff：把「可编辑上下文」从整段历史收窄到尾部
+
+> 状态：**待排期**。本条来自《前缀断点决定成本》§5，是对 5.4 的方向性补强，不是 5.4 的替代。
+
+- **问题**：现在 5.2 / 5.4 的动作形态都是「就地改写」。就地改写的断点就在被改写的位置，所以 `B`（断点后缀）通常是整段历史；`r ≈ 0.1` 时，改写一次要按 0.9 的单价重算后面所有 token。计划里没有任何「只追加、不动旧前缀」的动作形态，而这是笔记排序里最便宜的一档。
+- **动作**：
+  1. **明确四段形状**并写进 README / `docs/features/live-context-mirror.md`：不可变前缀（system / task / 编译过的知识）+ 只追加日志（旧历史，命中缓存）+ 可写尾部（ledger / 待办 / 最新状态）+ 必要时 handoff 到新会话（brief + 指针）。模型管理的对象是尾部状态与 handoff 时机，不是反复重写整段历史；
+  2. **尾部纠正优先于头部改写**：旧结论错了，追加一条更正 / 墓碑，改「当前有效状态」，不动原文；
+  3. **新增 handoff 动作**（与 `cleanup` 平级，先写红灯用例）：模型给出一份**带溯源指针**的 brief（文件、旧会话 id、artifact），插件把它作为新一轮的起点、旧会话留作归档。`cleanup` 保持「删尾部 / 卸载大观测」的低成本用途，handoff 负责真正要丢头部的情形；
+  4. **候选层区分成本档位**：5.2 的候选渲染时标注动作形态（tail drop / offload / handoff），并按 `net` 排序；handoff 的 `B` 是新会话的前缀，不是旧历史的断点后缀。
+- **红灯（用例 16）**：断言「尾部追加更正不产生受保护的头部改动」「handoff brief 必须携带至少一个指针」「handoff 被选中时不再同时建议头部 range」「README 四段形状与 `cleanup` / `offload` / handoff 的分工一致」。
+- **依赖 / 风险**：handoff 会开新会话，`resume`、fork、surface 绑定都要复验（I-5 的未验证边界）；brief 有损，必须带指针，且 brief 本身是新的注入面（P1-3 的来源标签继续适用）。旧缓存已冷时 handoff 不一定更便宜，收益只在「旧缓存还热、brief 足够小」这一格成立。
 
 ### 5.7 六步与既有清单的对应
 
@@ -253,5 +269,6 @@ npm pack --dry-run
 | 5.4 | I-4、P1-3 | 已实施（2026-11-09，`offload` 保留要点）；不替代 diff / 审计 / 回滚 |
 | 5.5 | I-10（规则外清单） | 新增一条需人复核的维度 |
 | 5.6 | I-5、I-6、I-9 | 撤除试验 + 诚实定位 |
+| 5.8 | I-4、P1-3 | 新增方向（可写尾部 + handoff），未实施 |
 
 红灯用例编号 10~15，细节见各步「红灯」行；本次只修改计划文档，不改任何生产代码。

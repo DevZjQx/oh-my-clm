@@ -74,12 +74,88 @@ test("cleanup candidates never suggest deleting a user message", () => {
 	const single = renderCleanupCandidates({
 		triggered: true,
 		signals: ["1 completed turn ≥ 1"],
-		candidates: [{ start: 5, end: 5, tokens: 12, turnsOld: 1 }],
+		candidates: [{ start: 5, end: 5, tokens: 12, suffixTokens: 0, netTokens: 12, turnsOld: 1 }],
 		savingsTokens: 12,
 	});
 	assert.match(single, /ranges: \["5"\]/);
-	assert.match(single, /Candidates: 5 \(~12 tok, 1 turn old\)/);
+	assert.match(single, /Candidates: 5 \(~12 tok freed, 1 turn old, 0 tok after the break, net ~12\)/);
 	assert.doesNotMatch(single, /5-5/);
+});
+
+/**
+ * A big old turn with the whole conversation behind it, and a recent turn whose
+ * suffix is only the open turn. Deleting the old turn rewrites the prefix that
+ * everything else sits on, so its real cost is the 0.9x-priced suffix, not the
+ * tokens it frees (prefix-breakpoint note, §7 counterexample 1).
+ */
+function breakpointRecords(): MirrorRecord[] {
+	return [
+		record("0", "user", "Protected task.", { protected: true }),
+		record("1", "assistant", "anchor block"),
+		record("2", "user", "An old, large request."),
+		record("3", "assistant", "A".repeat(8_000)),
+		record("4", "user", "A middle request."),
+		record("5", "assistant", "B".repeat(4_000)),
+		record("6", "user", "The most recent settled request."),
+		record("7", "toolResult", "C".repeat(20_000), { toolCallId: "call-3" }),
+		record("8", "user", "The open turn, still growing."),
+	];
+}
+
+test("cleanup candidates rank by net savings after the prefix break, not by free tokens", () => {
+	const plan = planCleanupTrigger(breakpointRecords(), { completedTurns: 4 }, {
+		completedTurns: 1,
+		maxCandidates: 1,
+	});
+	assert.equal(plan.triggered, true);
+	// The 20k toolResult turn is the newest and its suffix is only the open turn;
+	// the 8k assistant turn is older and sits under four more blocks.
+	assert.deepEqual(plan.candidates.map((candidate) => [candidate.start, candidate.end, candidate.turnsOld]), [[6, 7, 1]]);
+	const candidate = plan.candidates[0];
+	assert.ok(candidate !== undefined);
+	assert.ok(candidate.suffixTokens > 0, "the suffix that must be re-prefilled is priced in");
+	assert.ok(candidate.netTokens < candidate.tokens, "the net figure keeps the re-prefill cost visible");
+	assert.match(renderCleanupCandidates(plan), /net ~\d+/);
+	assert.match(renderCleanupCandidates(plan), /\d+ tok after the break/);
+});
+
+test("a range whose break never pays back inside the run is not suggested", () => {
+	// With r = 0.1 the break costs ~0.9 × 5.7k of suffix to save ~230 a turn:
+	// ~22 turns of payback, longer than the assumed horizon.
+	const notWorthIt = [
+		record("0", "user", "Protected task.", { protected: true }),
+		record("1", "assistant", "anchor block"),
+		record("2", "user", "An old request."),
+		record("3", "assistant", "A".repeat(8_000)),
+		record("4", "user", `${"D".repeat(20_000)} open turn`),
+	];
+	const plan = planCleanupTrigger(notWorthIt, { completedTurns: 1 }, { completedTurns: 1 });
+	assert.equal(plan.triggered, true);
+	assert.deepEqual(plan.candidates, [], "a trigger that only finds loss-making edits must say nothing");
+	assert.equal(plan.savingsTokens, 0);
+	assert.equal(renderCleanupCandidates(plan), "");
+});
+
+test("with no cache discount (r = 1) the break costs nothing, as on GLM-5", () => {
+	// Same context, two endpoints: at r = 0.1 only the tail turn pays back; at
+	// r = 1 the old 8k turn is worth deleting too, because no suffix is re-priced.
+	const cached = planCleanupTrigger(breakpointRecords(), { completedTurns: 4 }, {
+		completedTurns: 1,
+		maxCandidates: 3,
+	});
+	const uncached = planCleanupTrigger(breakpointRecords(), { completedTurns: 4 }, {
+		completedTurns: 1,
+		maxCandidates: 3,
+		cacheDiscount: 1,
+	});
+	assert.deepEqual(cached.candidates.map((candidate) => [candidate.start, candidate.end]), [[6, 7]]);
+	assert.ok(
+		uncached.candidates.some((candidate) => candidate.start === 2 && candidate.end === 3),
+		"r = 1 makes a break that loses money under caching profitable",
+	);
+	const old = uncached.candidates.find((candidate) => candidate.start === 2);
+	assert.ok(old !== undefined);
+	assert.equal(old.netTokens, old.tokens, "an uncached endpoint pays nothing for the break");
 });
 
 test("cleanup trigger signals are labelled and an estimated usage keeps the ~ marker", () => {
@@ -102,7 +178,7 @@ test("cleanup trigger signals are labelled and an estimated usage keeps the ~ ma
 	assert.ok(mixed.signals.some((signal) => signal.startsWith("toolResult ") && signal.endsWith("% ≥ 50%")));
 });
 
-test("cleanup candidates rank by reclaimable tokens times staleness", () => {
+test("cleanup candidates fall back to freed tokens then staleness when the break is free", () => {
 	const sized = [
 		record("0", "user", "protected", { protected: true }),
 		record("1", "assistant", "anchor block"),
@@ -119,6 +195,9 @@ test("cleanup candidates rank by reclaimable tokens times staleness", () => {
 	}, {
 		usagePercent: 1,
 		maxCandidates: 1,
+		// r = 1 keeps the tie-break legible: no suffix is priced, so the biggest
+		// range wins and staleness only breaks ties.
+		cacheDiscount: 1,
 	});
 	assert.equal(plan.triggered, true);
 	// 5 is far larger than 3, so savings beat the extra turn of staleness.

@@ -728,6 +728,8 @@ test("plan §5.2 (case 11): usage line and cleanup candidates follow host usage 
 		"CLM_TRIGGER_TURNS",
 		"CLM_TRIGGER_TOOL_RATIO",
 		"CLM_TRIGGER_SINCE",
+		"CLM_CACHE_DISCOUNT",
+		"CLM_CACHE_PAYBACK_TURNS",
 	] as const;
 	const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
 	for (const key of envKeys) delete process.env[key];
@@ -811,7 +813,7 @@ test("plan §5.2 (case 11): usage line and cleanup candidates follow host usage 
 			triggered,
 			/Suggested cleanup \(usage 80% ≥ 70%\): cleanup\(\{ ranges: \["3-5"\], skipRoles: \["user"\] \}\) frees ~\d+ tok\./,
 		);
-		assert.match(triggered, /3-5 \(~\d+ tok, 1 turn old\); block 1, user messages, and the current turn stay\./);
+		assert.match(triggered, /3-5 \(~\d+ tok freed, 1 turn old, \d+ tok after the break, net ~\d+\); block 1, user messages, and the current turn stay\./);
 		// The suggested call must keep the human's request inside its own range:
 		// a bare range would delete the user block that starts the turn.
 		const userBlock = buildDshMirrorRecords(session, bridgeOptions(String(session.id)))

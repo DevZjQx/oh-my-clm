@@ -17,7 +17,7 @@ import {
  * This module is pure: it takes records plus already-collected numbers, so the
  * Pi and DSH adapters can feed the same planner from their own hosts.
  */
-export interface CleanupTriggerOptions {
+export interface CleanupTriggerOptions extends CleanupCandidateOptions {
 	/** Fires when usage reaches this percentage of the window. 0 disables. */
 	usagePercent?: number;
 	/** Fires when this many turns have completed. 0 disables. */
@@ -26,10 +26,6 @@ export interface CleanupTriggerOptions {
 	toolResultShare?: number;
 	/** Fires when this many turns have elapsed since the last applied cleanup. 0 disables. */
 	turnsSinceCleanup?: number;
-	/** Maximum candidate ranges named in one trigger. Defaults to 3. */
-	maxCandidates?: number;
-	/** Completed turns smaller than this are never suggested. Defaults to 0. */
-	minSavingsTokens?: number;
 }
 
 export interface CleanupTriggerContext {
@@ -57,9 +53,20 @@ export interface CleanupCandidate {
 	 */
 	tokens: number;
 	/**
+	 * Tokens after the first removed block, which lose their cached prefix and
+	 * are re-priced at `1−r` when the range is applied. This is the `B` of the
+	 * cost formula, not the deletion size (prefix-breakpoint note, §1).
+	 */
+	suffixTokens: number;
+	/**
+	 * `r·tokens − (1−r)·suffixTokens / paybackTurns`: what the range saves per
+	 * turn, with the one-time break amortised over the remaining run. Negative
+	 * candidates are never suggested.
+	 */
+	netTokens: number;
+	/**
 	 * Turns elapsed since this one settled: the newest completed turn is `1`, so
-	 * the recency weight never zeroes out a recent turn's savings. Second half of
-	 * the ranking.
+	 * the recency weight never zeroes out a recent turn's savings. Final tie-break.
 	 */
 	turnsOld: number;
 }
@@ -137,7 +144,29 @@ export interface CleanupCandidateOptions {
 	maxCandidates?: number;
 	/** Completed turns smaller than this are never suggested. Defaults to 0. */
 	minSavingsTokens?: number;
+	/**
+	 * `r` in `cost ≈ r·L + (1−r)·B`: the cache-read price as a fraction of the
+	 * full input price. Defaults to 0.1 (DeepSeek's order of magnitude); it is a
+	 * per-endpoint constant, not a universal one, so it stays configurable.
+	 */
+	cacheDiscount?: number;
+	/**
+	 * Turns the one-time break cost is amortised over: `N` in
+	 * `N ≈ (1−r)·S / (r·ΔL)`. A break is only worth it if the run outlives its
+	 * payback, so a shorter horizon demands a cheaper break. Defaults to 10.
+	 */
+	paybackTurns?: number;
 }
+
+/** Ratio the notes use for DeepSeek; other endpoints differ (1/10 ~ 1/30). */
+export const DEFAULT_CACHE_DISCOUNT = 0.1;
+
+/**
+ * Uncalibrated long-run assumption, in the same spirit as the trigger
+ * thresholds: set `1` to price only the turn in front of you, raise it when the
+ * measured run length is longer. It is a placeholder, not a measurement.
+ */
+export const DEFAULT_PAYBACK_TURNS = 10;
 
 /**
  * The candidate half of a trigger, without the threshold decision. The Pi
@@ -155,25 +184,59 @@ export function assembleCleanupCandidates(
 ): { candidates: CleanupCandidate[]; savingsTokens: number } {
 	const maxCandidates = Math.max(1, Math.floor(options.maxCandidates ?? DEFAULT_MAX_CANDIDATES));
 	const minSavings = Math.max(0, Math.floor(options.minSavingsTokens ?? 0));
+	const rawDiscount = options.cacheDiscount ?? DEFAULT_CACHE_DISCOUNT;
+	// `r` is a price ratio: outside [0, 1] it is not a discount, it is a typo.
+	const discount = Number.isFinite(rawDiscount) ? Math.min(1, Math.max(0, rawDiscount)) : DEFAULT_CACHE_DISCOUNT;
+	const rawPayback = options.paybackTurns ?? DEFAULT_PAYBACK_TURNS;
+	const paybackTurns = Number.isFinite(rawPayback) ? Math.max(1, Math.floor(rawPayback)) : DEFAULT_PAYBACK_TURNS;
 	const units = buildBlockDigestUnits(records);
-	const completed = units.filter((unit) => !unit.open);
+	const unitTokens = units.map((unit) => estimateMirrorTokens(unit.records));
+
+	// Tokens behind the first block each range would remove: `B` in
+	// `r·L + (1−r)·B`. The keep-rule leaves user blocks in place, so the break
+	// starts at the first block the call actually rewrites or drops.
+	const suffixWithinUnit = units.map((unit) => {
+		const firstRemoved = unit.records.findIndex((record) => record.role !== "user");
+		const afterBreak = firstRemoved < 0 ? unit.records.length : firstRemoved + 1;
+		return estimateMirrorTokens(unit.records.slice(afterBreak));
+	});
+	// Running total from the end: one pass, so the ranking stays linear in turns.
+	const suffixTokensAt: number[] = [];
+	let laterTokens = 0;
+	for (let index = units.length - 1; index >= 0; index -= 1) {
+		suffixTokensAt[index] = laterTokens + (suffixWithinUnit[index] ?? 0);
+		laterTokens += unitTokens[index] ?? 0;
+	}
+
+	const completed = units
+		.map((unit, index) => ({ unit, index }))
+		.filter(({ unit }) => !unit.open);
 	const candidates = completed
-		.map((unit, index) => ({
+		.map(({ unit, index }, position) => ({
 			start: unit.start,
 			end: unit.end,
 			// The keep-rule is part of the suggestion, so the figure the model reads
 			// must already exclude what the rule preserves. A turn that is nothing
 			// but a user message therefore scores 0 and is dropped below.
 			tokens: estimateMirrorTokens(unit.records.filter((record) => record.role !== "user")),
+			suffixTokens: suffixTokensAt[index] ?? 0,
 			// Counted from the end of the completed list, so the ranking is the
 			// same whether the open turn exists or not.
-			turnsOld: completed.length - index,
+			turnsOld: completed.length - position,
+		}))
+		.map((candidate) => ({
+			...candidate,
+			netTokens: Math.round(discount * candidate.tokens - ((1 - discount) * candidate.suffixTokens) / paybackTurns),
 		}))
 		.filter((candidate) => candidate.start > 1)
 		.filter((candidate) => candidate.tokens > 0 && candidate.tokens >= minSavings)
-		// Savings first, then staleness: a big recent turn can beat a tiny old one,
-		// but equal sizes prefer the turn that has been paying rent the longest.
-		.sort((a, b) => b.tokens * b.turnsOld - a.tokens * a.turnsOld
+		// A range that costs more to break than it frees is not a candidate for a
+		// cheaper context; suggesting it would make the model do the wrong thing
+		// confidently (prefix-breakpoint note, §7).
+		.filter((candidate) => candidate.netTokens > 0)
+		// Rent is paid at the discounted price, so net savings lead the ranking. A
+		// big old turn only wins when its break is genuinely cheap (or `r ≈ 1`).
+		.sort((a, b) => b.netTokens - a.netTokens
 			|| b.tokens - a.tokens
 			|| b.turnsOld - a.turnsOld)
 		.slice(0, maxCandidates);
@@ -250,7 +313,7 @@ export function renderCleanupCandidates(plan: CleanupTriggerPlan): string {
 	const skipRoles = JSON.stringify([...CANDIDATE_SKIP_ROLES]);
 	const head = `Suggested cleanup (${plan.signals.join("; ")}): cleanup({ ranges: [${ranges.join(", ")}], skipRoles: ${skipRoles} }) frees ~${plan.savingsTokens} tok.`;
 	const detail = `Candidates: ${plan.candidates
-		.map((candidate) => `${candidateRange(candidate)} (~${candidate.tokens} tok, ${candidate.turnsOld} turn${candidate.turnsOld === 1 ? "" : "s"} old)`)
+		.map((candidate) => `${candidateRange(candidate)} (~${candidate.tokens} tok freed, ${candidate.turnsOld} turn${candidate.turnsOld === 1 ? "" : "s"} old, ${candidate.suffixTokens} tok after the break, net ~${candidate.netTokens})`)
 		.join(", ")}; block 1, user messages, and the current turn stay.`;
 	return `${head}\n${detail}`;
 }
