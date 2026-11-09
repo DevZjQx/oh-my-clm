@@ -9,10 +9,12 @@ import {
 } from "./context-cleanup.ts";
 import {
 	buildMirrorRecords,
+	calibrateWithHostUsage,
 	DEFAULT_MAX_BLOCK_CHARS,
 	DEFAULT_MAX_MIRROR_CHARS,
 	estimateMessageTokens,
 	estimateMirrorTokens,
+	hostUsageOf,
 	mirrorSignature,
 	parseMirror,
 	planContextEdits,
@@ -23,6 +25,7 @@ import {
 	type ContextEditDraft,
 	type ContextEditProvenance,
 	type EditPlan,
+	type HostUsage,
 	type MirrorRecord,
 	type ProjectionEntryLike,
 } from "./context-format.ts";
@@ -91,6 +94,8 @@ export interface DshBridgeOptions {
 	maxMirrorChars?: number;
 	/** Approximate fixed request tokens used by the shrink-only gate. */
 	fixedTokens?: number;
+	/** Host-reported exact usage for estimate + host-cap double checking (P1-2). */
+	hostUsage?: HostUsage;
 	/** How much of the cleanup tool result is copied into model context. */
 	cleanupResult?: CleanupResultCopy;
 	/** Preview/head/tail budget for the model-facing block index. */
@@ -603,8 +608,17 @@ function applyDshContextEdits(
 		}
 	}
 
-	const before = fixedTokens(options) + estimateMirrorTokens(records);
-	const after = fixedTokens(options) + estimateAfterMutation(records, actions);
+	const estimatedBefore = fixedTokens(options) + estimateMirrorTokens(records);
+	const estimatedAfter = fixedTokens(options) + estimateAfterMutation(records, actions);
+	let before = estimatedBefore;
+	let after = estimatedAfter;
+	const hostUsage = hostUsageOf(options.hostUsage);
+	if (hostUsage) {
+		const calibrated = calibrateWithHostUsage(estimatedBefore, estimatedAfter, hostUsage);
+		before = calibrated.beforeTokens;
+		after = calibrated.afterTokens;
+		if (calibrated.reason) return rejectMutation(calibrated.reason, before, after);
+	}
 	if (after >= before) {
 		return rejectMutation(
 			"A DSH surface mutation must SHRINK context; replace stale text with a shorter summary instead.",
@@ -664,7 +678,10 @@ export function executeDshCleanup(
 			maxPreviewChars: options.blockIndex?.maxPreviewChars,
 		});
 	}
-	const plan = planCleanup(records, cleanupMirrorForRecords(records), targets, { fixedTokens: options.fixedTokens });
+	const plan = planCleanup(records, cleanupMirrorForRecords(records), targets, {
+		fixedTokens: options.fixedTokens,
+		hostUsage: options.hostUsage,
+	});
 	if (plan.status !== "applied") {
 		const index = copy === "full" ? renderDshBlockIndex(session, options) : undefined;
 		return cleanupToolResult(plan, index, copy);
@@ -747,6 +764,7 @@ export function reconcileDshMirror(
 		candidatePlan = planContextEdits(previous.records, parseMirror(current), {
 			allowGrowth: false,
 			fixedTokens: options.fixedTokens,
+			hostUsage: options.hostUsage,
 		});
 		state.lastProcessedMirror = current;
 	}

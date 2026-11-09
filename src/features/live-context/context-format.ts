@@ -214,6 +214,61 @@ export interface EditPlan {
 	reason?: string;
 }
 
+/**
+ * Exact context usage reported by the host runtime. `tokens` is the whole
+ * current request (system prompt, tools, messages), not an estimate of the
+ * editable mirror alone; `contextWindow` is the provider's real window.
+ */
+export interface HostUsage {
+	tokens: number;
+	contextWindow: number;
+}
+
+/**
+ * Share of the host window kept free before any write is approved. The shared
+ * 3.5 chars/token estimate is not a provider tokenizer (README), so at high
+ * occupancy a small estimated shrink is not evidence that the next request
+ * fits; this leaves room for the response and estimator error. Calibrate on
+ * real V4.1-Flash sessions (docs/plan.md §5.0) instead of copying a model's
+ * threshold from elsewhere.
+ */
+export const HOST_CAP_HEADROOM = 0.05;
+
+/** Validate an untrusted host usage value before it replaces an estimate. */
+export function hostUsageOf(value: unknown): HostUsage | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const { tokens, contextWindow } = value as { tokens?: unknown; contextWindow?: unknown };
+	if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0) return undefined;
+	if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) return undefined;
+	return { tokens: Math.ceil(tokens), contextWindow: Math.ceil(contextWindow) };
+}
+
+export interface HostUsageCalibration {
+	beforeTokens: number;
+	afterTokens: number;
+	reason?: string;
+}
+
+/**
+ * Calibrate an estimated before/after pair against the host's exact usage.
+ * The estimate is trusted only for the signed delta; the baseline and the hard
+ * cap come from the host. A rejection reason is returned when the calibrated
+ * post-edit usage still leaves no safe headroom.
+ */
+export function calibrateWithHostUsage(
+	beforeEstimate: number,
+	afterEstimate: number,
+	hostUsage: HostUsage,
+): HostUsageCalibration {
+	const beforeTokens = hostUsage.tokens;
+	const afterTokens = Math.max(0, beforeTokens + (afterEstimate - beforeEstimate));
+	const safeCap = hostUsage.contextWindow * (1 - HOST_CAP_HEADROOM);
+	const reason = afterTokens > safeCap
+		? `Host context usage is ~${beforeTokens}/${hostUsage.contextWindow} tokens; the calibrated post-edit usage (~${afterTokens}) still exceeds the safe cap (~${Math.floor(safeCap)}). The 3.5 chars/token estimate is not a provider tokenizer — free more context with a larger cleanup before rewriting.`
+		: undefined;
+	return { beforeTokens, afterTokens, reason };
+}
+
 export interface EditPlanOptions {
 	/** `true` means fit-gate behavior; `false` means shrink-gate behavior. */
 	allowGrowth?: boolean;
@@ -225,6 +280,8 @@ export interface EditPlanOptions {
 	rejectUnknownIds?: boolean;
 	/** Allow replacing user-authored content; omission remains possible by default. */
 	allowUserReplacement?: boolean;
+	/** Host-reported exact usage for estimate + host-cap double checking (P1-2). */
+	hostUsage?: HostUsage;
 }
 
 export interface MirrorBuildOptions {
@@ -1155,7 +1212,8 @@ export function planContextEdits(
 	const fixedTokens = typeof options.fixedTokens === "number" && Number.isFinite(options.fixedTokens) && options.fixedTokens >= 0
 		? Math.ceil(options.fixedTokens)
 		: 0;
-	const beforeTokens = fixedTokens + estimateMirrorTokens(records);
+	const estimatedBefore = fixedTokens + estimateMirrorTokens(records);
+	let beforeTokens = estimatedBefore;
 	if (!parsed.recognized) {
 		return {
 			status: "rejected",
@@ -1423,12 +1481,31 @@ export function planContextEdits(
 		};
 	}
 
-	const afterTokens = fixedTokens + records.reduce((total, record) => {
+	const estimatedAfter = fixedTokens + records.reduce((total, record) => {
 		const action = actions.get(record.id) ?? { kind: "keep" as const };
 		if (action.kind === "omit") return total;
 		const text = action.kind === "replace" ? action.body ?? "" : record.text;
 		return total + estimateRecordTokens(record, text);
 	}, 0);
+	let afterTokens = estimatedAfter;
+	const hostUsage = hostUsageOf(options.hostUsage);
+	if (hostUsage) {
+		const calibrated = calibrateWithHostUsage(estimatedBefore, estimatedAfter, hostUsage);
+		beforeTokens = calibrated.beforeTokens;
+		afterTokens = calibrated.afterTokens;
+		if (calibrated.reason) {
+			return {
+				status: "rejected",
+				edits: [],
+				beforeTokens,
+				afterTokens,
+				changedIds: changed.map((record) => record.id),
+				omittedIds: changed.filter((record) => actions.get(record.id)?.kind === "omit").map((record) => record.id),
+				warnings,
+				reason: calibrated.reason,
+			};
+		}
+	}
 	const allowGrowth = options.allowGrowth ?? true;
 	const budgetTokens = options.budgetTokens ?? 0;
 	if (!allowGrowth && afterTokens >= beforeTokens) {

@@ -4,11 +4,14 @@ import {
 	PRESERVE_FIRST_BLOCK_REASON,
 	loadBearingRecord,
 	mirrorFingerprint,
+	calibrateWithHostUsage,
 	estimateMirrorTokens,
+	hostUsageOf,
 	renderBlockList,
 	scanMirrorBlocks,
 	type ContextEditDraft,
 	type EditPlan,
+	type HostUsage,
 	type MirrorRecord,
 	type MirrorRole,
 } from "./context-format.ts";
@@ -97,6 +100,8 @@ export interface CleanupPlanOptions {
 	fixedTokens?: number;
 	/** Keep the first visible editable block as a load-bearing anchor. */
 	preserveFirstBlock?: boolean;
+	/** Host-reported exact usage for estimate + host-cap double checking (P1-2). */
+	hostUsage?: HostUsage;
 }
 
 interface DisplayRecord {
@@ -523,10 +528,19 @@ export function planCleanup(
 	}
 
 	const omitted = records.filter((record) => actions.has(record.id));
-	const beforeTokens = fixedTokens(options) + estimateMirrorTokens(records);
-	const afterTokens = fixedTokens(options) + records.reduce((total, record) => {
+	const estimatedBefore = fixedTokens(options) + estimateMirrorTokens(records);
+	const estimatedAfter = fixedTokens(options) + records.reduce((total, record) => {
 		return actions.has(record.id) ? total : total + estimateMirrorTokens([record]);
 	}, 0);
+	let beforeTokens = estimatedBefore;
+	let afterTokens = estimatedAfter;
+	const hostUsage = hostUsageOf(options.hostUsage);
+	if (hostUsage) {
+		const calibrated = calibrateWithHostUsage(estimatedBefore, estimatedAfter, hostUsage);
+		beforeTokens = calibrated.beforeTokens;
+		afterTokens = calibrated.afterTokens;
+		if (calibrated.reason) return rejectPlan(args.args.blockIds, calibrated.reason, beforeTokens);
+	}
 	if (afterTokens >= beforeTokens) {
 		return rejectPlan(
 			args.args.blockIds,

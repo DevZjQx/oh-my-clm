@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import { CLM_MIRROR_FILENAME, CLM_TEMP_ROOT, sessionMirrorPath, } from "../src/lib/clm-paths.js";
 import { writePrivateText } from "../src/lib/clm-files.js";
 import { buildDshMirrorRecords, dshBlockIndexText, dshOpenTurnStep, executeDshCleanup, reconcileDshMirror, } from "../src/features/live-context/dsh-bridge.js";
-import { DEFAULT_BLOCK_INDEX_HEAD, DEFAULT_BLOCK_INDEX_PREVIEW_CHARS, DEFAULT_BLOCK_INDEX_TAIL, DEFAULT_DIGEST_MAX_LINES, estimateMirrorTokens, renderMirror, } from "../src/features/live-context/context-format.js";
+import { DEFAULT_BLOCK_INDEX_HEAD, DEFAULT_BLOCK_INDEX_PREVIEW_CHARS, DEFAULT_BLOCK_INDEX_TAIL, DEFAULT_DIGEST_MAX_LINES, estimateMirrorTokens, hostUsageOf, renderMirror, } from "../src/features/live-context/context-format.js";
 import { formatCleanupToolResult, parseCleanupArgs, parseCleanupResultCopy, } from "../src/features/live-context/context-cleanup.js";
 export const name = "oh-my-clm";
 const PROMPT_SECTION = "oh-my-clm:live-context";
@@ -80,6 +80,50 @@ Block 1 and the initial task are protected. At a subtask boundary, use one \`cle
 function cleanupResultCopy() {
     return parseCleanupResultCopy(process.env.CLM_CLEANUP_RESULT);
 }
+/** Process-scoped host Context, like indexModeOverride; set by apply(). */
+let activeContext;
+/**
+ * Exact usage from the DSH host's projection service. dsh-context reads the
+ * same kernel values via `sessionProjections.snapshot(session, KERNEL_KEYS)`
+ * (KERNEL_KEYS = sessionStats / tokenUsage / contextBreakdown); the official
+ * contextPressure projection carries contextWindow. Prompt tokens are the two
+ * input billing buckets per docs/plan.md §5.2 — outputTokens is not part of
+ * the context window, and cacheWriteTokens is a subset of the uncached bucket.
+ * Any missing or invalid shape returns undefined, so the fallback is labelled
+ * `~` instead of being passed off as exact.
+ */
+function hostUsageFor(session) {
+    const projections = activeContext?.sessionProjections;
+    if (typeof projections?.snapshot !== "function")
+        return undefined;
+    let block;
+    try {
+        block = projections.snapshot(session, ["tokenUsage", "contextPressure", "sessionStats"]);
+    }
+    catch {
+        return undefined;
+    }
+    if (typeof block !== "object" || block === null)
+        return undefined;
+    const values = block.values;
+    if (typeof values !== "object" || values === null)
+        return undefined;
+    const record = values;
+    const usage = record.tokenUsage;
+    if (typeof usage !== "object" || usage === null)
+        return undefined;
+    const inputTokens = usage;
+    const bucket = (value) => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+    const tokens = bucket(inputTokens.cacheReadTokens) + bucket(inputTokens.uncachedInputTokens);
+    const pressure = record.contextPressure;
+    const stats = record.sessionStats;
+    const windowCandidate = pressure?.contextWindow ?? stats?.contextWindow;
+    const configuredWindow = positiveEnv("CLM_CONTEXT_WINDOW", 0);
+    const contextWindow = typeof windowCandidate === "number" && windowCandidate > 0
+        ? windowCandidate
+        : (configuredWindow > 0 ? configuredWindow : undefined);
+    return hostUsageOf({ tokens, contextWindow });
+}
 function optionsFor(session) {
     const sessionId = String(session.id);
     const mirrorPath = sessionMirrorPath(sessionId);
@@ -89,6 +133,7 @@ function optionsFor(session) {
         maxBlockChars: positiveEnv("CLM_MAX_BLOCK_CHARS", 12_000),
         maxMirrorChars: positiveEnv("CLM_MAX_MIRROR_CHARS", 96_000),
         fixedTokens: positiveEnv("CLM_CONTEXT_FIXED_TOKENS", 0),
+        hostUsage: hostUsageFor(session),
         cleanupResult: cleanupResultCopy(),
         indexMode: indexMode(),
         blockIndex: {
@@ -244,6 +289,9 @@ function dshStatusText(session, options) {
         `protected blocks: ${records.length - editable.length}`,
         `mirror preview: ~${previewTokens} tokens; canonical editable: ~${canonicalTokens} tokens`,
         `estimated request: ~${fixedTokens + canonicalTokens} tokens (fixed request ~${fixedTokens} + editable mirror ~${canonicalTokens})`,
+        options.hostUsage
+            ? `DSH tokenUsage: ${options.hostUsage.tokens}/${options.hostUsage.contextWindow} tokens (host-exact; the 3.5 chars/token estimate is used only for the edit delta)`
+            : "DSH tokenUsage: unavailable; the shrink gate falls back to the ~ estimate",
         `DSH surface nodes: ${session.surface.nodes.length}`,
         `block index: ${options.indexMode ?? "blocks"}`,
         "edit policy: shrink-only",
@@ -345,9 +393,14 @@ function enqueueReconcile(ctx, session, state, queues, isActive) {
  * does not duplicate the DSH tool matrix or write unknown session events.
  */
 export function apply(ctx) {
+    activeContext = ctx;
     const states = new Map();
     const queues = new WeakMap();
-    ctx.effect?.(() => () => states.clear(), "oh-my-clm.state");
+    ctx.effect?.(() => () => {
+        states.clear();
+        if (activeContext === ctx)
+            activeContext = undefined;
+    }, "oh-my-clm.state");
     ctx.systemPrompt?.section({
         name: PROMPT_SECTION,
         order: ctx.systemPrompt.getSectionOrder?.("TOOL_EDIT") ?? DEFAULT_ORDER,

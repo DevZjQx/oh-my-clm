@@ -773,6 +773,48 @@ test("plan §3.3 (P1-2): a language swap that grows real tokens is rejected unde
 	assert.equal(plan.status, "rejected", "a shrink-only gate must not be bypassed by switching scripts");
 });
 
+// docs/plan.md §5.1 实施记录 / P1-2: "进入 5.2 前须先补 P1-2 的宿主 usage
+// 校准"，否则 5.2 的触发与计价不成立。当前 shrink 门只看 3.5 chars/token
+// 估算 (context-format.ts:922)；ctx.getContextUsage() 的精确 tokens 仅出现在
+// status 文本里 (extensions/clm.ts:189)，从未进入编辑规划层。以下断言描述
+// 期望行为，当前必然为红：`hostUsage` 是约定的规格形状（宿主精确用量 +
+// 真实窗口），实现时按此把 usage 送进规划层；① 它必须校准 beforeTokens，
+// ② 用量贴住宿主窗口上限时，即便估算判定 shrink 也必须拒绝（估算 + 上限
+// 双检）。DSH 侧 cacheReadTokens / uncachedInputTokens 走同一通道。
+test("plan §5.1 gate (P1-2): host usage calibrates the shrink gate and fails closed at the window cap", () => {
+	const projected = buildMirrorRecords([
+		{
+			sourceEntry: { id: "task", type: "message" },
+			messages: [{ role: "user", content: "Task" }],
+		},
+		{
+			sourceEntry: { id: "body", type: "message" },
+			messages: [{ role: "assistant", content: [{ type: "text", text: "a".repeat(400) }] }],
+		},
+	]);
+	const edited = renderMirror(projected).replace("a".repeat(400), "a".repeat(100));
+	const parsed = parseMirror(edited);
+
+	// Baseline: the 3.5 chars/token estimate alone calls this a shrink and applies it.
+	const estimated = planContextEdits(projected, parsed, { allowGrowth: false });
+	assert.equal(estimated.status, "applied", "the estimate alone accepts this shrink");
+
+	const hostUsage = { tokens: 9_800, contextWindow: 10_000 };
+	const options = { allowGrowth: false, hostUsage } as unknown as Parameters<typeof planContextEdits>[2];
+	const calibrated = planContextEdits(projected, parsed, options);
+
+	assert.equal(
+		calibrated.beforeTokens,
+		hostUsage.tokens,
+		"the host's exact usage must calibrate beforeTokens instead of the 3.5 chars/token estimate",
+	);
+	assert.equal(
+		calibrated.status,
+		"rejected",
+		"an edit must be rejected when the host reports a nearly full real context window (estimate + host-cap double check)",
+	);
+});
+
 // §3 case 4a / P1-3: an untrusted body cannot forge a privileged source claim.
 test("plan §3.4a (P1-3): a model-written body cannot forge a trusted source", () => {
 	const forged = renderMirror(records).replace(

@@ -1,4 +1,4 @@
-import { MIRROR_HEADER, MIRROR_VERSION, PRESERVE_FIRST_BLOCK_REASON, loadBearingRecord, mirrorFingerprint, estimateMirrorTokens, renderBlockList, scanMirrorBlocks, } from "./context-format.js";
+import { MIRROR_HEADER, MIRROR_VERSION, PRESERVE_FIRST_BLOCK_REASON, loadBearingRecord, mirrorFingerprint, calibrateWithHostUsage, estimateMirrorTokens, hostUsageOf, renderBlockList, scanMirrorBlocks, } from "./context-format.js";
 const SNAPSHOT_PATTERN = /^<!-- CLM_SNAPSHOT ([a-f0-9]{16}) -->$/;
 const EMPTY_MARKER = "<!-- CLM_EMPTY -->";
 /** Widest inclusive range a single cleanup call may expand to. */
@@ -362,10 +362,20 @@ export function planCleanup(records, parsed, requested, options = {}) {
         }
     }
     const omitted = records.filter((record) => actions.has(record.id));
-    const beforeTokens = fixedTokens(options) + estimateMirrorTokens(records);
-    const afterTokens = fixedTokens(options) + records.reduce((total, record) => {
+    const estimatedBefore = fixedTokens(options) + estimateMirrorTokens(records);
+    const estimatedAfter = fixedTokens(options) + records.reduce((total, record) => {
         return actions.has(record.id) ? total : total + estimateMirrorTokens([record]);
     }, 0);
+    let beforeTokens = estimatedBefore;
+    let afterTokens = estimatedAfter;
+    const hostUsage = hostUsageOf(options.hostUsage);
+    if (hostUsage) {
+        const calibrated = calibrateWithHostUsage(estimatedBefore, estimatedAfter, hostUsage);
+        beforeTokens = calibrated.beforeTokens;
+        afterTokens = calibrated.afterTokens;
+        if (calibrated.reason)
+            return rejectPlan(args.args.blockIds, calibrated.reason, beforeTokens);
+    }
     if (afterTokens >= beforeTokens) {
         return rejectPlan(args.args.blockIds, "Cleanup must strictly shrink the estimated context; no safe cleanup was applied.", beforeTokens);
     }

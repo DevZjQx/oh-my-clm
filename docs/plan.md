@@ -1,8 +1,8 @@
 # 审查整改计划（oh-my-clm 0.1.12）
 
-> 追加（2026-11-09）：§5 新增「让 DeepSeek-V4.1-Flash 主动清理上下文」方向，六步按 1~6 顺序排期；**5.1 已实施**（用例 10 红灯转绿），5.2~5.6 尚未实施；§1~§4 的结论不变。
+> 追加（2026-11-09）：§5 新增「让 DeepSeek-V4.1-Flash 主动清理上下文」方向，六步按 1~6 顺序排期；**5.1 已实施**（用例 10 红灯转绿），**P1-2 的宿主 usage 校准 + 上限双检已补**（5.2 前置，见 §1 P1-2 实施记录），5.2~5.6 尚未实施；§1~§4 的结论不变。
 > 状态：评审草稿 / 整改已完成（验收部分）
-> 整改状态（2026-11-09）：§3 的 11 条回归用例，以及一次推送前复核新增的 5 条回归（P1-1 守卫收窄 4 条、I-2 触顶重置 1 条）全部转绿（`npm test` 114/114、`npm run check`、`npm run typecheck` 通过），生产代码与文档已同步；逐项说明见 `changelog.md` 的「0.1.13（当前版本）」。**回归用例转绿不等于第 1 节打回项全部结案**：P1-2 的「宿主 usage 校准 + 估算/上限双检」、P1-3 的「编辑 diff/审计/最小回滚、审批/签名」仍未实现（P1-3 只落地了运行时来源标签 + 显式保留字黑名单，不是对任意注入指令的内容审计）；§2 改进项中 I-1、I-2 已修，I-3~I-9 及「规则外清单」（安全姿态、真实宿主行为、撤除试验、维护代价）仍需人工复核 / 排期。
+> 整改状态（2026-11-09）：§3 的 11 条回归用例，以及一次推送前复核新增的 5 条回归（P1-1 守卫收窄 4 条、I-2 触顶重置 1 条）全部转绿（`npm test` 114/114、`npm run check`、`npm run typecheck` 通过），生产代码与文档已同步；逐项说明见 `changelog.md` 的「0.1.13（当前版本）」。**回归用例转绿不等于第 1 节打回项全部结案**：P1-2 的「宿主 usage 校准 + 估算/上限双检」已实现（2026-11-09，Pi `getContextUsage()` 与 DSH `sessionProjections` 的 `tokenUsage` / `contextPressure` 进入共享门；`npm test` 118/118），§5.2 的用量行与候选触发仍未做；P1-3 的「编辑 diff/审计/最小回滚、审批/签名」仍未实现（P1-3 只落地了运行时来源标签 + 显式保留字黑名单，不是对任意注入指令的内容审计）；§2 改进项中 I-1、I-2 已修，I-3~I-9 及「规则外清单」（安全姿态、真实宿主行为、撤除试验、维护代价）仍需人工复核 / 排期。
 > 审查对象：当前 checkout（`package.json` 0.1.12，HEAD `b14b187`）
 > 依据：`http://127.0.0.1:3080/dsh-zdiary-kit/view` 的 101 篇笔记（只读知识库，**仅作参考，不作准**）、本仓库源码与文档、仓库自带的 CLM 自评表。
 > 自动化基线：`npm test` 98/98 通过、`npm run check` 通过、`npm run typecheck` 通过。
@@ -34,6 +34,7 @@
   - 删除一个字符串正文的 assistant block：`before/after` 相同（都计 0）→ 合法清理被 `A compaction must SHRINK context` 误拒。
 - **要求**：优先用宿主精确数据（Pi `ctx.getContextUsage()`、DSH 的 `cacheReadTokens` / `uncachedInputTokens` 与 `usage`）校准；至少补 CJK 感知估算、修复 assistant 字符串正文为 0 的分支，并把安全门从"近似估算"降级为"估算 + 宿主上限双检"。
 - **验收**：补跨语种、assistant 字符串正文、图片/toolCall 形状的估算测试；新增"换语种增长"与"删除 0-token 块误拒"两条回归；README 明确估算不是 provider tokenizer。
+- **实施记录（2026-11-09）**：`EditPlanOptions.hostUsage` / `CleanupPlanOptions.hostUsage` 与共享的 `calibrateWithHostUsage` 已落地——估算只保留有符号 delta，`beforeTokens` 与硬上限取自宿主精确值；校准后编辑用量仍高于窗口的 95%（`HOST_CAP_HEADROOM`，待 V4.1-Flash 会话标定）即拒绝，大 cleanup 能把用量降到水位以下则放行，避免高水位死锁。Pi 从 `ctx.getContextUsage()` 采集；DSH 从 `sessionProjections.snapshot(session, keys)` 的 `tokenUsage`（`cacheReadTokens + uncachedInputTokens`）与 `contextPressure.contextWindow` 采集，服务缺失时 status 显式标 `~` 降级；`CLM_CONTEXT_WINDOW` 作为窗口兜底。`planContextEdits`、`planCleanup` 与 DSH 的 mutation 门共用同一函数。新增红灯用例（`plan §5.1 gate (P1-2)`）先红后绿，另有 DSH 采集链路测试；`npm test` 118/118、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
 
 ### P1-3 写权限 = 安全边界，但缺写入时溯源 / 分区 / diff / 回滚；仓库自评表已承认
 
@@ -181,11 +182,11 @@ npm pack --dry-run
   4. 保持 `test/features/live-context/dsh-bridge.test.ts` 与 `test/adapters/extension.test.ts` 的提示词长度守卫继续通过。
 - **红灯（用例 10）**：DSH 断言 `promptText()` 不含劝退句、含触发条件句、渲染长度不超上限；Pi 断言附录同口径、且不再同时出现 "do not read or print the file" 与 "rewrite only from a complete current body" 的自相矛盾。
 - **依赖 / 风险**：静态段每轮都付，新增只许一句；这是 5.2 候选的载体，必须先落地。
-- **实施记录（2026-11-09）**：用例 10 先写红灯断言并确认 `npm test` 失败，再改生产代码转绿——`dsh/index.ts` 删掉劝退句、两宿主各加一条「子任务边界用一次 `cleanup`」触发句、`extensions/clm.ts` 消掉 I-7 的自相矛盾（同时删去冗余的 "during an agent turn" 腾出 standing-tax 预算；self-read 保护仍由代码保证）。长度守卫 DSH 779/800、Pi 987/1000；`npm test` 116/116、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。**进入 5.2 前须先补 P1-2 的宿主 usage 校准**（§5.7 依赖，`CHARS_PER_TOKEN = 3.5` 仍在 `context-format.ts:922`），否则触发与计价不成立；具体用量 / 候选细节仍不进静态段。
+- **实施记录（2026-11-09）**：用例 10 先写红灯断言并确认 `npm test` 失败，再改生产代码转绿——`dsh/index.ts` 删掉劝退句、两宿主各加一条「子任务边界用一次 `cleanup`」触发句、`extensions/clm.ts` 消掉 I-7 的自相矛盾（同时删去冗余的 "during an agent turn" 腾出 standing-tax 预算；self-read 保护仍由代码保证）。长度守卫 DSH 779/800、Pi 987/1000；`npm test` 116/116、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。**进入 5.2 前须先补 P1-2 的宿主 usage 校准**——已于 2026-11-09 补齐（`CHARS_PER_TOKEN = 3.5` 仍用于估算 delta，`beforeTokens` 与硬上限改取宿主精确值；详见 §1 P1-2 实施记录）；具体用量 / 候选细节仍不进静态段。
 
 ### 5.2 代码侧触发 + 用量可见 + 候选装配（核心，DSH 先行）
 
-- **现状 / 证据**：`dsh/index.ts:205-224` 的 `blockIndexContextText` 已具备「每轮现算、只作用该轮」的动态通道，`dsh/index.ts:467-475` 是现成挂载点，**不需要新宿主能力**；但 DSH 无预算机制（`docs/features/dsh-surface-bridge.md:85`、I-2），用量只在手动 `/clm status` 里出现（`dsh/index.ts:333-355`），且是 3.5 chars/token 估算（P1-2 未结案、`README.md:180` 自承不完整）。
+- **现状 / 证据**：`dsh/index.ts:205-224` 的 `blockIndexContextText` 已具备「每轮现算、只作用该轮」的动态通道，`dsh/index.ts:467-475` 是现成挂载点，**不需要新宿主能力**；但 DSH 无预算机制（`docs/features/dsh-surface-bridge.md:85`、I-2），用量只在手动 `/clm status` 里出现（`dsh/index.ts:333-355`），且是 3.5 chars/token 估算（P1-2 的宿主校准已于 2026-11-09 补上，`options.hostUsage` 已可用；§5.2 只需把它显示出来并据此触发）。
 - **动作**：
   1. **用量可见**：动态 context 头部加一行 `~X/Y tokens (Z%) · N editable blocks · last cleanup at turn K`；X 优先取宿主真实 usage（DSH `tokenUsage` 的 `cacheReadTokens` + `uncachedInputTokens`，或 API `prompt_cache_hit/miss_tokens`），取不到才退回估算并保留 `~` 标记，绝不静默（对应《常驻记忆上限不能静默截断》Hermes 头部 "67% — 1,474/2,220 chars"）。
   2. **触发判定（代码）**：用量 ≥ 阈值、或已完成 turn 数 ≥ N、或 `toolResult` 占比超线、或距上次清理 ≥ M 个 turn，任一命中即在 **turn 边界**算一次；阈值与 Effort 档位挂钩，在 V4.1-Flash 会话上标定。
@@ -243,7 +244,7 @@ npm pack --dry-run
 | 本节步 | 关联既有项 | 关系 |
 |---|---|---|
 | 5.1 | I-7（提示词口径） | 顺手统一，不新增打回 |
-| 5.2 | I-2、I-6、P1-2 | 这三项补齐后，触发与计价才成立 |
+| 5.2 | I-2、I-6、P1-2 | I-2、P1-2 已补齐（2026-11-09）；I-6 的代价可观测仍待 5.6 |
 | 5.3 | I-2 | 双宿主一致，沿用四件套 |
 | 5.4 | I-4、P1-3 | 只解决「丢要点」，不替代 diff / 审计 / 回滚 |
 | 5.5 | I-10（规则外清单） | 新增一条需人复核的维度 |

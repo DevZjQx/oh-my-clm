@@ -2,14 +2,18 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/features/live-context-mirror.md`](./docs/features/live-context-mirror.md)。
 
+## 未发布
+
+- **宿主 usage 校准与上限双检（P1-2）。** `EditPlanOptions.hostUsage` / `CleanupPlanOptions.hostUsage` 与共享的 `calibrateWithHostUsage` 落地：估算只保留编辑前后的有符号 delta，`beforeTokens` 与硬上限取自宿主精确值；校准后编辑用量仍高于窗口 95%（`HOST_CAP_HEADROOM`，待 V4.1-Flash 会话标定）即拒绝，大 cleanup 能降到水位以下则放行，避免高水位死锁。Pi 从 `ctx.getContextUsage()` 采集；DSH 从 `sessionProjections.snapshot(session, keys)` 的 `tokenUsage`（`cacheReadTokens + uncachedInputTokens`）与 `contextPressure.contextWindow` 采集，服务缺失时 status 显式标 `~`，不静默；`CLM_CONTEXT_WINDOW` 作为窗口兜底。`planContextEdits`、`planCleanup` 与 DSH 的 mutation 门共用同一函数。新增先红后绿用例与 DSH 采集链路测试；`npm test` 118/118。
+
 ## 0.1.13（当前版本）
 
-依据 [`docs/plan.md`](./docs/plan.md) 的第 1 节复现与 §3 回归用例整改，并包含一次推送前复核的补充修复；`npm test` 114/114、`npm run check`、`npm run typecheck` 全通过。需明确：`docs/plan.md` §1 的 P1-2「宿主 usage 校准 + 上限双检」与 P1-3「编辑 diff/审计/最小回滚、审批/签名」仍未实现，不因回归用例转绿而结案；§2 的 I-3~I-9 同样仍是待排期项。
+依据 [`docs/plan.md`](./docs/plan.md) 的第 1 节复现与 §3 回归用例整改，并包含一次推送前复核的补充修复；`npm test` 114/114、`npm run check`、`npm run typecheck` 全通过。需明确：`docs/plan.md` §1 的 P1-2「宿主 usage 校准 + 上限双检」在 0.1.13 中尚未实现（已在未发布版本补齐，见下），P1-3「编辑 diff/审计/最小回滚、审批/签名」仍未实现，不因回归用例转绿而结案；§2 的 I-3~I-9 同样仍是待排期项。
 
 ### 修复
 
 - **改写截断 preview 不再毁掉 canonical 正文（P1-1）。** `planContextEdits` 现在拒绝改写内容被省略的 preview（截断或自引用省略），并要求 body 不含保留的截断 marker；否则 head+tail 副本会成为新的 canonical 正文，中间内容永久丢失且因变短而通过 shrink 门。守卫只针对真正有损的 preview：`renderText` 也会因 `normalizeText` 的空白/CRLF 归一化而与 canonical 不同，这类块内容完整、仍可正常改写（回归用例固定了这一点）。
-- **shrink 门的 token 估算（P1-2）。** `estimateMessageTokens` 修复 assistant 字符串正文计 0 的分支，并对非 ASCII 字符（CJK、emoji 等）按约 1 token/字符加权，使"换语种导致真实 token 增长"的编辑不再被误判为收缩。估算仍是近似，不是 provider tokenizer；宿主 usage 校准与上限双检尚未实现，已在文档中标明。
+- **shrink 门的 token 估算（P1-2）。** `estimateMessageTokens` 修复 assistant 字符串正文计 0 的分支，并对非 ASCII 字符（CJK、emoji 等）按约 1 token/字符加权，使"换语种导致真实 token 增长"的编辑不再被误判为收缩。估算仍是近似，不是 provider tokenizer；宿主 usage 校准与上限双检在 0.1.13 中尚未实现（已在未发布版本补齐）。
 - **写入时溯源与来源伪造（P1-3）。** 新增 `ContextEditDraft.provenance` 封闭字段（规划器写入、不从正文解析）；mirror body 中伪造 `[oh-my-clm ... source=/owner=/trusted=/provenance=]` 的编辑被拒绝；DSH 的 omission 与 assistant 改写按该字段派生 `source.kind`（`oh-my-clm:model-mirror-edit` / `oh-my-clm:runtime-cleanup`），不再冒充 `user`；Pi 的 `<pi-clm-edit-notice>` 与 budget nudge 改为 `system` 角色消息，不注入合成 `user`。系统提示/索引不进可编辑 mirror，模型可改区只放历史正文。这里的保护是「来源标签由运行时写入 + 显式保留字黑名单」，**不是对任意注入指令的内容审计**；审批/签名、diff/审计、回滚仍未实现。
 - **block-1 守卫下沉到共享编辑规划层（P1-4）。** 新增 `loadBearingRecord()`，`planCleanup` 与 `planContextEdits` 共用；compaction 释放 protected 前缀后，首个可编辑 block 仍不可删除（含配对级联与显式 `CLM_EMPTY` 全清）。一条旧的"空 mirror 省略全部"断言按新不变量更新。
 - **`CLM_CLEANUP_RESULT=none` 不再吞掉拒绝（P1-5）。** `none` 只抑制成功确认；`rejected` 始终返回可行动 reason，`listed` 始终返回行内容。README / cleanup-tool 文档的 `none` 与 Pi 结果模式口径同步（Pi 实为 `compact`）。

@@ -1,5 +1,5 @@
 import { cleanupMirrorForRecords, cleanupToolResult, describeCleanupList, planCleanup, } from "./context-cleanup.js";
-import { buildMirrorRecords, DEFAULT_MAX_BLOCK_CHARS, DEFAULT_MAX_MIRROR_CHARS, estimateMessageTokens, estimateMirrorTokens, mirrorSignature, parseMirror, planContextEdits, renderBlockDigest, renderBlockIndex, renderMirror, } from "./context-format.js";
+import { buildMirrorRecords, calibrateWithHostUsage, DEFAULT_MAX_BLOCK_CHARS, DEFAULT_MAX_MIRROR_CHARS, estimateMessageTokens, estimateMirrorTokens, hostUsageOf, mirrorSignature, parseMirror, planContextEdits, renderBlockDigest, renderBlockIndex, renderMirror, } from "./context-format.js";
 /**
  * Closed source tags for DSH replacement nodes, derived from the planner-owned
  * `ContextEditDraft.provenance`. A model-driven edit must never be attributed to
@@ -432,8 +432,18 @@ function applyDshContextEdits(session, plan, records, options) {
             }
         }
     }
-    const before = fixedTokens(options) + estimateMirrorTokens(records);
-    const after = fixedTokens(options) + estimateAfterMutation(records, actions);
+    const estimatedBefore = fixedTokens(options) + estimateMirrorTokens(records);
+    const estimatedAfter = fixedTokens(options) + estimateAfterMutation(records, actions);
+    let before = estimatedBefore;
+    let after = estimatedAfter;
+    const hostUsage = hostUsageOf(options.hostUsage);
+    if (hostUsage) {
+        const calibrated = calibrateWithHostUsage(estimatedBefore, estimatedAfter, hostUsage);
+        before = calibrated.beforeTokens;
+        after = calibrated.afterTokens;
+        if (calibrated.reason)
+            return rejectMutation(calibrated.reason, before, after);
+    }
     if (after >= before) {
         return rejectMutation("A DSH surface mutation must SHRINK context; replace stale text with a shorter summary instead.", before, after);
     }
@@ -483,7 +493,10 @@ export function executeDshCleanup(session, targets, options, io, state) {
             maxPreviewChars: options.blockIndex?.maxPreviewChars,
         });
     }
-    const plan = planCleanup(records, cleanupMirrorForRecords(records), targets, { fixedTokens: options.fixedTokens });
+    const plan = planCleanup(records, cleanupMirrorForRecords(records), targets, {
+        fixedTokens: options.fixedTokens,
+        hostUsage: options.hostUsage,
+    });
     if (plan.status !== "applied") {
         const index = copy === "full" ? renderDshBlockIndex(session, options) : undefined;
         return cleanupToolResult(plan, index, copy);
@@ -558,6 +571,7 @@ export function reconcileDshMirror(state, session, io, options) {
         candidatePlan = planContextEdits(previous.records, parseMirror(current), {
             allowGrowth: false,
             fixedTokens: options.fixedTokens,
+            hostUsage: options.hostUsage,
         });
         state.lastProcessedMirror = current;
     }

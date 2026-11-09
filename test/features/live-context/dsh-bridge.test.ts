@@ -938,6 +938,59 @@ test("DSH defers a pending edit until step/start opens the next step", async () 
 	}
 });
 
+test("DSH reads host-exact tokenUsage from sessionProjections and labels the fallback", async () => {
+	const root = listenerContext();
+	const snapshotKeys: Array<readonly string[] | undefined> = [];
+	const projections = {
+		snapshot(_session: unknown, keys?: readonly string[]) {
+			snapshotKeys.push(keys);
+			return {
+				asOfSeq: 12,
+				values: {
+					tokenUsage: {
+						uncachedInputTokens: 800,
+						outputTokens: 120,
+						cacheReadTokens: 9_000,
+						cacheWriteTokens: 0,
+					},
+					contextPressure: { contextWindow: 10_000 },
+				},
+			};
+		},
+	};
+	dshHost({ ...root, sessionProjections: projections } as any);
+	const command = root.commands.definitions.get("clm");
+	assert.ok(command, "/clm was not registered");
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-dsh-host-usage-"));
+	const sessionId = `dsh-host-usage-${process.pid}-${Date.now()}`;
+	const mirrorPath = sessionMirrorPath(sessionId);
+	const session = dshSession(cwd, sessionId);
+	const invocation = {
+		agent: { id: sessionId, session },
+		commandId: "command-1",
+		rawInput: "status",
+		attachments: [],
+		signal: new AbortController().signal,
+	};
+	try {
+		const status = await command.handler(invocation);
+		assert.equal(status.kind, "success", status.text);
+		assert.match(status.text, /DSH tokenUsage: 9800\/10000 tokens \(host-exact/);
+		assert.ok(snapshotKeys.some((keys) => keys?.includes("tokenUsage")));
+
+		// Without the projection service the fallback must be visibly labelled,
+		// never passed off as an exact value (P1-2 / docs/plan.md §5.2).
+		const bare = listenerContext();
+		dshHost({ ...bare } as any);
+		const fallback = await bare.commands.definitions.get("clm").handler(invocation);
+		assert.equal(fallback.kind, "success", fallback.text);
+		assert.match(fallback.text, /DSH tokenUsage: unavailable; the shrink gate falls back to the ~ estimate/);
+	} finally {
+		fs.rmSync(path.dirname(mirrorPath), { recursive: true, force: true });
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
 test("DSH /clm command reports the live mirror status and validates arguments", async () => {
 	const root = listenerContext();
 	dshHost({ ...root } as any);

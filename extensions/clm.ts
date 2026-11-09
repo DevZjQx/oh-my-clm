@@ -16,12 +16,14 @@ import {
 	DEFAULT_MAX_MIRROR_CHARS,
 	estimateMessageTokens,
 	estimateMirrorTokens,
+	hostUsageOf,
 	messageText,
 	mirrorSignature,
 	parseMirror,
 	planContextEdits,
 	renderMirror,
 	type EditPlanOptions,
+	type HostUsage,
 	type MirrorRecord,
 	type ProjectionEntryLike,
 } from "../src/features/live-context/context-format.ts";
@@ -98,8 +100,23 @@ function fixedRequestTokens(ctx: ExtensionContext): number {
 	return systemPrompt ? estimateMessageTokens({ role: "system", content: systemPrompt }) : 0;
 }
 
+/**
+ * Exact usage from the Pi host for the estimate + host-cap double check (P1-2).
+ * `getContextUsage().tokens` is the whole current request, not an estimate of
+ * the editable mirror; fall back to the model's window when the host omits it.
+ */
+function hostUsageOfContext(ctx: ExtensionContext): HostUsage | undefined {
+	const usage = ctx.getContextUsage?.();
+	if (!usage) return undefined;
+	return hostUsageOf({ tokens: usage.tokens, contextWindow: usage.contextWindow ?? ctx.model?.contextWindow });
+}
+
 function editPlanOptions(ctx: ExtensionContext): EditPlanOptions {
-	return { allowGrowth: false, fixedTokens: fixedRequestTokens(ctx) };
+	return {
+		allowGrowth: false,
+		fixedTokens: fixedRequestTokens(ctx),
+		hostUsage: hostUsageOfContext(ctx),
+	};
 }
 
 function notify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error" = "info"): void {
@@ -361,7 +378,7 @@ function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolRe
 		records,
 		parseCleanupMirror(text),
 		parsedArgs.args,
-		{ fixedTokens: fixedRequestTokens(ctx) },
+		{ fixedTokens: fixedRequestTokens(ctx), hostUsage: hostUsageOfContext(ctx) },
 	);
 	if (plan.status !== "applied") {
 		if (changedThisStep && /snapshot is stale/.test(plan.reason ?? "")) {
