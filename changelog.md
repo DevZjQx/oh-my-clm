@@ -2,7 +2,13 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/features/live-context-mirror.md`](./docs/features/live-context-mirror.md)。
 
-## 0.1.14（当前版本）
+## 0.1.15（当前版本）
+
+修复 DSH 宿主上 `/clm status` 与 runtime block index 一起失效的问题：可选服务 `sessionProjections` 不在 `inject` 里，却仍被当成普通属性读取。`npm test` 135/135、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
+
+- **修复 `/clm status` 在真实 DSH 上直接报错。** `sessionProjections` 刻意不进 `inject`（老宿主没有该服务，进了就整体不激活），但代码仍直接读 `ctx.sessionProjections`；Cordis 对未声明服务会抛 `cannot get property "sessionProjections" without inject`，于是 `/clm status` 返回 `oh-my-clm: could not render status: ...`，同一读取路径上的 runtime block index 也被 `try` 静默清空。现在统一走 Cordis 文档规定的免 inject 读取 `ctx.get("sessionProjections")`（与 `@deepseek-ai/dsh-tools` 的 `ctx.get("approval")` 同一用法），服务缺失时只让用量行退回带 `~` 的估算。新增回归：用 Cordis 语义的 Proxy（未声明属性读取即抛错）跑通 `/clm status` 与 block index；先把读取改回直接属性访问可复现原报错。`npm test` 135/135、`npm run check`、`npm run typecheck` 全通过。
+
+## 0.1.14
 
 推动模型主动清理上下文（[`docs/plan.md`](./docs/plan.md) §5.2–§5.4）：用量可见、候选可确认、删错可留要点。三项都先写红灯用例再改生产代码，`npm test` 134/134、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过；触发阈值全部默认关闭，尚未在真实 DeepSeek-V4.1-Flash 会话上标定（见下文 §5.2）。P1-3「编辑 diff/审计/最小回滚、审批/签名」仍未实现，§5.5（触发器的审计抽查流）、§5.6（撤除试验与诚实定位）仍在排期。
 
