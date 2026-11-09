@@ -126,7 +126,7 @@ dsh --profile <profile>
 dsh plugin --profile <profile> remove oh-my-clm
 ```
 
-需要固定版本时，npm 源在包名后加 `@<version>`（例如 `oh-my-clm@0.1.13`），GitHub 源在仓库后加 `#<ref>`（例如 `github:DevZjQx/oh-my-clm#<commit-sha>`）。DSH 不读取 `pi` 设置，Pi 的安装也不会自动把插件加入任何 DSH profile。
+需要固定版本时，npm 源在包名后加 `@<version>`（例如 `oh-my-clm@0.1.14`），GitHub 源在仓库后加 `#<ref>`（例如 `github:DevZjQx/oh-my-clm#<commit-sha>`）。DSH 不读取 `pi` 设置，Pi 的安装也不会自动把插件加入任何 DSH profile。
 
 ## 快速上手
 
