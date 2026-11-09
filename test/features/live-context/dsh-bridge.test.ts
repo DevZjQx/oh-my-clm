@@ -773,7 +773,7 @@ test("plan §5.2 (case 11): usage line and cleanup candidates follow host usage 
 				role: "tool",
 				source: { kind: "tool", callId: "call-trigger" },
 				toolCallId: "call-trigger",
-				content: [{ type: "text", text: "Settled second-area output that can be omitted." }],
+				content: [{ type: "text", text: `Settled second-area output that can be omitted. ${"Q".repeat(20_000)}` }],
 			},
 		});
 		append(session, "user/message", {
@@ -862,7 +862,7 @@ test("plan §5.2 (case 11): usage line and cleanup candidates follow host usage 
 		const bareSession = dshSession(cwd, "dsh-52-estimate");
 		seedSecondTurn(bareSession);
 		const bareRender = await contextFor(bare, bareSession);
-		assert.match(bareRender(), /Usage: ~\d+ tokens \(window unknown\)/);
+		assert.match(bareRender(), /Usage: ~\d+(?:\.\d+)?k? tokens \(window unknown\)/);
 		assert.doesNotMatch(bareRender(), /Suggested cleanup/);
 	} finally {
 		for (const key of envKeys) {

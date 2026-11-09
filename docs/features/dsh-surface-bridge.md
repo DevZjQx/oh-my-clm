@@ -98,7 +98,7 @@ host bridge 可选读取以下变量；它们只影响 mirror preview、shrink-o
 - 用量行与候选按 turn 边界渲染并按 `(已完成 turn 数, 触发配置)` 缓存，同一 turn 内逐字节不变，因此 DSH 仍然只在 turn 边界追加一次快照；`cleanup` / mirror edit 生效或 compaction 后清空缓存（删除会重排 ID）。
 | `CLM_CLEANUP_RESULT` | `compact` | `compact` / `full` / `none`，只影响 cleanup 的模型可见结果。 |
 
-block index 的 `CLM_INDEX_*` 开关、`/clm mode` 和 `cleanup` 结果语义见 [cleanup-tool.md](./cleanup-tool.md#7-配置)。`CLM_CONTEXT_BUDGET` 是 Pi 侧的目标预算（未设置时跟随宿主窗口），DSH bridge 不实现预算机制。
+block index 的 `CLM_INDEX_*` 开关、`/clm mode` 和 `cleanup` 结果语义见 [cleanup-tool.md](./cleanup-tool.md#7-配置)。`CLM_CONTEXT_BUDGET` 是 Pi 侧的目标预算（未设置时窗口不再是触发基准，见 [live-context-mirror.md](./live-context-mirror.md#环境变量)），DSH bridge 不实现预算机制。
 
 ## 6. 验证与未验证边界
 

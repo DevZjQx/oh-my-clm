@@ -602,6 +602,51 @@ test("budget pressure uses an ephemeral nudge instead of a compact command", asy
 	}
 });
 
+test("an empty assistant message does not warn on an unchanged mirror", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-empty-message-"));
+	const sessionId = "empty-message-session";
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "answer", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "A real answer." }] }] },
+			// Pi appends an aborted or errored assistant turn as `content: []`; it
+			// renders as an empty CLM_ENTRY and must not look like a deletion.
+			{ sourceEntry: { id: "aborted", type: "message" }, messages: [{ role: "assistant", content: [] }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const notifications: Array<{ message: string; type?: string }> = [];
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerTool: () => undefined,
+		registerCommand: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: true,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: (message: string, type?: string) => { notifications.push({ message, type }); } },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => sessionId,
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+	const result = await handlers.get("turn_end")?.({ entries: [] }, ctx);
+	assert.equal(result, undefined, "an unchanged mirror must be a noop");
+	assert.deepEqual(notifications, [], "no warning for an empty canonical message");
+});
+
 test("Pi tells the model when a mirror edit was rejected", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-reject-"));
 	const sessionId = "reject-notice-session";
@@ -998,10 +1043,11 @@ test("plan I-2 follow-up: a low-pressure round resets an exhausted nudge loop", 
 	}
 });
 
-// docs/plan.md §5.3 / case 12 (red): the Pi nudge must fold into the same
-// request as a system line carrying the §5.2 candidate format, fire from the
-// host window without any CLM_CONTEXT_BUDGET switch, and never add a turn or
-// ask the model to stop its task work.
+// docs/plan.md §5.3 / case 12: the Pi nudge must fold into the same request as
+// a system line carrying the §5.2 candidate format, and never add a turn or ask
+// the model to stop its task work. Since the §5.6 calibration the window is no
+// longer a trigger basis, so this fixture fires because its settled turns pay
+// for their own prefix break — no CLM_CONTEXT_BUDGET required.
 test("plan §5.3 (case 12, Pi): pressure folds a candidate into the same request", async () => {
 	const previousBudget = process.env.CLM_CONTEXT_BUDGET;
 	delete process.env.CLM_CONTEXT_BUDGET;
@@ -1064,7 +1110,7 @@ test("plan §5.3 (case 12, Pi): pressure folds a candidate into the same request
 		assert.match(nudgeText, /Usage: 92k\/100k tokens \(92%\)/);
 		assert.match(
 			nudgeText,
-			/Suggested cleanup \(usage 92% ≥ 75%\): cleanup\(\{ ranges: \["\d+(?:-\d+)?"\], skipRoles: \["user"\] \}\)/,
+			/Suggested cleanup \(best range pays back: net ~\d+ tok at r = 2%\): cleanup\(\{ ranges: \["\d+(?:-\d+)?"\], skipRoles: \["user"\] \}\)/,
 		);
 		// The old shape spent a whole turn on the cleanup; the new one folds it
 		// into the task, so neither "context-only turn" nor a stop order appears.
@@ -1189,6 +1235,134 @@ test("plan §5.3 review: an explicit budget below the host window stays self-con
 	} finally {
 		if (previousBudget === undefined) delete process.env.CLM_CONTEXT_BUDGET;
 		else process.env.CLM_CONTEXT_BUDGET = previousBudget;
+	}
+});
+
+// docs/plan.md §5.6 calibration (2026-11-09, real deepseek-flash session):
+// the host window is 1,000,000 tokens and the session sat at 119.5k, i.e. 12%.
+// "75% of the window" is unreachable, so the window must stop being the Pi
+// trigger basis; a range that pays for its own prefix break should be.
+test("plan §5.6 (calibration): a paying candidate nudges without any budget or window pressure", async () => {
+	const previous = process.env.CLM_CONTEXT_BUDGET;
+	delete process.env.CLM_CONTEXT_BUDGET;
+	try {
+		const projection = {
+			entries: [
+				{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+				{ sourceEntry: { id: "u1", type: "message" }, messages: [{ role: "user", content: "First request." }] },
+				{ sourceEntry: { id: "a1", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: `First answer: ${"A".repeat(4_000)}` }] }] },
+				{ sourceEntry: { id: "u2", type: "message" }, messages: [{ role: "user", content: "Second request." }] },
+				{ sourceEntry: { id: "a2", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: `Second answer: ${"B".repeat(4_000)}` }] }] },
+				{ sourceEntry: { id: "u3", type: "message" }, messages: [{ role: "user", content: "The current request." }] },
+			],
+			messages: [],
+		};
+		const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+		const api = {
+			on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+				handlers.set(name, handler);
+				return () => undefined;
+			},
+			registerCommand: () => undefined,
+			registerTool: () => undefined,
+		};
+		extension(api as any);
+		const ctx = {
+			cwd: fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-calibration-")),
+			hasUI: false,
+			mode: "print",
+			model: { contextWindow: 1_000_000 },
+			// The measured session: 119.5k of a 1M window.
+			getContextUsage: () => ({ tokens: 119_494, contextWindow: 1_000_000, percent: 12 }),
+			ui: { notify: () => undefined },
+			sessionManager: {
+				buildSessionProjection: () => projection,
+				getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+				getSessionId: () => "calibration-1m",
+			},
+		};
+		await handlers.get("session_start")?.({}, ctx);
+		const messages = [
+			{ role: "user", content: "First request." },
+			{ role: "assistant", content: `First answer: ${"A".repeat(4_000)}` },
+			{ role: "user", content: "Second request." },
+			{ role: "assistant", content: `Second answer: ${"B".repeat(4_000)}` },
+			{ role: "user", content: "The current request." },
+		];
+		const result = await handlers.get("context")?.({ messages }, ctx) as
+			{ messages?: Array<{ role: string; content: string }> } | undefined;
+		const nudgeText = result?.messages?.at(-1)?.content ?? "";
+		assert.match(nudgeText, /<pi-clm-budget-nudge>/, "a paying range is a trigger on its own");
+		assert.match(nudgeText, /Suggested cleanup \(/, "the payload is the candidate, not an open question");
+		// No budget was set, so no percentage could have fired: the old copy would
+		// have said "usage 12% >= 75%" or stayed silent.
+		assert.doesNotMatch(nudgeText, /≥ 75%/);
+		assert.doesNotMatch(nudgeText, /usage 12%/);
+	} finally {
+		if (previous === undefined) delete process.env.CLM_CONTEXT_BUDGET;
+		else process.env.CLM_CONTEXT_BUDGET = previous;
+	}
+});
+
+// The same 1M-window shape with nothing that pays back must stay silent: at
+// r = 0.02 an old settled turn's rent is worth 2%, so breaking its prefix costs
+// more than it saves (measured payback 85-1742 turns on the real session).
+test("plan §5.6 (calibration): a 1M window with no paying range stays silent", async () => {
+	const previous = process.env.CLM_CONTEXT_BUDGET;
+	delete process.env.CLM_CONTEXT_BUDGET;
+	try {
+		const projection = {
+			entries: [
+				{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+				{ sourceEntry: { id: "u1", type: "message" }, messages: [{ role: "user", content: "An old request." }] },
+				{ sourceEntry: { id: "a1", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "An old answer." }] }] },
+				{ sourceEntry: { id: "u2", type: "message" }, messages: [{ role: "user", content: "A bigger later request." }] },
+				{ sourceEntry: { id: "a2", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "Z".repeat(20_000) }] }] },
+				{ sourceEntry: { id: "u3", type: "message" }, messages: [{ role: "user", content: "The current request." }] },
+				// The open turn is already large, so every settled range sits under
+				// a suffix bigger than the rent it saves.
+				{ sourceEntry: { id: "a3", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "Y".repeat(20_000) }] }] },
+			],
+			messages: [],
+		};
+		const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+		const api = {
+			on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+				handlers.set(name, handler);
+				return () => undefined;
+			},
+			registerCommand: () => undefined,
+			registerTool: () => undefined,
+		};
+		extension(api as any);
+		const ctx = {
+			cwd: fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-calibration-quiet-")),
+			hasUI: false,
+			mode: "print",
+			model: { contextWindow: 1_000_000 },
+			getContextUsage: () => ({ tokens: 119_494, contextWindow: 1_000_000, percent: 12 }),
+			ui: { notify: () => undefined },
+			sessionManager: {
+				buildSessionProjection: () => projection,
+				getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+				getSessionId: () => "calibration-quiet",
+			},
+		};
+		await handlers.get("session_start")?.({}, ctx);
+		const messages = [
+			{ role: "user", content: "An old request." },
+			{ role: "assistant", content: "An old answer." },
+			{ role: "user", content: "A bigger later request." },
+			{ role: "assistant", content: "Z".repeat(20_000) },
+			{ role: "user", content: "The current request." },
+			{ role: "assistant", content: "Y".repeat(20_000) },
+		];
+		const result = await handlers.get("context")?.({ messages }, ctx) as
+			{ messages?: Array<{ role: string; content: string }> } | undefined;
+		assert.equal(result, undefined, "nothing to confirm means nothing to say");
+	} finally {
+		if (previous === undefined) delete process.env.CLM_CONTEXT_BUDGET;
+		else process.env.CLM_CONTEXT_BUDGET = previous;
 	}
 });
 

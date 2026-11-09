@@ -2,7 +2,19 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/features/live-context-mirror.md`](./docs/features/live-context-mirror.md)。
 
-## 0.1.17（当前版本）
+## 0.1.18（当前版本）
+
+在真实 Pi + `deepseek-flash` 会话上完成首次标定（§5.6），据此修正两处**方向性错误**（`r` 高估 5 倍、Pi 的触发基准在 1M 窗口上不可达），并修掉空消息被误判成 cleanup 删除、导致 Pi 反复弹出 shrink 警告的问题。`npm test` 145/145、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
+
+- **空消息不再被误判成 cleanup 删除。** 投影里的空正文消息（典型是被 Esc 中断 / 报错的 `content: []` assistant 消息，或空 toolResult）会渲染成一个空的 `CLM_ENTRY`；`planContextEdits` 原先把空 body 一律当成「模型清空了这个块」→ omit，于是**未修改的 mirror** 也每次 `turn_end` 都产生一次 0-token 删除。删 0 token 不满足 shrink-only 门，Pi 于是每隔几轮弹出 `CLM edit rejected: A compaction must SHRINK context…`。现在只有**基线非空**时清空才算删除；基线本来为空则保持 `keep`，未修改的 mirror 回到 `noop`。回归：空 assistant 消息 + 原样 mirror → `noop`；清空一个非空块仍 `applied`；`turn_end` 不再发 warning。`npm test` 145/145（原 143）。
+
+- **实测（只读，84 次请求）**：prompt 累计 6.29M token、命中率 95.0%；窗口 1,000,000、会话止于 119.5k（12%）；缓存读占 **19.4% 的账单**却占 95% 的 prompt。Pi 的价目表是 input `$0.30/M`、cacheRead `$0.006/M` → **`r = 0.02`，不是 0.1**。按该值回算同一份 mirror 的 9 个已完成 turn，回本需要 85~1742 轮，**就地清理一次都不划算**（候选 0 个；`r = 0.1` 下也只有 1 个 net ~37 的边缘候选）。
+- **`CLM_CACHE_DISCOUNT` 默认 `10` → `2`。** 取小是 fail-safe 方向：低估缓存折扣只会让插件更少建议断点，不会诱导多花钱。价目表是本地推算（`totalFromProvider: false`），官方口径 1/10~1/30，仍按端点覆盖。
+- **断点后缀改为「最后一个被删块之后」。** 原先从第一个被删块开始算，把同一区间里一起删掉的 toolResult 也算进 `B`，系统性高估了每个工具型 turn 的断点成本——在 `r = 0.02` 下这个偏差足以让所有候选消失。修正后同一 turn 的 `net` 从负数回到正数。
+- **Pi 的触发基准换了。** 宿主窗口不再是预算默认值：1M 窗口下 `0.75 × window` 不可达，实测会话 12% 就结束，且真到 748k 时账早已输掉。现在触发三选一：显式 `CLM_CONTEXT_BUDGET` 的压力、存在 `net > 0` 的候选、`CLM_TRIGGER_SINCE` / `CLM_TRIGGER_TOOL_RATIO`（Pi 现在也认这两个，按 step 计数）。都不命中就完全沉默，不再用「做一次 cleanup 或一次 mirror 编辑」催模型做负收益编辑；预算压力命中但无付得起的候选时，文案改为「从尾部（当前 step）删，别改写旧 turn」。
+- **回归。** 新增两条标定用例：1M 窗口 + 12% + 有付得起的候选 → 仍然 nudge（旧代码沉默）；同样的窗口 + 没有付得起的候选 → 完全沉默（旧代码只在 75% 才动）。既有用例按新前提更新：case 12 不再声称「窗口本身够触发」，两个 fixture 的 toolResult 补到真实规模（2k → 20k 字符），`Usage: ~5.8k tokens` 的断言放行 `k` 单位。`npm test` 143/143（原 141）。
+
+## 0.1.17
 
 清理候选改为按**断点成本**排序：省下的 token 打折，断掉的前缀后缀打全价。对应《前缀断点决定成本》§7 的三个反例，先写红灯用例再改生产代码；`npm test` 141/141、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
 

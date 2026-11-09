@@ -1260,7 +1260,14 @@ export function planContextEdits(records, parsed, options = {}) {
         const body = normalizeText(block.body);
         const renderedBaseline = normalizeText(record.renderText ?? record.text);
         if (!body) {
-            actions.set(record.id, { kind: "omit", reason: "block emptied" });
+            // An empty canonical message (for example an aborted assistant turn with
+            // no content) renders as an empty body. Reading that as "the model
+            // emptied this block" turns every unchanged mirror into a zero-token
+            // omission, which the shrink gate then rejects with a user-visible
+            // warning. Only an emptied non-empty baseline is a deletion.
+            actions.set(record.id, renderedBaseline
+                ? { kind: "omit", reason: "block emptied" }
+                : { kind: "keep" });
         }
         else if (renderedBaseline === body) {
             actions.set(record.id, { kind: "keep" });

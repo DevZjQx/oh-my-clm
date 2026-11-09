@@ -25,10 +25,12 @@ function records(): MirrorRecord[] {
 	return [
 		record("0", "user", "Initial task that stays protected.", { protected: true }),
 		record("1", "assistant", "I inspected the repository.\nread README"),
-		record("2", "toolResult", "Z".repeat(2_000), { toolCallId: "call-1" }),
+		// Real tool output is tens of KB; at r = 0.02 a 2k result no longer pays for
+		// the prefix break, so the fixture uses a realistic size (see §5.6).
+		record("2", "toolResult", "Z".repeat(20_000), { toolCallId: "call-1" }),
 		record("3", "user", "A settled second request."),
 		record("4", "assistant", "I grepped the second area.\ngrep"),
-		record("5", "toolResult", "Y".repeat(2_000), { toolCallId: "call-2" }),
+		record("5", "toolResult", "Y".repeat(20_000), { toolCallId: "call-2" }),
 		record("6", "user", "The current turn is still growing."),
 	];
 }

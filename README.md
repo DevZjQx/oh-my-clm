@@ -70,7 +70,7 @@ DSH 的 runtime context 会包含 `<oh-my-clm-block-index>`，有两种模式（
 - 命中任一触发阈值时，`<oh-my-clm-block-index>` 末尾给出可直接确认的候选：`Suggested cleanup (usage 80% ≥ 70%): cleanup({ ranges: ["3-5"], skipRoles: ["user"] }) frees ~120 tok.`，随后一行列出每个区间的预计节省、陈旧度、断点后的 token 数与净收益。候选带上已有的 `skipRoles: ["user"]`：turn 以 user 块开头，裸区间会连人类请求一起删掉，而引用的节省数字已经扣除了被保留的 user 块。候选只取**已完成的 turn**，永不包含 block 1 和当前 turn；模型只需要确认或改范围，不必自己判断何时清理。
 - 用量行与候选按 **turn 边界** 计算并缓存，同一 turn 内逐字节不变，不会每步追加一份快照；`cleanup` 或 mirror edit 生效后清空缓存（删除会重排 ID），compaction 由宿主适配器清空。
 - 所有触发阈值默认关闭（`0`），因为尚未在真实 DeepSeek-V4.1-Flash 会话上标定；打开方式见下文 `CLM_TRIGGER_*`。
-- 候选按**断点后的净收益**排序，而不是按「省下多少 token」：一次就地改写会让被改位置之后的全部 token 失去缓存，按 `cost ≈ r·L + (1−r)·B` 计，省下的 token 打折、断掉的 `B` 打全价。所以 `cleanup` 的真实收益约等于 `net ≈ r·freed − (1−r)·suffix / N`（`r` 为缓存命中价比例，`N` 为这笔一次性成本要摊几轮），`net ≤ 0` 的区间不会出现在候选里——触发命中但所有区间都亏本时，只会显示用量行。`r` / `N` 默认 `0.1` / `10`，用 `CLM_CACHE_DISCOUNT`（百分比）与 `CLM_CACHE_PAYBACK_TURNS` 按端点覆盖；没有缓存（`r = 1`）时这两项退化成纯 token 比较，与「短上下文一定更便宜」的直觉一致。
+- 候选按**断点后的净收益**排序，而不是按「省下多少 token」：一次就地改写会让被改位置之后的全部 token 失去缓存，按 `cost ≈ r·L + (1−r)·B` 计，省下的 token 打折、断掉的 `B` 打全价。所以 `cleanup` 的真实收益约等于 `net ≈ r·freed − (1−r)·suffix / N`（`r` 为缓存命中价比例，`N` 为这笔一次性成本要摊几轮），`net ≤ 0` 的区间不会出现在候选里——触发命中但所有区间都亏本时，只会显示用量行。`r` / `N` 默认 `0.02` / `10`（`r` 取自 Pi 自己的 deepseek-flash 价目表，见 [`docs/plan.md`](./docs/plan.md) §5.6），用 `CLM_CACHE_DISCOUNT`（百分比）与 `CLM_CACHE_PAYBACK_TURNS` 按端点覆盖；没有缓存（`r = 1`）时这两项退化成纯 token 比较，与「短上下文一定更便宜」的直觉一致。
 
 `cleanup` 接受 `ranges: ["3-16"]`（包含式区间）或 `blockIds: [...]`（单块），还可以用 `skipRoles: ["user"]` 在一个 turn 区间里保留人类消息。不确定是否还需要某个 block 时用 `cleanup({ offload: [{ blockId, note }] })`：保留 ID / role / 位置，正文换成一行严格更短的 `[offloaded: <note>]`，要点由模型自己写（插件不引入第二个 summarizer）；`offload` 可与删除混用，block 1、user 块和会变长的占位都会被拒绝。配对级联删除（assistant tool call 与结果）会单独报告为 `paired`，不会混进你请求的 ID。显式单块 ID 仍然严格校验，range 越界会夹取，range 覆盖 block 1 时保留 block 1。`cleanup({ list: "3-16" })` 是只读的展开：返回该区间的行（role + 短 preview），不做任何删除，因此“索引只给了省略行、但我想先看清楚”不需要读整个 mirror；它不能和删除目标同时出现。只有需要完整、未截断的正文做 rewrite 时才需要读 mirror。
 
@@ -165,7 +165,7 @@ pi -e .
 
 ### 预算与 nudge
 
-`CLM_CONTEXT_BUDGET` 是一个近似的目标预算，不是第二个 context window，也不会阻止已经过大的请求。未设置时预算默认取宿主窗口（`ctx.getContextUsage().contextWindow`）；当用量达到约 `0.75 × max(1, budget - 2048)` 时，扩展在**同一次请求**里追加一条临时 `system` 行（不占单独回合、不要求停手），内容是 §5.2 的用量行 + 可直接确认的 `cleanup({ ranges, skipRoles: ["user"] })` 候选；没有候选时提示做一次 `cleanup` 或一次 mirror 编辑。该行不写入 session history，`I-2` 的停止条件（连续两轮无进展即中止、轮数上限、压力消失后重置）仍在 state 里。设了 `CLM_CONTEXT_BUDGET` 时，用量行和百分比都以该预算为分母（与触发判定一致），而不是宿主窗口。
+`CLM_CONTEXT_BUDGET` 是一个近似的目标预算，不是第二个 context window，也不会阻止已经过大的请求。**宿主窗口不是触发基准**：在 1M 窗口的模型上（实测 `deepseek-flash`）会话跑到 12% 就结束了，75% 那条线永远到不了，而真到了也已经输掉缓存这笔账。现在的触发只有三种，任一命中即在**同一次请求**里追加一条临时 `system` 行（不占单独回合、不要求停手）：① 显式设了 `CLM_CONTEXT_BUDGET` 且用量达到约 `0.75 × max(1, budget - 2048)`；② 存在一个能付得起自身前缀断点代价的候选（`net > 0`）；③ `CLM_TRIGGER_SINCE`（距上次清理的 step 数）或 `CLM_TRIGGER_TOOL_RATIO`（toolResult 占可编辑 token 的百分比）达到阈值。行内是 §5.2 的用量行 + 可直接确认的 `cleanup({ ranges, skipRoles: ["user"] })`；只有预算压力而没有付得起的候选时，提示改为「别再改写旧 turn，从尾部（当前 step）删」。该行不写入 session history，`I-2` 的停止条件（连续两轮无进展即中止、轮数上限、压力消失后重置）仍在 state 里。设了 `CLM_CONTEXT_BUDGET` 时，用量行和百分比都以该预算为分母（与触发判定一致），而不是宿主窗口；未设时用量行以宿主窗口为分母，仅作参考，不参与触发判定。
 
 ```bash
 CLM_CONTEXT_BUDGET=32000 pi --extension ./extensions/clm.ts
@@ -249,7 +249,7 @@ Block index 的模式与尺寸开关：`CLM_INDEX_MODE`（`digest` 默认 / `blo
 
 DSH 只在 runtime-context 快照文本变化时追加新快照，因此节流能减少重复注入；`cleanup` 或 mirror edit 生效后会立即失效并重渲染，设为 `1` 可恢复每步刷新。节流按“打开中的 turn + 已关闭 step 数”计数：DSH 在 `agent/pre-step` 渲染索引，此时下一步的 `step/start` 还没写入，旧的 turn/step 键因此从未命中（E-027）。
 
-清理触发开关（默认全部关闭，尚未在真实 V4.1-Flash 会话标定，见 [`docs/plan.md`](./docs/plan.md) §5.2）：`CLM_TRIGGER_PCT`（用量达到窗口的百分比）、`CLM_TRIGGER_TURNS`（已完成 turn 数）、`CLM_TRIGGER_TOOL_RATIO`（toolResult 占可编辑 token 的百分比）、`CLM_TRIGGER_SINCE`（距上次成功清理的 turn 数）、`CLM_TRIGGER_CANDIDATES`（每次最多候选数，默认 3）、`CLM_TRIGGER_MIN_TOKENS`（最小可省 token）、`CLM_CONTEXT_WINDOW`（宿主不提供窗口时的兜底窗口）。另有缓存计价口径：`CLM_CACHE_DISCOUNT`（缓存命中价占全价的比例，百分比，默认 `10` 即 1/10）、`CLM_CACHE_PAYBACK_TURNS`（断点成本摊到几轮，默认 `10`），用于候选的净收益排序。任一阈值命中即在该 turn 边界装配一次候选；未命中时只有用量行。
+清理触发开关（默认全部关闭，尚未在真实 V4.1-Flash 会话标定，见 [`docs/plan.md`](./docs/plan.md) §5.2）：`CLM_TRIGGER_PCT`（用量达到窗口的百分比）、`CLM_TRIGGER_TURNS`（已完成 turn 数）、`CLM_TRIGGER_TOOL_RATIO`（toolResult 占可编辑 token 的百分比）、`CLM_TRIGGER_SINCE`（距上次成功清理的 turn 数）、`CLM_TRIGGER_CANDIDATES`（每次最多候选数，默认 3）、`CLM_TRIGGER_MIN_TOKENS`（最小可省 token）、`CLM_CONTEXT_WINDOW`（宿主不提供窗口时的兜底窗口）。另有缓存计价口径：`CLM_CACHE_DISCOUNT`（缓存命中价占全价的比例，百分比，默认 `2` 即 1/50，取自 Pi 自己的 deepseek-flash 价目表：输入 `$0.30/M`、缓存读 `$0.006/M`）、`CLM_CACHE_PAYBACK_TURNS`（断点成本摊到几轮，默认 `10`），用于候选的净收益排序。Pi 侧同样认 `CLM_TRIGGER_SINCE` 与 `CLM_TRIGGER_TOOL_RATIO`。任一阈值命中即在该 turn 边界装配一次候选；未命中时只有用量行。
 
 用 `node scripts/measure-session-index.mjs --project .` 可以从真实 session 日志核对索引快照数、字节数、步间隔和 cleanup 调用形态；它同时给出 `blocks` 与 `digest` 的对比，以及 digest 的预测重渲染次数。
 

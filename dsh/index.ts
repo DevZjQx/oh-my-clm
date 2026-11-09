@@ -139,7 +139,7 @@ function triggerOptions(): CleanupTriggerOptions {
 		minSavingsTokens: nonNegativeEnv("CLM_TRIGGER_MIN_TOKENS", 0),
 		// `r` in `r·L + (1−r)·B`, as a percentage (10 = cached reads cost 1/10).
 		// Per-endpoint, so it is an env value, not a hardcoded constant.
-		cacheDiscount: Math.min(100, nonNegativeEnv("CLM_CACHE_DISCOUNT", 10)) / 100,
+		cacheDiscount: Math.min(100, nonNegativeEnv("CLM_CACHE_DISCOUNT", 2)) / 100,
 		paybackTurns: positiveEnv("CLM_CACHE_PAYBACK_TURNS", 10),
 	};
 }

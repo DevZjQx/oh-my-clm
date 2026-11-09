@@ -146,8 +146,9 @@ export interface CleanupCandidateOptions {
 	minSavingsTokens?: number;
 	/**
 	 * `r` in `cost ≈ r·L + (1−r)·B`: the cache-read price as a fraction of the
-	 * full input price. Defaults to 0.1 (DeepSeek's order of magnitude); it is a
-	 * per-endpoint constant, not a universal one, so it stays configurable.
+	 * full input price. Defaults to 0.02 (deepseek-flash through Pi's price
+	 * table); it is a per-endpoint constant, not a universal one, so it stays
+	 * configurable.
 	 */
 	cacheDiscount?: number;
 	/**
@@ -158,8 +159,13 @@ export interface CleanupCandidateOptions {
 	paybackTurns?: number;
 }
 
-/** Ratio the notes use for DeepSeek; other endpoints differ (1/10 ~ 1/30). */
-export const DEFAULT_CACHE_DISCOUNT = 0.1;
+/**
+ * `r` for deepseek-flash through Pi's own cost table (2026-11-09): input
+ * $0.30/M vs cacheRead $0.006/M. Endpoints differ (1/10 ~ 1/50), so it stays
+ * configurable; choosing too low only makes the plugin quieter, which is the
+ * safe direction.
+ */
+export const DEFAULT_CACHE_DISCOUNT = 0.02;
 
 /**
  * Uncalibrated long-run assumption, in the same spirit as the trigger
@@ -192,12 +198,14 @@ export function assembleCleanupCandidates(
 	const units = buildBlockDigestUnits(records);
 	const unitTokens = units.map((unit) => estimateMirrorTokens(unit.records));
 
-	// Tokens behind the first block each range would remove: `B` in
-	// `r·L + (1−r)·B`. The keep-rule leaves user blocks in place, so the break
-	// starts at the first block the call actually rewrites or drops.
+	// Tokens behind the last block each range would remove: `B` in
+	// `r·L + (1−r)·B`. The keep-rule leaves user blocks in place, so the break is
+	// measured after the last block the call actually rewrites or drops — blocks
+	// removed together with it are gone, not re-prefilled, and counting them as
+	// suffix overstated the cost of every tool-heavy turn.
 	const suffixWithinUnit = units.map((unit) => {
-		const firstRemoved = unit.records.findIndex((record) => record.role !== "user");
-		const afterBreak = firstRemoved < 0 ? unit.records.length : firstRemoved + 1;
+		const lastRemoved = unit.records.reduce((last, record, index) => (record.role === "user" ? last : index), -1);
+		const afterBreak = lastRemoved < 0 ? unit.records.length : lastRemoved + 1;
 		return estimateMirrorTokens(unit.records.slice(afterBreak));
 	});
 	// Running total from the end: one pass, so the ranking stays linear in turns.

@@ -147,6 +147,42 @@ test("render and parse preserve stable editable entry ids", () => {
 	assert.equal(planContextEdits(records, parsed).status, "noop");
 });
 
+test("an empty canonical message is not a deletion in an unchanged mirror", () => {
+	// Pi appends an aborted/errored assistant message as `content: []`. It renders
+	// as an empty CLM_ENTRY, so an untouched mirror used to plan a zero-token
+	// omission and the shrink gate rejected it on every following turn_end.
+	const projected = buildMirrorRecords([
+		{
+			sourceEntry: { id: "task", type: "message" },
+			messages: [{ role: "user", content: "Keep the task." }],
+		},
+		{
+			sourceEntry: { id: "answer", type: "message" },
+			messages: [{ role: "assistant", content: [{ type: "text", text: "A real answer." }] }],
+		},
+		{
+			sourceEntry: { id: "aborted", type: "message" },
+			messages: [{ role: "assistant", content: [] }],
+		},
+		{
+			sourceEntry: { id: "tail", type: "message" },
+			messages: [{ role: "assistant", content: [{ type: "text", text: "Another fact to drop." }] }],
+		},
+	]);
+	const mirror = renderMirror(projected);
+	assert.match(mirror, /\[\[CLM_ENTRY id=2 role=assistant\]\]\n\n\[\[\/CLM_ENTRY id=2\]\]/);
+
+	const unchanged = planContextEdits(projected, parseMirror(mirror), { allowGrowth: false });
+	assert.equal(unchanged.status, "noop");
+	assert.deepEqual(unchanged.changedIds, []);
+	assert.equal(unchanged.reason, undefined);
+
+	// Clearing a block that did have content is still a deletion.
+	const emptied = planContextEdits(projected, parseMirror(mirror.replace("Another fact to drop.", "")), { allowGrowth: false });
+	assert.equal(emptied.status, "applied");
+	assert.deepEqual(emptied.omittedIds, ["tail"]);
+});
+
 test("rewriting an assistant tool turn removes the paired tool result", () => {
 	const mirror = renderMirror(records);
 	const edited = mirror

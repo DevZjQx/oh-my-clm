@@ -68,7 +68,7 @@ Confirm it in this same request, then continue the task.
 </pi-clm-budget-nudge>
 ```
 
-它与 DSH 的清理候选共用 `context-trigger.ts` 的用量行 / 候选装配（§5.2 / §5.3），模型只做确认或改范围，不占单独回合、也不要求停下手头任务。用量优先取 `ctx.getContextUsage()` 的宿主精确值（缺失时保留 `~`），预算默认取宿主窗口 `contextWindow`，因此未设 `CLM_CONTEXT_BUDGET` 时也会在真实水位触发；一旦显式设了 `CLM_CONTEXT_BUDGET`，用量行与百分比都改以该预算为分母（触发判定用的也是它），不会出现“按预算触发、按窗口显示百分比”的自相矛盾。
+它与 DSH 的清理候选共用 `context-trigger.ts` 的用量行 / 候选装配（§5.2 / §5.3），模型只做确认或改范围，不占单独回合、也不要求停下手头任务。用量优先取 `ctx.getContextUsage()` 的宿主精确值（缺失时保留 `~`）。**宿主窗口不再是触发基准**（§5.6 实测：1M 窗口、会话止于 12%）：触发来自显式 `CLM_CONTEXT_BUDGET`、一个付得起自身断点代价的候选，或 `CLM_TRIGGER_SINCE` / `CLM_TRIGGER_TOOL_RATIO`。一旦显式设了 `CLM_CONTEXT_BUDGET`，用量行与百分比都改以该预算为分母（触发判定用的也是它），不会出现“按预算触发、按窗口显示百分比”的自相矛盾；未设时用量行以宿主窗口为分母，仅作参考，不参与触发判定。
 
 nudge 只存在于这一次 provider request，不写入 session，也不会触发额外的模型 turn。I-2 的停止条件仍在 state 里：每轮必须进步、连续两轮无进展即中止（`MAX_NUDGE_ROUNDS`）、压力消失或真实收缩后重置。若 Pi 的原生 context window 已没有足够空间，扩展不再追加 nudge，交给 Pi 的 native auto-compaction 处理。
 
@@ -241,7 +241,7 @@ the dump showed
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `CLM_CONTEXT_BUDGET` | 宿主窗口 | 近似目标 token；接近目标时在同一次请求追加临时 budget nudge。未设置时跟随 `ctx.getContextUsage().contextWindow`（窗口也不可知则不触发）。正整数才生效 |
+| `CLM_CONTEXT_BUDGET` | 无 | 近似目标 token；用量达到约 `0.75 × max(1, budget − 2048)` 时在同一次请求追加临时 budget nudge。未设置时窗口不是触发基准，触发来自付得起的候选或 `CLM_TRIGGER_SINCE` / `CLM_TRIGGER_TOOL_RATIO`。正整数才生效 |
 
 例如：
 
@@ -250,7 +250,7 @@ CLM_CONTEXT_BUDGET=32000 \
 pi --extension ./extensions/clm.ts
 ```
 
-如果不设置目标预算，扩展仍会按宿主窗口在水位较高时注入 nudge，并生成 mirror、校验模型编辑、使用 Pi native context limit/auto-compaction。
+如果不设置目标预算，扩展会在存在付得起的清理候选、或 `CLM_TRIGGER_SINCE` / `CLM_TRIGGER_TOOL_RATIO` 命中时注入 nudge；宿主窗口只用于用量行的参考分母，不再是触发基准。无论是否触发，扩展都会生成 mirror、校验模型编辑、使用 Pi native context limit/auto-compaction。
 
 ## 8. 代码结构
 

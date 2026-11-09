@@ -2,7 +2,8 @@
 
 > 追加（2026-11-09）：§5 新增「让 DeepSeek-V4.1-Flash 主动清理上下文」方向，六步按 1~6 顺序排期；**5.1 已实施**（用例 10 红灯转绿），**P1-2 的宿主 usage 校准 + 上限双检已补**（5.2 前置，见 §1 P1-2 实施记录），**5.2 已实施**（用例 11 红灯转绿；触发阈值默认关闭，待真实 V4.1-Flash 会话标定），**5.3 已实施**（用例 12）、**5.4 已实施**（用例 13），5.5~5.6 尚未实施；§1~§4 的结论不变。
 > 状态：评审草稿 / 整改已完成（验收部分）
-> 追加（2026-11-09，候选成本口径）：§5.2 的候选排序原来写成「可省 token × 陈旧度」，被《前缀断点决定成本》§7 列为反例一（旧 turn 的租按折扣价付，断点后缀却按全价重算）。现已改为按断点后的净节省排序、并过滤回本不成立的范围，新增 `CLM_CACHE_DISCOUNT` / `CLM_CACHE_PAYBACK_TURNS` 两个可配置口径（默认 `0.1` / `10`，均未标定）；§5.6 的遥测字段补上 `r`、`S` 与回本轮数；新增 §5.8（可写尾部与 handoff，待排期）。
+> 追加（2026-11-09，首次真实标定）：在真实 Pi + `deepseek-flash` 会话上采到基线（§5.6）——`r = 0.02`、命中率 95.0%、窗口 1M 而会话止于 12%。据此把 `CLM_CACHE_DISCOUNT` 默认改为 `2`（fail-safe 方向），并改掉 Pi 的触发基准：宿主窗口不再触发，改为「显式预算 / 付得起的候选 / step·tool 占比」三选一。§5.2 的 `suffixTokens` 同时修正为「最后一个被删块之后」——原先会把同一区间内一起删掉的 toolResult 也算作后缀，系统性高估断点成本。
+> 追加（2026-11-09，候选成本口径）：§5.2 的候选排序原来写成「可省 token × 陈旧度」，被《前缀断点决定成本》§7 列为反例一（旧 turn 的租按折扣价付，断点后缀却按全价重算）。现已改为按断点后的净节省排序、并过滤回本不成立的范围，新增 `CLM_CACHE_DISCOUNT` / `CLM_CACHE_PAYBACK_TURNS` 两个可配置口径（默认 `0.1` / `10`，均未标定；同日实测后 `r` 默认改为 `0.02`，见上一条）；§5.6 的遥测字段补上 `r`、`S` 与回本轮数；新增 §5.8（可写尾部与 handoff，待排期）。
 > 整改状态（2026-11-09）：§3 的 11 条回归用例，以及一次推送前复核新增的 5 条回归（P1-1 守卫收窄 4 条、I-2 触顶重置 1 条）全部转绿（`npm test` 114/114、`npm run check`、`npm run typecheck` 通过），生产代码与文档已同步；逐项说明见 `changelog.md` 的「0.1.13」。**回归用例转绿不等于第 1 节打回项全部结案**：P1-2 的「宿主 usage 校准 + 估算/上限双检」已实现（2026-11-09，Pi `getContextUsage()` 与 DSH `sessionProjections` 的 `contextPressure` 进入共享门；`npm test` 138/138；同日修正 DSH 采集口径，见 §1 P1-2 实施记录的补记），§5.2 的用量行与候选触发已做（5.2~5.4 已实施，0.1.14 发布）；P1-3 的「编辑 diff/审计/最小回滚、审批/签名」仍未实现（P1-3 只落地了运行时来源标签 + 显式保留字黑名单，不是对任意注入指令的内容审计）；§2 改进项中 I-1、I-2 已修，I-3~I-9 及「规则外清单」（安全姿态、真实宿主行为、撤除试验、维护代价）仍需人工复核 / 排期。
 > 审查对象：当前 checkout（`package.json` 0.1.12，HEAD `b14b187`）
 > 依据：`http://127.0.0.1:3080/dsh-zdiary-kit/view` 的 101 篇笔记（只读知识库，**仅作参考，不作准**）、本仓库源码与文档、仓库自带的 CLM 自评表。
@@ -167,7 +168,7 @@ npm pack --dry-run
 **三条硬约束（贯穿 1~6）**：
 
 - **低频、边界触发**：DeepSeek API 命中价约为 miss 的 1/10~1/30（`docs/reference/dsh-prefix-cache.md`），cleanup 是 surface replacement，会打断前缀；《上下文缩短不等于降本》/ CCM 显示每步压缩反而更贵（Opus +31%、Kimi +106%）。**禁止「每轮主动清一次」**，只在子任务边界、一次批量。
-- **目标模型标定**：阈值与 Effort 修正（max 档输出 token ≈2.5×，上下文涨得更快）只在 V4.1-Flash 上重测，不从别的模型搬（《语义层按使用者分叉》：换模型搬策略至少掉 5.7 分）。候选要做成动作层可直接确认的，不要让它先在长思维链里声明（DA 笔记：thinking 模式下声明式方案失效）。
+- **目标模型标定**：阈值与 Effort 修正（max 档输出 token ≈2.5×，上下文涨得更快）只在 V4.1-Flash 上重测，不从别的模型搬（《语义层按使用者分叉》：换模型搬策略至少掉 5.7 分）。候选要做成动作层可直接确认的，不要让它先在长思维链里声明（DA 笔记：thinking 模式下声明式方案失效）。**窗口百分比不能当触发基准**：V4.1-Flash 的窗口是 1M，实测会话 84 次请求只到 12%，`0.75 × window` 是死线；只能按显式预算、候选净收益或 step / tool 占比触发。
 - **动态文本 turn 内字节稳定**：候选与用量行按 turn 边界计算、turn 内不变，命中 DSH 快照去重；否则 `systemPrompt.context` 每步追加一份快照，反而给每轮加税（`dsh-bridge.ts:246-266` 的节流可复用）。
 
 **验收口径**：不以「模型自发 cleanup 次数」为成功标准，而以 ① 触发后被执行 / 被否决 / 被改写的比例、② 上下文峰值、③ 缓存命中率（`cacheReadTokens` 占比）、④ 任务成功率 四项为准。**能力天花板写进文档**：ContextPilot 69.40、CCM+蒸馏 86.72 那种「每步自己管理」是 SFT/RL 训出来的，插件做不到；插件只承诺「触发可靠 + 确认成本低 + 代价可算」。
@@ -198,7 +199,7 @@ npm pack --dry-run
 - **依赖 / 风险**：依赖 5.1 的策略句；受前缀缓存约束，只能低频触发；真实 usage 取不到时的降级必须显式标注 `~`，否则退回静默估算等于没修 P1-2。
 - **实施记录（2026-11-09）**：用例 11 先写红灯断言并确认 `npm test` 失败，再改生产代码转绿。新增 `src/features/live-context/context-trigger.ts`（纯函数 `planCleanupTrigger` / `formatUsageLine` / `renderCleanupCandidates`），阈值全部默认 `0`（关闭）——`CLM_TRIGGER_PCT`、`CLM_TRIGGER_TURNS`、`CLM_TRIGGER_TOOL_RATIO`、`CLM_TRIGGER_SINCE`，另有 `CLM_TRIGGER_CANDIDATES`（默认 3）、`CLM_TRIGGER_MIN_TOKENS`（默认 0）与 `CLM_CONTEXT_WINDOW`（估算模式的窗口兜底）；机制先以可关闭形态交付，标定后再打开。`dshTriggerView` 在 DSH 动态 context 头部输出用量行（宿主精确值优先，缺失标 `~`，窗口未知写 `window unknown`）；命中阈值时把候选写进同一个 `<oh-my-clm-block-index>`：只取已完成 turn、按「可省 token × 陈旧度」排序、永不包含 block 1 与当前 turn，并给出可直接确认的 `cleanup({ ranges, skipRoles: ["user"] })` 与每区间理由（推送前复核补：turn 以 user 块开头，裸区间会连人类请求一起删掉，因此候选固定带 `skipRoles: ["user"]`，引用的节省数字也已扣除被保留的 user 块）。用量行与候选按 `(已完成 turn 数, 触发配置)` 缓存，同一 turn 内逐字节不变；`cleanup` / mirror edit 生效与 compaction 后失效。`npm test` 123/123、`npm run check`、`npm run typecheck`、`npm pack --dry-run`、`npm run build:dsh:plugin` 全通过。
 
-- **补记（2026-11-09，候选排序改为按断点成本）**：原排序 `tokens × turnsOld` 是《前缀断点决定成本》§7 点名的反例一——它把「租」按全价计，而 `r=0.1` 时旧 turn 的租只有 0.1×，断它的后缀却要付 0.9×。现在 `assembleCleanupCandidates` 为每个候选计算 `suffixTokens`（应用 `skipRoles` 后第一个被改写/删除块之后的 token 数，即公式里的 `B`）与 `netTokens = r·tokens − (1−r)·suffixTokens / N`：按 `net` 排序，`net ≤ 0` 的区间不进候选（触发命中但所有区间都亏本时只给用量行，不诱导模型做负收益编辑）；`N` 是回本轮数，默认 10，`r` 默认 0.1，二者可由 `CLM_CACHE_DISCOUNT`（百分比，10 = 1/10）与 `CLM_CACHE_PAYBACK_TURNS` 覆盖，DSH 的 per-turn 缓存签名与 Pi 的 nudge 都读同一口径。渲染详情行改为 `3-5 (~120 tok freed, 1 turn old, 40 tok after the break, net ~116)`，让断点代价对模型可见。三条红灯先红后绿：`r=0.1` 时最新大工具 turn 压过更老的 8k turn、回本超期时零候选、`r=1`（如 GLM-5）时亏本区间重新变得划算且 `net == tokens`；既有用例按新口径更新（fixture 里 4-token 的 settled turn 在 `r=0.1` 下确实不值得断，改为真实规模正文）。
+- **补记（2026-11-09，候选排序改为按断点成本）**：原排序 `tokens × turnsOld` 是《前缀断点决定成本》§7 点名的反例一——它把「租」按全价计，而 `r=0.1` 时旧 turn 的租只有 0.1×，断它的后缀却要付 0.9×。现在 `assembleCleanupCandidates` 为每个候选计算 `suffixTokens`（应用 `skipRoles` 后第一个被改写/删除块之后的 token 数，即公式里的 `B`）与 `netTokens = r·tokens − (1−r)·suffixTokens / N`：按 `net` 排序，`net ≤ 0` 的区间不进候选（触发命中但所有区间都亏本时只给用量行，不诱导模型做负收益编辑）；`N` 是回本轮数，默认 10，`r` 默认 0.1（后经 §5.6 实测改为 `0.02`，见本节抬头），二者可由 `CLM_CACHE_DISCOUNT`（百分比，10 = 1/10）与 `CLM_CACHE_PAYBACK_TURNS` 覆盖，DSH 的 per-turn 缓存签名与 Pi 的 nudge 都读同一口径。渲染详情行改为 `3-5 (~120 tok freed, 1 turn old, 40 tok after the break, net ~116)`，让断点代价对模型可见。三条红灯先红后绿：`r=0.1` 时最新大工具 turn 压过更老的 8k turn、回本超期时零候选、`r=1`（如 GLM-5）时亏本区间重新变得划算且 `net == tokens`；既有用例按新口径更新（fixture 里 4-token 的 settled turn 在 `r=0.1` 下确实不值得断，改为真实规模正文）。
 
 ### 5.3 收编 Pi 的独立 nudge 到同一次请求
 
@@ -210,6 +211,7 @@ npm pack --dry-run
   4. 注入角色保持 `system`（P1-3 已修的口径，不要退回合成 user）。
 - **红灯（用例 12）**：`test/adapters/extension.test.ts`（或 `session-integration.test.ts`）断言「未设 `CLM_CONTEXT_BUDGET` 时用量过高仍注入」「不产生额外 assistant turn」「连续两轮无进展后中止」「注入角色为 system」。
 - **依赖 / 风险**：与 5.2 共用候选格式，必须同一步调；改成同请求注入后 `messages.some(含 marker)` 的旧去重守卫仍不可靠，中止条件以 state 里的四件套为准。
+- **补记（2026-11-09，触发基准按实测改掉）**：原实现的预算默认取宿主窗口，隐含「用量到窗口 75% 才触发」。§5.6 的首次真实采集推翻了这条：`deepseek-flash` 的窗口是 1,000,000，会话跑完 84 次请求只到 119.5k（12%），75% 那条线在现实会话里不存在，而且真到 748k 时账早已输掉。现在窗口不再是触发基准，改为三选一：① 显式 `CLM_CONTEXT_BUDGET` + `0.75 × (budget − 2048)`；② 存在 `net > 0` 的候选（候选本身即触发）；③ `CLM_TRIGGER_SINCE` / `CLM_TRIGGER_TOOL_RATIO`（两个宿主同名，Pi 按 step 计数）。三者都不命中就**完全沉默**，不再用「做一次 cleanup 或一次 mirror 编辑」催模型做负收益编辑；预算压力命中但没有付得起的候选时，文案改为「从尾部（当前 step）删，别改写旧 turn」。
 - **实施记录（2026-11-09）**：用例 12 先写红灯断言并确认 `npm test` 失败，再改生产代码转绿。`extensions/clm.ts` 的 `contextBudgetNudge` 不再声称 "context-only turn"，也不再要求模型停手：它改为在同一次请求里追加一条 `system` 行，内容为 5.2 的用量行 + 可直接确认的 `cleanup({ ranges, skipRoles: ["user"] })` 候选（复用 `formatUsageLine` / `assembleCleanupCandidates` / `renderCleanupCandidates`，候选装配从 `planCleanupTrigger` 抽出为纯函数）。预算默认取宿主窗口（`ctx.getContextUsage()?.contextWindow`），未设 `CLM_CONTEXT_BUDGET` 也会在真实水位触发；用量优先取宿主精确值，取不到才退回估算并保留 `~`。**推送前复核补**：显式设了预算时，用量行与 `usage Z%` 信号统一以该预算为分母（原先信号用宿主窗口，`CLM_CONTEXT_BUDGET=32000` + 200k 窗口会渲染成“usage 15% ≥ 75%”），并新增该场景的回归用例。I-2 四件套原样保留：每轮必须进步、连续两轮无进展即中止、`MAX_NUDGE_ROUNDS` 上限、压力消失 / 真实收缩后重置；注入角色仍是 `system`。静态附录里的触发句同步改成「确认候选或做一次编辑，然后继续任务」，长度守卫 Pi 996/1000。`formatUsageLine` 新增 `turnWord`，Pi 用 `step` 计数（Pi 在 `turn_end` 按 step 提交），并在 state 里记录 `lastCleanupStep`。
 
 ### 5.4 软卸载：给删除一个低损、可保留要点的替代
@@ -237,6 +239,7 @@ npm pack --dry-run
 
 ### 5.6 遥测与撤除 A/B 验收
 
+- **已采集（2026-11-09，真实 Pi + deepseek-flash 会话，只读）**：84 次 provider 请求、prompt 累计 6.29M token、命中率 95.0%；窗口 1,000,000，最后一次请求 119.5k（12%）；可编辑块 22k token（其余 ~97k 是宿主 system prompt / 工具 schema / 受保护前缀）。计价取自 Pi 自己的价目表：input `$0.30/M`、cacheRead `$0.006/M` → `r = 0.02`；缓存读占 **19.4% 的账单**，却占 95.0% 的 prompt（「命中率不是折扣率」的实测版本：0.1× 命中 95.8% 时账单仍是全 miss 的 13.8%，这里是 2% → 19.4%）。按该 `r` 回算同一份 mirror 的 9 个已完成 turn：回本 `N ≈ (1−r)S/(rΔL)` 分别为 85 / 119 / 338 / 598 / 762 / 947 / 1742 轮 → 就地清理**一次都不划算**，候选数为 0（`r = 0.1` 时也只有一个 net ~37 的边缘候选）。同一会话内 nudge 真实注入 **0 次**、`cleanup` 调用 0 次，原因是窗口型触发不可达。限定：单会话、单端点；`totalFromProvider: false` 说明这些价格是本地表推算而非官方账单（官方口径 1/10~1/30），故 `r` 取小属 fail-safe 方向（少建议，不是多花钱）。
 - **现状 / 证据**：`scripts/measure-session-index.mjs` 已能量索引快照数 / 字节 / 步间隔与真实 `cleanup` 调用形态（`:167-176`、`:243-254`），但**不含**缓存命中率、上下文峰值、任务成功率、触发决策；I-5（未验证「模型是否真会用 turn-level cleanup」）、I-6（代价不可观测，`docs/reference/clm-technical-analysis.md:34-36/43` 的 Prefix-reuse FLOPs / SCR / ATIF-CTX 全 ❌）仍未结案。
 - **动作**：
   1. **基线采集**（从第 1 步起并行、只读、不改生产代码）：在真实 V4.1-Flash 长会话日志上量四项——cleanup 自发 / 触发次数、上下文峰值、缓存命中率（`cacheReadTokens` 占比）、任务成功率；
@@ -268,7 +271,7 @@ npm pack --dry-run
 | 5.3 | I-2 | 已实施（2026-11-09，同请求 system 行 + 宿主窗口默认预算）；四件套不变 |
 | 5.4 | I-4、P1-3 | 已实施（2026-11-09，`offload` 保留要点）；不替代 diff / 审计 / 回滚 |
 | 5.5 | I-10（规则外清单） | 新增一条需人复核的维度 |
-| 5.6 | I-5、I-6、I-9 | 撤除试验 + 诚实定位 |
+| 5.6 | I-5、I-6、I-9 | 基线已采集（2026-11-09，见本节）；遥测字段与撤除 A/B 待做 |
 | 5.8 | I-4、P1-3 | 新增方向（可写尾部 + handoff），未实施 |
 
 红灯用例编号 10~15，细节见各步「红灯」行；本次只修改计划文档，不改任何生产代码。

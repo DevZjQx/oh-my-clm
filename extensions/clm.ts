@@ -41,7 +41,9 @@ import {
 	assembleCleanupCandidates,
 	formatPercent,
 	formatUsageLine,
+	planCleanupTrigger,
 	renderCleanupCandidates,
+	type CleanupTriggerPlan,
 } from "../src/features/live-context/context-trigger.ts";
 import { writePrivateText } from "../src/lib/clm-files.ts";
 import { sessionMirrorPath } from "../src/lib/clm-paths.ts";
@@ -64,6 +66,10 @@ interface Config {
 	cacheDiscount: number;
 	/** Turns the one-time prefix-break cost is amortised over. */
 	paybackTurns: number;
+	/** Steps since the last applied cleanup that trigger a nudge. 0 disables. */
+	triggerSince: number;
+	/** toolResult share (0..1) of editable tokens that triggers a nudge. 0 disables. */
+	triggerToolShare: number;
 }
 
 interface MirrorSnapshot {
@@ -89,9 +95,14 @@ function config(): Config {
 		budgetTokens: positiveEnv("CLM_CONTEXT_BUDGET", 0),
 		maxBlockChars: DEFAULT_MAX_BLOCK_CHARS,
 		maxMirrorChars: DEFAULT_MAX_MIRROR_CHARS,
-		// Same knobs as DSH (`CLM_CACHE_DISCOUNT` is a percentage: 10 = 1/10).
-		cacheDiscount: Math.min(100, nonNegativeEnv("CLM_CACHE_DISCOUNT", 10)) / 100,
+		// Same knobs as DSH (`CLM_CACHE_DISCOUNT` is a percentage: 2 = 1/50).
+		// Measured on deepseek-flash through Pi's own cost table (2026-11-09):
+		// input $0.30/M vs cacheRead $0.006/M. Lower is the fail-safe direction.
+		cacheDiscount: Math.min(100, nonNegativeEnv("CLM_CACHE_DISCOUNT", 2)) / 100,
 		paybackTurns: positiveEnv("CLM_CACHE_PAYBACK_TURNS", 10),
+		// Host-independent triggers, same names as DSH. Both default off.
+		triggerSince: nonNegativeEnv("CLM_TRIGGER_SINCE", 0),
+		triggerToolShare: Math.min(100, nonNegativeEnv("CLM_TRIGGER_TOOL_RATIO", 0)) / 100,
 	};
 }
 
@@ -470,18 +481,53 @@ function contextBudgetNudge(
 	const settings = config();
 	const hostUsage = hostUsageOfContext(ctx);
 	const hostWindow = hostUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-	// Without CLM_CONTEXT_BUDGET the host window is the budget: a switch must
-	// not be required before the plugin can react to real pressure.
-	const budget = settings.budgetTokens > 0 ? settings.budgetTokens : hostWindow;
-	if (budget <= 0) return undefined;
 	if (messages.some((message) => messageText(message).includes(CONTEXT_NUDGE_MARKER))) return undefined;
-	const target = Math.max(1, budget - CONTEXT_RESERVE_TOKENS);
 	const estimated = fixedRequestTokens(ctx) + messages.reduce<number>((total, message) => total + estimateMessageTokens(message), 0);
 	// Host-exact usage wins over the 3.5 chars/token estimate (P1-2), so the
 	// decision and the rendered line agree.
 	const tokens = hostUsage?.tokens ?? estimated;
-	if (tokens < Math.floor(target * CONTEXT_NUDGE_FRACTION)) {
-		// Budget pressure is gone: a later episode must get a fresh loop budget.
+	// The host window is **not** a trigger. Measured on deepseek-flash
+	// (2026-11-09): a 1,000,000-token window means "75% of the window" is
+	// unreachable — the session sat at 12% after 84 requests — and a break that
+	// late has already lost the cache game. Pressure is priced only against an
+	// explicit budget; otherwise the trigger is a candidate that pays for its
+	// own prefix break, or the host-independent step/tool-share thresholds.
+	const budget = settings.budgetTokens;
+	const plan = planCleanupTrigger(records, {
+		usageTokens: tokens,
+		...(budget > 0 ? { contextWindow: budget } : hostWindow > 0 ? { contextWindow: hostWindow } : {}),
+		exactUsage: hostUsage !== undefined,
+		completedTurns: state.completedSteps,
+		...(state.lastCleanupStep !== undefined ? { lastCleanupTurn: state.lastCleanupStep } : {}),
+		currentTurn: state.completedSteps + 1,
+	}, {
+		...(budget > 0 ? { usagePercent: CONTEXT_NUDGE_FRACTION * 100 } : {}),
+		turnsSinceCleanup: settings.triggerSince,
+		toolResultShare: settings.triggerToolShare,
+		cacheDiscount: settings.cacheDiscount,
+		paybackTurns: settings.paybackTurns,
+	});
+	let payload: CleanupTriggerPlan | undefined = plan.triggered ? plan : undefined;
+	if (!payload) {
+		// No threshold fired, but the candidate half is a trigger of its own: if a
+		// range can pay for the prefix break it causes, that is worth one line.
+		const assembled = assembleCleanupCandidates(records, {
+			cacheDiscount: settings.cacheDiscount,
+			paybackTurns: settings.paybackTurns,
+		});
+		const best = assembled.candidates[0];
+		if (best) {
+			payload = {
+				triggered: true,
+				signals: [`best range pays back: net ~${best.netTokens} tok at r = ${formatPercent(settings.cacheDiscount * 100)}`],
+				...assembled,
+			};
+		}
+	}
+	if (!payload) {
+		// Nothing to confirm: stay silent rather than nag the model into an edit
+		// that costs more than it saves. A later episode starts with a fresh loop
+		// budget.
 		state.nudgeRounds = 0;
 		state.lastNudgeTokens = undefined;
 		return undefined;
@@ -489,35 +535,22 @@ function contextBudgetNudge(
 	if (state.nudgeRounds >= MAX_NUDGE_ROUNDS) return undefined;
 
 	const editable = records.filter((record) => !record.protected);
-	// The budget is the operative target, so it is the basis of *both* halves of
-	// the payload. Measuring the line against the host window while the decision
-	// uses a smaller explicit budget produced self-contradictory copy
-	// ("Suggested cleanup (usage 15% ≥ 75%)"); the window still guards whether the
-	// nudge itself fits, nothing more.
+	// An explicit budget is the operative target, so it is the basis of both
+	// halves of the payload; without one the window is only context for the
+	// reader. Measuring the line against the window while the decision uses a
+	// smaller budget produced self-contradictory copy ("usage 15% ≥ 75%").
 	const usageLine = formatUsageLine({
 		tokens,
-		contextWindow: budget,
+		...(budget > 0 ? { contextWindow: budget } : hostWindow > 0 ? { contextWindow: hostWindow } : {}),
 		exact: hostUsage !== undefined,
 		editableBlocks: editable.length,
 		...(state.lastCleanupStep !== undefined ? { lastCleanupTurn: state.lastCleanupStep } : {}),
 		turnWord: "step",
 	});
-	// Same assembly and rendering as §5.2; only the threshold decision differs.
-	// The ranking prices the prefix break too: `net ≈ r·freed − (1−r)·suffix/N`.
-	const signals = [
-		`${hostUsage ? "" : "~"}usage ${formatPercent((tokens / budget) * 100)} ≥ ${formatPercent(CONTEXT_NUDGE_FRACTION * 100)}`,
-	];
-	const candidates = renderCleanupCandidates({
-		triggered: true,
-		signals,
-		...assembleCleanupCandidates(records, {
-			cacheDiscount: settings.cacheDiscount,
-			paybackTurns: settings.paybackTurns,
-		}),
-	});
+	const candidates = renderCleanupCandidates(payload);
 	const action = candidates
 		? `${candidates}\nConfirm it in this same request, then continue the task.`
-		: "Use one `cleanup` call or one mirror edit to free enough context, then continue the task.";
+		: "No settled range pays for the prefix break it would cause; trim the tail (the step in progress) instead of rewriting older turns.";
 	const nudge = `${CONTEXT_NUDGE_MARKER}\n${usageLine}\n${action}\n${CONTEXT_NUDGE_MARKER}`;
 	const nudgeTokens = estimateMessageTokens({ role: "system", content: nudge });
 	if (hostWindow > 0 && tokens + nudgeTokens + CONTEXT_RESERVE_TOKENS > hostWindow) return undefined;
