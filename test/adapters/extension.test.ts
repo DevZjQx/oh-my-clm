@@ -121,6 +121,51 @@ test("extension mirrors a projection and emits persistent context edits at turn_
 	assert.ok(notified.includes(mirrorPath));
 });
 
+// docs/plan.md §5.1 / case 10 (red): the Pi appendix must carry the same
+// "when to clean" trigger condition as DSH, and must not simultaneously tell
+// the model to "do not read or print the file" and to "rewrite only from a
+// complete current body" — you cannot rewrite a body you never read (I-7).
+// Both are currently true of the appendix, so these assertions are expected
+// to fail until §5.1 is implemented.
+test("plan §5.1 (case 10, Pi): appendix states when to clean and drops the self-read contradiction", () => {
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerCommand: () => undefined,
+		registerTool: () => undefined,
+	};
+	extension(api as any);
+	const beforeStart = { systemPromptOptions: {} as Record<string, string> };
+	const ctx = {
+		cwd: fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-")),
+		hasUI: false,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: () => undefined },
+		sessionManager: { getSessionId: () => "plan-5-1-pi" },
+	};
+	handlers.get("before_agent_start")?.(beforeStart, ctx);
+	const prompt = beforeStart.systemPromptOptions.appendSystemPrompt ?? "";
+	assert.match(
+		prompt,
+		/(?:sub-question|subtask|子任务|收到清理候选|cleanup candidate|complet\w+ (?:a )?(?:sub)?task|at .{0,24}boundar\w*|(?:when|once|after) .{0,80}cleanup)/i,
+		"Pi appendix must carry an explicit cleanup trigger condition (§5.1)",
+	);
+	const selfReadContradiction =
+		/do not read or print the file/i.test(prompt) &&
+		/rewrite only from a (?:block's )?complete current body/i.test(prompt);
+	assert.equal(
+		selfReadContradiction,
+		false,
+		"Pi appendix must not forbid reading the file while requiring a complete current body (§5.1 / I-7)",
+	);
+	assert.ok(prompt.length <= 1000, `Pi live-context prompt grew to ${prompt.length} chars`);
+});
+
 test("Pi cleanup removes selected mirror spans in one tool execution", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-cleanup-tool-"));
 	const sessionId = "cleanup-tool-session";

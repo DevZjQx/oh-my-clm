@@ -695,6 +695,28 @@ test("DSH cleanup tool value passes the declared output schema", async () => {
 	}
 });
 
+// docs/plan.md §5.1 / case 10 (red): the DSH static prompt must state *when*
+// to clean (an explicit trigger condition), must not end by telling the model
+// that nothing is required, and must stay inside the standing-tax budget.
+// Today it only says *how* to clean and closes with "Nothing else is required
+// of you.", so these assertions are expected to fail until §5.1 is implemented.
+test("plan §5.1 (case 10, DSH): static prompt states when to clean within the length budget", () => {
+	const root = listenerContext();
+	dshHost({ ...root } as any);
+	const promptSection = root.sections[0]?.text ?? "";
+	assert.doesNotMatch(
+		promptSection,
+		/Nothing else is required of you/i,
+		"DSH prompt must not dissuade the model from cleaning (§5.1)",
+	);
+	assert.match(
+		promptSection,
+		/(?:sub-question|subtask|子任务|收到清理候选|cleanup candidate|complet\w+ (?:a )?(?:sub)?task|at .{0,24}boundar\w*|(?:when|once|after) .{0,80}cleanup)/i,
+		"DSH prompt must carry an explicit cleanup trigger condition (§5.1)",
+	);
+	assert.ok(promptSection.length <= 800, `live-context prompt grew to ${promptSection.length} chars`);
+});
+
 test("mock DSH host loads the entry, registers hooks, and mutates the active surface", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-dsh-host-"));
 	const root = listenerContext();
