@@ -3,9 +3,11 @@ import test from "node:test";
 import { estimateMessageTokens as piEstimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import {
 	buildMirrorRecords,
+	calibrateWithHostUsage,
 	estimateMessageTokens,
 	estimateMirrorTokens,
 	estimateTokens,
+	hostUsageOf,
 	mirrorSignature,
 	parseMirror,
 	planContextEdits,
@@ -813,6 +815,42 @@ test("plan §5.1 gate (P1-2): host usage calibrates the shrink gate and fails cl
 		"rejected",
 		"an edit must be rejected when the host reports a nearly full real context window (estimate + host-cap double check)",
 	);
+});
+
+// §5.1 gate: a host figure larger than its own window is never occupancy.
+// DSH's `tokenUsage` totals are cumulative ("durable cumulative provider usage
+// for a complete session log"), so after a few turns they exceed the window;
+// calibrating the gate with them rejected every cleanup, however large.
+test("plan §5.1 gate (P1-2): host usage above its own window is not occupancy", () => {
+	assert.equal(
+		hostUsageOf({ tokens: 3_375_000, contextWindow: 1_048_576 }),
+		undefined,
+		"a cumulative total must be dropped, not used as `beforeTokens`",
+	);
+	assert.deepEqual(
+		hostUsageOf({ tokens: 900_000, contextWindow: 1_048_576 }),
+		{ tokens: 900_000, contextWindow: 1_048_576 },
+		"a plausible occupancy value still calibrates the gate",
+	);
+});
+
+// §5.1 gate: when the baseline already fills its own window, no cleanup can
+// reach the cap, so fail-closed deadlocks the tool (every range rejected,
+// nothing removed). Such a baseline must admit any strict shrink and say why;
+// the headroom band below the window keeps the original fail-closed behavior.
+test("plan §5.1 gate (P1-2): an at-window baseline admits a strict shrink instead of deadlocking", () => {
+	const shrink = calibrateWithHostUsage(10_000, 9_700, { tokens: 10_000, contextWindow: 10_000 });
+	assert.equal(shrink.reason, undefined, "an at-window shrink must not be rejected");
+	assert.equal(shrink.afterTokens, 9_700);
+	assert.match(shrink.warning ?? "", /already at the window/);
+
+	const growth = calibrateWithHostUsage(10_000, 10_000, { tokens: 10_000, contextWindow: 10_000 });
+	assert.match(growth.reason ?? "", /does not shrink/);
+
+	// Inside the 95%-100% band a shrink that still misses the cap is rejected:
+	// a larger cleanup can fit, so "free more" is real advice, not a deadlock.
+	const nearCap = calibrateWithHostUsage(9_800, 9_600, { tokens: 9_800, contextWindow: 10_000 });
+	assert.match(nearCap.reason ?? "", /free more context/);
 });
 
 // §3 case 4a / P1-3: an untrusted body cannot forge a privileged source claim.

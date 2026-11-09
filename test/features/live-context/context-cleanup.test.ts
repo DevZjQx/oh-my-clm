@@ -641,3 +641,44 @@ test("plan §5.4 (case 13): rewriteMirrorBlocks refuses a remove/offload conflic
 	assert.equal(missing.ok, false);
 	assert.match(missing.ok === false ? missing.reason : "", /not found/);
 });
+
+// Regression for the DSH deadlock: `tokenUsage` is a cumulative billing fold, so
+// after a few turns it exceeds the window and the calibrator rejected every
+// cleanup - even one that removed every editable block (`removedBlockIds: []`).
+test("plan §5.1 gate (P1-2): a cumulative host total cannot deadlock cleanup", () => {
+	const records: MirrorRecord[] = [
+		{ id: "task", role: "user", text: "Keep the task.", protected: true, toolCallIds: [] },
+		{ id: "anchor", role: "assistant", text: "Anchor.", protected: false, toolCallIds: [] },
+		{ id: "stale", role: "assistant", text: "x".repeat(2_000), protected: false, toolCallIds: [] },
+	];
+	const structural = parseCleanupMirror(renderMirror(records));
+	// Editable ordinals: anchor=1, stale=2.
+
+	// Above its own window the figure is not occupancy (DSH reports the whole
+	// session's billed prompt tokens here): the gate falls back to the labelled
+	// estimate and the cleanup applies, with no warning.
+	const bogus = planCleanup(records, structural, validArgs({ ranges: ["2-2"] }), {
+		hostUsage: { tokens: 3_375_000, contextWindow: 1_048_576 },
+	});
+	assert.equal(bogus.status, "applied");
+	assert.deepEqual(bogus.removedBlockIds, [2]);
+	assert.deepEqual(bogus.warnings, []);
+
+	// A baseline already at the window cannot reach the cap by any cleanup, so a
+	// strict shrink is applied (with a warning) instead of refused.
+	const atWindow = planCleanup(records, structural, validArgs({ ranges: ["2-2"] }), {
+		hostUsage: { tokens: 1_048_576, contextWindow: 1_048_576 },
+	});
+	assert.equal(atWindow.status, "applied");
+	assert.ok(atWindow.afterTokens < atWindow.beforeTokens);
+	assert.match(atWindow.warnings.join(" "), /already at the window/);
+	assert.deepEqual(atWindow.removedBlockIds, [2]);
+
+	// In the headroom band the gate still fails closed: a larger cleanup can fit.
+	const nearCap = planCleanup(records, structural, validArgs({ ranges: ["2-2"] }), {
+		hostUsage: { tokens: 1_030_000, contextWindow: 1_048_576 },
+	});
+	assert.equal(nearCap.status, "rejected");
+	assert.match(nearCap.reason ?? "", /free more context/);
+	assert.deepEqual(nearCap.removedBlockIds, []);
+});

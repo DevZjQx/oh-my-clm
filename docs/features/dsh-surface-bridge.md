@@ -93,7 +93,7 @@ host bridge 可选读取以下变量；它们只影响 mirror preview、shrink-o
 
 所有 `CLM_TRIGGER_*` 默认关闭：阈值尚未在真实 DeepSeek-V4.1-Flash 会话上标定，机制先以可关闭形态交付（见 `docs/plan.md` §5.2）。命中后在 `systemPrompt.context()` 的同一个 `<oh-my-clm-block-index>` 里追加一行用量和一条可直接确认的候选：
 
-- 用量行 `Usage: X/Y tokens (Z%) · N editable blocks · last cleanup at turn K` 的 `X` 优先取宿主精确值（`sessionProjections` 的 `tokenUsage`），取不到才退回 `~` 估算，窗口未知时显式写 `window unknown`，不静默冒充精确值。该服务通过 `ctx.get("sessionProjections")` 读取（免 inject，见 §1），缺失时只降级用量行，不影响 `/clm status` 或 block index。Pi 侧的 budget nudge 复用同一套用量行与候选格式（§5.3），只是触发源换成 Pi 的预算水位。
+- 用量行 `Usage: X/Y tokens (Z%) · N editable blocks · last cleanup at turn K` 的 `X` 优先取宿主精确值：`contextPressure.projectedTokens`（provider 采样 + 采样后表面增量，即下一次请求的 prompt 估算价），缺失时退到 `pressureTokens`（最近一次请求的 prompt 大小）；取不到才退回 `~` 估算，窗口未知时显式写 `window unknown`，不静默冒充精确值。**`tokenUsage` 是整段会话的累计计费桶，不是水位**：它的 wire view 是 `state.totals`，DSH 类型注释写明 "durable cumulative provider usage for a complete session log"；当成 `beforeTokens` 会在几十轮后报出 300%+ 并让每次 cleanup 都被拒（`/clm status` 的标签也相应改为 `DSH projectedTokens:`）。该服务通过 `ctx.get("sessionProjections")` 读取（免 inject，见 §1），缺失时只降级用量行，不影响 `/clm status` 或 block index。Pi 侧的 budget nudge 复用同一套用量行与候选格式（§5.3），只是触发源换成 Pi 的预算水位。
 - 候选只取已完成的 turn（正在进行的 turn 仍可能补齐 tool 配对），按“可省 token × 陈旧度”排序，并永不包含 block 1；候选以“区间 + 保留规则”的形式给出（`ranges` 加 `skipRoles: ["user"]`），因为 turn 以 user 块开头，裸区间会连人类请求一起删掉，而引用的节省数字已经扣除了被保留的 user 块；模型只做确认或改范围，开放题变成核对。
 - 用量行与候选按 turn 边界渲染并按 `(已完成 turn 数, 触发配置)` 缓存，同一 turn 内逐字节不变，因此 DSH 仍然只在 turn 边界追加一次快照；`cleanup` / mirror edit 生效或 compaction 后清空缓存（删除会重排 ID）。
 | `CLM_CLEANUP_RESULT` | `compact` | `compact` / `full` / `none`，只影响 cleanup 的模型可见结果。 |

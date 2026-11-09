@@ -66,7 +66,7 @@ DSH 的 runtime context 会包含 `<oh-my-clm-block-index>`，有两种模式（
 
 每个 DSH 快照的头部还有一行用量，命中触发条件时索引末尾追加一条清理候选：
 
-- 用量行形如 `Usage: 12.3k/128k tokens (9.6%) · 18 editable blocks · last cleanup at turn 4`。token 数优先取宿主精确值（`sessionProjections` 的 `tokenUsage`，即 `cacheReadTokens + uncachedInputTokens`）；取不到时显示 `~` 估算，窗口也不可知时写 `window unknown`，不会把估算冒充精确值（P1-2）。
+- 用量行形如 `Usage: 12.3k/128k tokens (9.6%) · 18 editable blocks · last cleanup at turn 4`。token 数优先取宿主精确值：`sessionProjections` 的 `contextPressure.projectedTokens`（下一次请求的 prompt 估算价），缺失时退到同一投影的 `pressureTokens`（最近一次请求的 prompt 大小）。**不要用 `tokenUsage` 的 `cacheReadTokens + uncachedInputTokens`**——那是整段会话的累计计费账（DSH 文档原文 "durable cumulative provider usage for a complete session log"），跑几轮就会超过窗口，拿它当水位会让每次 cleanup 都显得不安全；取不到时显示 `~` 估算，窗口也不可知时写 `window unknown`，不会把估算冒充精确值（P1-2）。
 - 命中任一触发阈值时，`<oh-my-clm-block-index>` 末尾给出可直接确认的候选：`Suggested cleanup (usage 80% ≥ 70%): cleanup({ ranges: ["3-5"], skipRoles: ["user"] }) frees ~120 tok.`，随后一行列出每个区间的预计节省与陈旧度。候选带上已有的 `skipRoles: ["user"]`：turn 以 user 块开头，裸区间会连人类请求一起删掉，而引用的节省数字已经扣除了被保留的 user 块。候选只取**已完成的 turn**，永不包含 block 1 和当前 turn；模型只需要确认或改范围，不必自己判断何时清理。
 - 用量行与候选按 **turn 边界** 计算并缓存，同一 turn 内逐字节不变，不会每步追加一份快照；`cleanup` 或 mirror edit 生效后清空缓存（删除会重排 ID），compaction 由宿主适配器清空。
 - 所有触发阈值默认关闭（`0`），因为尚未在真实 DeepSeek-V4.1-Flash 会话上标定；打开方式见下文 `CLM_TRIGGER_*`。
@@ -184,7 +184,7 @@ Pi 侧的 mirror 显示上限是固定的：单 block 约 `12000` 字符，总 m
 
 token 计数使用共享格式层的 provider-independent `estimateMessageTokens(message)`，按消息分别估算。对当前 Pi 支持的 text、thinking、tool call、图片、system sections 和 tool declarations，ASCII 文本沿用与 Pi host 一致的 `3.5 chars/token` 近似及按消息 rounding；非 ASCII 字符（CJK、emoji 等）按约 1 token/字符加权，assistant 的字符串正文也按正文计入（此前计 0）。共享层不导入 Pi runtime，但会显式处理 DSH 的 `reasoning`、`tool-call`、`tool` 等形状；只有未识别的其他自有消息形状才走 fallback 估算。
 
-当前 Pi extension 的公开 `ExtensionContext` 只提供 effective system prompt，`fixedRequestTokens` 因此只计该 prompt；tool declaration overhead 只有在 host 传入结构化 system message 时才会被计入，否则这个估算就不完整。**它不是 provider 的精确 tokenizer**：加权只保证"换语种导致真实 token 增长"不再被误判为收缩；估算只用于编辑前后的有符号 delta，`beforeTokens` 与硬上限改取宿主精确用量（Pi `ctx.getContextUsage()`；DSH 走免 inject 的 `ctx.get("sessionProjections")` 取 `tokenUsage` / `contextPressure`，见 [dsh-surface-bridge.md](./docs/features/dsh-surface-bridge.md) §1）。校准后编辑用量仍高于窗口 95% 时拒绝（`HOST_CAP_HEADROOM`，待真实 V4.1-Flash 会话标定）；宿主用量取不到时 status 显式标 `~`，不静默当作精确值。
+当前 Pi extension 的公开 `ExtensionContext` 只提供 effective system prompt，`fixedRequestTokens` 因此只计该 prompt；tool declaration overhead 只有在 host 传入结构化 system message 时才会被计入，否则这个估算就不完整。**它不是 provider 的精确 tokenizer**：加权只保证"换语种导致真实 token 增长"不再被误判为收缩；估算只用于编辑前后的有符号 delta，`beforeTokens` 与硬上限改取宿主精确用量（Pi `ctx.getContextUsage()`；DSH 走免 inject 的 `ctx.get("sessionProjections")` 取 `contextPressure` 的 `projectedTokens` / `pressureTokens` 与窗口，见 [dsh-surface-bridge.md](./docs/features/dsh-surface-bridge.md) §1）。校准后编辑用量仍高于窗口 95% 时拒绝（`HOST_CAP_HEADROOM`，待真实 V4.1-Flash 会话标定）；宿主用量取不到时 status 显式标 `~`，不静默当作精确值。宿主数字超过自己声明的窗口时视为口径错误（单次请求不可能超窗）而退回估算；基线本身已占满窗口时，任何 cleanup 都到不了水位，此时放行严格收缩并给 warning，避免门控死锁。
 
 ### mirror 文件位置与权限
 

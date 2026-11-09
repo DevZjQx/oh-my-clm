@@ -737,8 +737,11 @@ test("plan §5.2 (case 11): usage line and cleanup candidates follow host usage 
 		snapshot() {
 			return {
 				values: {
-					tokenUsage: { cacheReadTokens: tokensUsed, uncachedInputTokens: 0 },
-					contextPressure: { contextWindow: 8_000 },
+					// Billing totals are cumulative for the whole session. They must
+					// not reach the gate: as occupancy they read 300%+ on a 1M window
+					// and rejected every cleanup, however much it removed.
+					tokenUsage: { cacheReadTokens: 3_375_000, uncachedInputTokens: 0 },
+					contextPressure: { contextWindow: 8_000, pressureTokens: tokensUsed },
 				},
 			};
 		},
@@ -1093,7 +1096,7 @@ test("DSH defers a pending edit until step/start opens the next step", async () 
 	}
 });
 
-test("DSH reads host-exact tokenUsage from sessionProjections and labels the fallback", async () => {
+test("DSH reads contextPressure occupancy from sessionProjections and labels the fallback", async () => {
 	const root = listenerContext();
 	const snapshotKeys: Array<readonly string[] | undefined> = [];
 	const projections = {
@@ -1102,13 +1105,16 @@ test("DSH reads host-exact tokenUsage from sessionProjections and labels the fal
 			return {
 				asOfSeq: 12,
 				values: {
+					// Cumulative billed prompt tokens for the session: 3.3M on a 10k
+					// window. Reading these as occupancy reported 322% and deadlocked
+					// the shrink gate; only contextPressure is occupancy.
 					tokenUsage: {
-						uncachedInputTokens: 800,
+						uncachedInputTokens: 3_370_000,
 						outputTokens: 120,
-						cacheReadTokens: 9_000,
+						cacheReadTokens: 5_000,
 						cacheWriteTokens: 0,
 					},
-					contextPressure: { contextWindow: 10_000 },
+					contextPressure: { contextWindow: 10_000, pressureTokens: 9_000, projectedTokens: 9_800 },
 				},
 			};
 		},
@@ -1130,8 +1136,12 @@ test("DSH reads host-exact tokenUsage from sessionProjections and labels the fal
 	try {
 		const status = await command.handler(invocation);
 		assert.equal(status.kind, "success", status.text);
-		assert.match(status.text, /DSH tokenUsage: 9800\/10000 tokens \(host-exact/);
-		assert.ok(snapshotKeys.some((keys) => keys?.includes("tokenUsage")));
+		assert.match(status.text, /DSH projectedTokens: 9800\/10000 tokens \(contextPressure/);
+		assert.ok(snapshotKeys.some((keys) => keys?.includes("contextPressure")));
+		assert.ok(
+			snapshotKeys.every((keys) => !keys || !keys.includes("tokenUsage")),
+			"the cumulative tokenUsage totals must never be read as occupancy",
+		);
 
 		// Without the projection service the fallback must be visibly labelled,
 		// never passed off as an exact value (P1-2 / docs/plan.md §5.2).
@@ -1139,7 +1149,7 @@ test("DSH reads host-exact tokenUsage from sessionProjections and labels the fal
 		dshHost({ ...bare } as any);
 		const fallback = await bare.commands.definitions.get("clm").handler(invocation);
 		assert.equal(fallback.kind, "success", fallback.text);
-		assert.match(fallback.text, /DSH tokenUsage: unavailable; the shrink gate falls back to the ~ estimate/);
+		assert.match(fallback.text, /DSH projectedTokens: unavailable; the shrink gate falls back to the ~ estimate/);
 	} finally {
 		fs.rmSync(path.dirname(mirrorPath), { recursive: true, force: true });
 		fs.rmSync(cwd, { recursive: true, force: true });
@@ -1158,8 +1168,8 @@ test("DSH reads sessionProjections through ctx.get, not an undeclared property",
 			return {
 				asOfSeq: 12,
 				values: {
-					tokenUsage: { uncachedInputTokens: 800, cacheReadTokens: 9_000 },
-					contextPressure: { contextWindow: 10_000 },
+					tokenUsage: { uncachedInputTokens: 3_000_000, cacheReadTokens: 9_000_000 },
+					contextPressure: { contextWindow: 10_000, projectedTokens: 9_800 },
 				},
 			};
 		},
@@ -1199,7 +1209,7 @@ test("DSH reads sessionProjections through ctx.get, not an undeclared property",
 	try {
 		const status = await command.handler(invocation);
 		assert.equal(status.kind, "success", status.text);
-		assert.match(status.text, /DSH tokenUsage: 9800\/10000 tokens \(host-exact/);
+		assert.match(status.text, /DSH projectedTokens: 9800\/10000 tokens \(contextPressure/);
 		assert.ok(readKeys.includes("sessionProjections"), "usage must be read through ctx.get");
 
 		// The same read path feeds the runtime block index, so it must still render.

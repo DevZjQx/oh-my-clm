@@ -2,7 +2,16 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/features/live-context-mirror.md`](./docs/features/live-context-mirror.md)。
 
-## 0.1.15（当前版本）
+## 未发布
+
+修复 DSH 宿主上 shrink 门永远拒绝 cleanup 的死锁：水位取错了投影。`npm test` 138/138、`npm run check`、`npm run typecheck` 全通过。
+
+- **`tokenUsage` 是累计计费账，不是上下文占用。** `dsh/index.ts` 的 `hostUsageFor` 原本把 `sessionProjections` 的 `tokenUsage`（`cacheReadTokens + uncachedInputTokens`）当 `beforeTokens`，但该投影的 wire view 是 `state.totals`，DSH 类型注释写明它是 "durable cumulative provider usage for a complete session log"。真实会话中它几轮后就超过窗口（观测值 3,375k / 1,049k ≈ 322%），于是 `calibrateWithHostUsage` 永远判「清理后仍超 95% 水位」，包括 `ranges: ["2-106"]` 删光全部可编辑块也被拒，且 `removedBlockIds` 恒为 `[]`。现在改用 `contextPressure.projectedTokens`（下一次请求的 prompt 估算价，缺失时退 `pressureTokens`）；`tokenUsage` 不再进 shrink 门，`/clm status` 的标签改为 `DSH projectedTokens:` 以免继续误导模型。
+- **超过自身窗口的宿主数字不再被当成水位。** `hostUsageOf` 现在拒绝 `tokens > contextWindow`：单次请求不可能超窗，这种数字是口径错误（累计账或误报），应退回带 `~` 的估算，而不是把门控焊死。
+- **基线已占满窗口时不再死锁。** `calibrateWithHostUsage` 在 `beforeTokens >= contextWindow` 时放行严格收缩，并在 plan / cleanup 的 `warnings` 里说明「只有 compaction 能恢复真实余量」；95%~100% 区间仍 fail-closed（更大的 cleanup 还能降到水位以下，"free more context" 是真建议）。
+- **回归。** 新增：累计 3,375k + 1,049k 窗口不阻塞 cleanup、at-window 严格收缩放行且给出 warning、95% 区间仍拒绝、`hostUsageOf` 丢弃超窗值；DSH 状态与触发链路断言只读 `contextPressure`、即使 `tokenUsage` 在场也不读。`npm test` 138/138（原 135）。
+
+## 0.1.15
 
 修复 DSH 宿主上 `/clm status` 与 runtime block index 一起失效的问题：可选服务 `sessionProjections` 不在 `inject` 里，却仍被当成普通属性读取。`npm test` 135/135、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
 

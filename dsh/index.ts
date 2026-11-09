@@ -239,11 +239,12 @@ function optionalService<T>(ctx: DshContext | undefined, name: string): T | unde
 	}
 }
 
-interface DshTokenUsage {
-	readonly cacheReadTokens?: unknown;
-	readonly uncachedInputTokens?: unknown;
-	readonly cacheWriteTokens?: unknown;
-	readonly outputTokens?: unknown;
+interface DshPressureProjection {
+	readonly contextWindow?: unknown;
+	/** Provider-reported prompt size of the most recent request. */
+	readonly pressureTokens?: unknown;
+	/** That sample repriced for the next request (sample + surface delta). */
+	readonly projectedTokens?: unknown;
 }
 
 /** Window field of the official contextPressure / sessionStats projections. */
@@ -251,22 +252,33 @@ interface DshWindowProjection {
 	readonly contextWindow?: unknown;
 }
 
+const nonNegativeCount = (value: unknown): number | undefined =>
+	typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+
 /**
- * Exact usage from the DSH host's projection service. dsh-context reads the
- * same kernel values via `sessionProjections.snapshot(session, KERNEL_KEYS)`
- * (KERNEL_KEYS = sessionStats / tokenUsage / contextBreakdown); the official
- * contextPressure projection carries contextWindow. Prompt tokens are the two
- * input billing buckets per docs/plan.md §5.2 — outputTokens is not part of
- * the context window, and cacheWriteTokens is a subset of the uncached bucket.
- * Any missing or invalid shape returns undefined, so the fallback is labelled
- * `~` instead of being passed off as exact.
+ * Occupancy from the DSH host's `contextPressure` projection.
+ *
+ * Do NOT read `tokenUsage`: its wire view is `state.totals`, documented as
+ * "durable cumulative provider usage for a complete session log"
+ * (`@deepseek-ai/dsh-token-meter/lib/types/projection.d.ts`). Summing its two
+ * input buckets counts every prompt of the session, so a 20-turn session on a
+ * 1M window reports millions of tokens and 300%+ pressure. Fed into the shrink
+ * gate as `beforeTokens`, that number rejects every cleanup - however much it
+ * removes - because the calibrated post-edit usage can never drop below the
+ * cap. Occupancy is `projectedTokens` (the next request's prompt: provider
+ * sample plus the surface's signed delta since it was sampled), with
+ * `pressureTokens` (the raw last sample) as the fallback; both are whole
+ * values, never sums over the log.
+ *
+ * No sample yet (or no window) returns undefined, so callers label the
+ * estimate `~` instead of passing a cumulative total off as exact.
  */
 function hostUsageFor(session: DshSessionLike): HostUsage | undefined {
 	const projections = optionalService<DshProjectionService>(activeContext, "sessionProjections");
 	if (typeof projections?.snapshot !== "function") return undefined;
 	let block: unknown;
 	try {
-		block = projections.snapshot(session, ["tokenUsage", "contextPressure", "sessionStats"]);
+		block = projections.snapshot(session, ["contextPressure", "sessionStats"]);
 	} catch {
 		return undefined;
 	}
@@ -274,19 +286,17 @@ function hostUsageFor(session: DshSessionLike): HostUsage | undefined {
 	const values = (block as { values?: unknown }).values;
 	if (typeof values !== "object" || values === null) return undefined;
 	const record = values as Record<string, unknown>;
-	const usage = record.tokenUsage;
-	if (typeof usage !== "object" || usage === null) return undefined;
-	const inputTokens = usage as DshTokenUsage;
-	const bucket = (value: unknown): number =>
-		typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
-	const tokens = bucket(inputTokens.cacheReadTokens) + bucket(inputTokens.uncachedInputTokens);
-	const pressure = record.contextPressure as DshWindowProjection | undefined;
+	const pressure = record.contextPressure as DshPressureProjection | undefined;
+	if (typeof pressure !== "object" || pressure === null) return undefined;
+	const tokens = nonNegativeCount(pressure.projectedTokens) ?? nonNegativeCount(pressure.pressureTokens);
+	if (tokens === undefined) return undefined;
 	const stats = record.sessionStats as DshWindowProjection | undefined;
-	const windowCandidate = pressure?.contextWindow ?? stats?.contextWindow;
+	const windowCandidate = pressure.contextWindow ?? stats?.contextWindow;
 	const configuredWindow = positiveEnv("CLM_CONTEXT_WINDOW", 0);
 	const contextWindow = typeof windowCandidate === "number" && windowCandidate > 0
 		? windowCandidate
 		: (configuredWindow > 0 ? configuredWindow : undefined);
+	if (contextWindow === undefined) return undefined;
 	return hostUsageOf({ tokens, contextWindow });
 }
 
@@ -505,8 +515,8 @@ function dshStatusText(session: DshSessionLike, options: DshBridgeOptions): stri
 		`mirror preview: ~${previewTokens} tokens; canonical editable: ~${canonicalTokens} tokens`,
 		`estimated request: ~${fixedTokens + canonicalTokens} tokens (fixed request ~${fixedTokens} + editable mirror ~${canonicalTokens})`,
 		options.hostUsage
-			? `DSH tokenUsage: ${options.hostUsage.tokens}/${options.hostUsage.contextWindow} tokens (host-exact; the 3.5 chars/token estimate is used only for the edit delta)`
-			: "DSH tokenUsage: unavailable; the shrink gate falls back to the ~ estimate",
+			? `DSH projectedTokens: ${options.hostUsage.tokens}/${options.hostUsage.contextWindow} tokens (contextPressure occupancy; host-exact, the 3.5 chars/token estimate is used only for the edit delta)`
+			: "DSH projectedTokens: unavailable; the shrink gate falls back to the ~ estimate",
 		`DSH surface nodes: ${session.surface.nodes.length}`,
 		`block index: ${options.indexMode ?? "blocks"}`,
 		"edit policy: shrink-only",

@@ -717,11 +717,13 @@ export function planCleanup(
 	}, 0);
 	let beforeTokens = estimatedBefore;
 	let afterTokens = estimatedAfter;
+	const warnings: string[] = [];
 	const hostUsage = hostUsageOf(options.hostUsage);
 	if (hostUsage) {
 		const calibrated = calibrateWithHostUsage(estimatedBefore, estimatedAfter, hostUsage);
 		beforeTokens = calibrated.beforeTokens;
 		afterTokens = calibrated.afterTokens;
+		if (calibrated.warning) warnings.push(calibrated.warning);
 		if (calibrated.reason) return rejectPlan(targetBlockIds(args.args), calibrated.reason, beforeTokens);
 	}
 	if (afterTokens >= beforeTokens) {
@@ -765,7 +767,7 @@ export function planCleanup(
 		afterTokens,
 		changedIds,
 		omittedIds: omitted.map((record) => record.id),
-		warnings: [],
+		warnings,
 		requestedBlockIds: [...args.args.blockIds],
 		removedBlockIds,
 		pairedRemovalIds,

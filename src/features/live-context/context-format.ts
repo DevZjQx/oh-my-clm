@@ -234,12 +234,22 @@ export interface HostUsage {
  */
 export const HOST_CAP_HEADROOM = 0.05;
 
-/** Validate an untrusted host usage value before it replaces an estimate. */
+/**
+ * Validate an untrusted host usage value before it replaces an estimate.
+ *
+ * One request cannot occupy more than its own window, so `tokens >
+ * contextWindow` is never occupancy. DSH's `tokenUsage` projection is a
+ * *cumulative* billing fold ("durable cumulative provider usage for a complete
+ * session log") and exceeds the window after a few turns; accepting it as
+ * `beforeTokens` makes every cleanup look unsafe. Such a value is dropped here
+ * so callers fall back to the labelled estimate instead of a deadlocked gate.
+ */
 export function hostUsageOf(value: unknown): HostUsage | undefined {
 	if (typeof value !== "object" || value === null) return undefined;
 	const { tokens, contextWindow } = value as { tokens?: unknown; contextWindow?: unknown };
 	if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0) return undefined;
 	if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) return undefined;
+	if (tokens > contextWindow) return undefined;
 	return { tokens: Math.ceil(tokens), contextWindow: Math.ceil(contextWindow) };
 }
 
@@ -247,6 +257,11 @@ export interface HostUsageCalibration {
 	beforeTokens: number;
 	afterTokens: number;
 	reason?: string;
+	/**
+	 * Advisory attached to an admitted shrink: the edit helps, but the baseline
+	 * already fills its own window, so only compaction restores real headroom.
+	 */
+	warning?: string;
 }
 
 /**
@@ -263,10 +278,32 @@ export function calibrateWithHostUsage(
 	const beforeTokens = hostUsage.tokens;
 	const afterTokens = Math.max(0, beforeTokens + (afterEstimate - beforeEstimate));
 	const safeCap = hostUsage.contextWindow * (1 - HOST_CAP_HEADROOM);
-	const reason = afterTokens > safeCap
-		? `Host context usage is ~${beforeTokens}/${hostUsage.contextWindow} tokens; the calibrated post-edit usage (~${afterTokens}) still exceeds the safe cap (~${Math.floor(safeCap)}). The 3.5 chars/token estimate is not a provider tokenizer — free more context with a larger cleanup before rewriting.`
-		: undefined;
-	return { beforeTokens, afterTokens, reason };
+	if (afterTokens <= safeCap) return { beforeTokens, afterTokens };
+	const cap = Math.floor(safeCap);
+	if (beforeTokens >= hostUsage.contextWindow) {
+		// The baseline already fills its own window, so no cleanup can reach the
+		// cap: the only reachable goal is a strict shrink. Rejecting here would
+		// deadlock the gate - even a cleanup that removes every editable block
+		// would be refused. Inside the headroom band (cap < before < window) the
+		// planned behavior stays fail-closed: a larger cleanup can still fit.
+		if (afterTokens >= beforeTokens) {
+			return {
+				beforeTokens,
+				afterTokens,
+				reason: `Host context usage is ~${beforeTokens}/${hostUsage.contextWindow} tokens, already at the window; this edit does not shrink it. Omit or shorten more text before rewriting.`,
+			};
+		}
+		return {
+			beforeTokens,
+			afterTokens,
+			warning: `Host context usage is ~${beforeTokens}/${hostUsage.contextWindow} tokens, already at the window (safe cap ~${cap}). Accepted because it shrinks by ~${beforeTokens - afterTokens} tokens, but only compaction restores real headroom.`,
+		};
+	}
+	return {
+		beforeTokens,
+		afterTokens,
+		reason: `Host context usage is ~${beforeTokens}/${hostUsage.contextWindow} tokens; the calibrated post-edit usage (~${afterTokens}) still exceeds the safe cap (~${cap}). The 3.5 chars/token estimate is not a provider tokenizer — free more context with a larger cleanup before rewriting.`,
+	};
 }
 
 export interface EditPlanOptions {
@@ -1592,6 +1629,7 @@ export function planContextEdits(
 		const calibrated = calibrateWithHostUsage(estimatedBefore, estimatedAfter, hostUsage);
 		beforeTokens = calibrated.beforeTokens;
 		afterTokens = calibrated.afterTokens;
+		if (calibrated.warning) warnings.push(calibrated.warning);
 		if (calibrated.reason) {
 			return {
 				status: "rejected",
