@@ -2,7 +2,7 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/features/live-context-mirror.md`](./docs/features/live-context-mirror.md)。
 
-## 未发布
+## 0.1.16（当前版本）
 
 修复 DSH 宿主上 shrink 门永远拒绝 cleanup 的死锁：水位取错了投影。`npm test` 138/138、`npm run check`、`npm run typecheck` 全通过。
 
