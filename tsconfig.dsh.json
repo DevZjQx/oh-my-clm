@@ -11,6 +11,7 @@
   "include": [
     "src/features/live-context/context-cleanup.ts",
     "src/features/live-context/context-format.ts",
+    "src/features/live-context/context-trigger.ts",
     "src/features/live-context/dsh-bridge.ts",
     "dsh/index.ts"
   ]

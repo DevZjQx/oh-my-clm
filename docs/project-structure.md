@@ -12,8 +12,9 @@ oh-my-clm
 │   │   └── clm-paths.ts         # /tmp/clm-<sessionId> 路径解析
 │   └── features
 │       └── live-context         # 唯一的业务领域：live context mirror
-│           ├── context-format.ts   # record 构建、渲染/解析、snapshot、编辑规划
-│           ├── context-cleanup.ts  # block-ID cleanup 参数与 span 删除
+│           ├── context-format.ts   # record 构建、渲染/解析、snapshot、编辑规划、span 删除/改写
+│           ├── context-cleanup.ts  # block-ID cleanup 参数、配对校验、删除与 offload
+│           ├── context-trigger.ts  # turn 边界触发、用量行与候选装配
 │           └── dsh-bridge.ts       # DSH surface 适配与 Session.append() mutation
 ├── extensions
 │   └── clm.ts                   # Pi host adapter（application 层）

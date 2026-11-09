@@ -64,7 +64,14 @@ DSH 的 runtime context 会包含 `<oh-my-clm-block-index>`，有两种模式（
 - `digest`（默认）：每个已完成的 turn 一行，给出包含式 ID 区间、块数、估算 token 成本和该 turn 的第一条 user 消息；正在进行的 turn 只给稳定的起始锚点（`IDs N..`），不列出。正常追加时文本在一个 turn 内不变，DSH 只在 turn 边界追加一条快照，而不是每步一条；`cleanup`、mirror edit 或 compaction 会清空缓存并在同一 turn 内重渲染（见下文 DSH 配置项）。
 - `blocks`（`CLM_INDEX_MODE=blocks`）：逐个列出可编辑 block，给出 cleanup 使用的 1-based ID、role 和短 preview。列表较长时显示前 12 个可编辑 block（“别动”锚点）加**最近 40 个**；两者之间的每个连续区间都用一行 `... N editable block(s) omitted (IDs A-B).` 标出，所以 ID 跳段不会被误读成空洞。
 
-`cleanup` 接受 `ranges: ["3-16"]`（包含式区间）或 `blockIds: [...]`（单块），还可以用 `skipRoles: ["user"]` 在一个 turn 区间里保留人类消息。配对级联删除（assistant tool call 与结果）会单独报告为 `paired`，不会混进你请求的 ID。显式单块 ID 仍然严格校验，range 越界会夹取，range 覆盖 block 1 时保留 block 1。`cleanup({ list: "3-16" })` 是只读的展开：返回该区间的行（role + 短 preview），不做任何删除，因此“索引只给了省略行、但我想先看清楚”不需要读整个 mirror；它不能和删除目标同时出现。只有需要完整、未截断的正文做 rewrite 时才需要读 mirror。
+每个 DSH 快照的头部还有一行用量，命中触发条件时索引末尾追加一条清理候选：
+
+- 用量行形如 `Usage: 12.3k/128k tokens (9.6%) · 18 editable blocks · last cleanup at turn 4`。token 数优先取宿主精确值（`sessionProjections` 的 `tokenUsage`，即 `cacheReadTokens + uncachedInputTokens`）；取不到时显示 `~` 估算，窗口也不可知时写 `window unknown`，不会把估算冒充精确值（P1-2）。
+- 命中任一触发阈值时，`<oh-my-clm-block-index>` 末尾给出可直接确认的候选：`Suggested cleanup (usage 80% ≥ 70%): cleanup({ ranges: ["3-5"], skipRoles: ["user"] }) frees ~120 tok.`，随后一行列出每个区间的预计节省与陈旧度。候选带上已有的 `skipRoles: ["user"]`：turn 以 user 块开头，裸区间会连人类请求一起删掉，而引用的节省数字已经扣除了被保留的 user 块。候选只取**已完成的 turn**，永不包含 block 1 和当前 turn；模型只需要确认或改范围，不必自己判断何时清理。
+- 用量行与候选按 **turn 边界** 计算并缓存，同一 turn 内逐字节不变，不会每步追加一份快照；`cleanup` 或 mirror edit 生效后清空缓存（删除会重排 ID），compaction 由宿主适配器清空。
+- 所有触发阈值默认关闭（`0`），因为尚未在真实 DeepSeek-V4.1-Flash 会话上标定；打开方式见下文 `CLM_TRIGGER_*`。
+
+`cleanup` 接受 `ranges: ["3-16"]`（包含式区间）或 `blockIds: [...]`（单块），还可以用 `skipRoles: ["user"]` 在一个 turn 区间里保留人类消息。不确定是否还需要某个 block 时用 `cleanup({ offload: [{ blockId, note }] })`：保留 ID / role / 位置，正文换成一行严格更短的 `[offloaded: <note>]`，要点由模型自己写（插件不引入第二个 summarizer）；`offload` 可与删除混用，block 1、user 块和会变长的占位都会被拒绝。配对级联删除（assistant tool call 与结果）会单独报告为 `paired`，不会混进你请求的 ID。显式单块 ID 仍然严格校验，range 越界会夹取，range 覆盖 block 1 时保留 block 1。`cleanup({ list: "3-16" })` 是只读的展开：返回该区间的行（role + 短 preview），不做任何删除，因此“索引只给了省略行、但我想先看清楚”不需要读整个 mirror；它不能和删除目标同时出现。只有需要完整、未截断的正文做 rewrite 时才需要读 mirror。
 
 ### 分支与持久化
 
@@ -157,7 +164,7 @@ pi -e .
 
 ### 预算与 nudge
 
-`CLM_CONTEXT_BUDGET` 是一个近似的目标预算，不是第二个 context window，也不会阻止已经过大的请求。当估算 token 达到约 `0.75 × max(1, budget - 2048)` 时，扩展会在 `context` hook 返回一条临时 nudge，允许模型做一次 `cleanup` 或一次 mirror 编辑；该 nudge 不写入 session history。没有设置预算时不发送 nudge。
+`CLM_CONTEXT_BUDGET` 是一个近似的目标预算，不是第二个 context window，也不会阻止已经过大的请求。未设置时预算默认取宿主窗口（`ctx.getContextUsage().contextWindow`）；当用量达到约 `0.75 × max(1, budget - 2048)` 时，扩展在**同一次请求**里追加一条临时 `system` 行（不占单独回合、不要求停手），内容是 §5.2 的用量行 + 可直接确认的 `cleanup({ ranges, skipRoles: ["user"] })` 候选；没有候选时提示做一次 `cleanup` 或一次 mirror 编辑。该行不写入 session history，`I-2` 的停止条件（连续两轮无进展即中止、轮数上限、压力消失后重置）仍在 state 里。设了 `CLM_CONTEXT_BUDGET` 时，用量行和百分比都以该预算为分母（与触发判定一致），而不是宿主窗口。
 
 ```bash
 CLM_CONTEXT_BUDGET=32000 pi --extension ./extensions/clm.ts
@@ -202,7 +209,7 @@ token 计数使用共享格式层的 provider-independent `estimateMessageTokens
 
 bridge 会对 mirror 编辑执行与 Pi 侧相同的 snapshot、结构安全和 shrink-only 校验；合法编辑通过 DSH 原生 `Session.append()` 的 `surfaceOp: { op: "replace" }` seam 写入当前 session，处理后再把 mirror 重写为新的 canonical DSH projection。
 
-当前 bridge 会改变 DSH active surface，这与 Pi 的 branch-local `context_edit` 不是一回事：cleanup 的删除计划全部是 `replacement: null`，因此只追加空 `developer/message` omission；普通 mirror 编辑在改写 tool result 时追加 `tool/result` content replacement，在改写/删除 assistant 时追加 `developer/message`（assistant 改写用缩短后的文本，删除用空 content）。原始事件仍保留在 append-only session log 中，`deriveMessages()` 使用新的 surface。
+当前 bridge 会改变 DSH active surface，这与 Pi 的 branch-local `context_edit` 不是一回事：cleanup 的删除是 `replacement: null`，因此只追加空 `developer/message` omission；`offload` 与普通 mirror 编辑则在改写 tool result 时追加 `tool/result` content replacement，在改写/删除 assistant 时追加 `developer/message`（改写用缩短后的文本，删除用空 content）。原始事件仍保留在 append-only session log 中，`deriveMessages()` 使用新的 surface。
 
 DSH 明确禁止 `assistant/message` 携带 `sourceEventSeqs`，而每个 replacement 又必须引用所有被遮蔽的节点，所以 assistant block 不能原地替换成另一个 assistant message。改写后的文本以 developer 身份进入模型可见历史，不再归属原模型回复；其 `source.kind` 由规划器来源派生（`oh-my-clm:model-mirror-edit` / `oh-my-clm:runtime-cleanup`），不再标记为 `user`。
 
@@ -240,6 +247,8 @@ Block index 的模式与尺寸开关：`CLM_INDEX_MODE`（`digest` 默认 / `blo
 `blocks` 模式列两段：前 12 个可编辑 block（开头任务的“别动”锚点）加最近 40 个；中间的连续区间用省略行标出。预算偏向最近内容，因为那里的 stale tool 噪声才是清理目标，而开头几轮通常要保留。`digest` 模式每个已完成 turn 一行，正在进行的 turn 只有锚点，所以文本天然在一个 turn 内稳定；被折叠的 turn 会额外给一行 `... largest omitted turns: A-B (x tok), ...`，直接指出回收窗口最大、却不在列表里的区间。
 
 DSH 只在 runtime-context 快照文本变化时追加新快照，因此节流能减少重复注入；`cleanup` 或 mirror edit 生效后会立即失效并重渲染，设为 `1` 可恢复每步刷新。节流按“打开中的 turn + 已关闭 step 数”计数：DSH 在 `agent/pre-step` 渲染索引，此时下一步的 `step/start` 还没写入，旧的 turn/step 键因此从未命中（E-027）。
+
+清理触发开关（默认全部关闭，尚未在真实 V4.1-Flash 会话标定，见 [`docs/plan.md`](./docs/plan.md) §5.2）：`CLM_TRIGGER_PCT`（用量达到窗口的百分比）、`CLM_TRIGGER_TURNS`（已完成 turn 数）、`CLM_TRIGGER_TOOL_RATIO`（toolResult 占可编辑 token 的百分比）、`CLM_TRIGGER_SINCE`（距上次成功清理的 turn 数）、`CLM_TRIGGER_CANDIDATES`（每次最多候选数，默认 3）、`CLM_TRIGGER_MIN_TOKENS`（最小可省 token）、`CLM_CONTEXT_WINDOW`（宿主不提供窗口时的兜底窗口）。任一命中即在该 turn 边界装配一次候选；未命中时只有用量行。
 
 用 `node scripts/measure-session-index.mjs --project .` 可以从真实 session 日志核对索引快照数、字节数、步间隔和 cleanup 调用形态；它同时给出 `blocks` 与 `digest` 的对比，以及 digest 的预测重渲染次数。
 

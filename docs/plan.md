@@ -1,6 +1,6 @@
 # 审查整改计划（oh-my-clm 0.1.12）
 
-> 追加（2026-11-09）：§5 新增「让 DeepSeek-V4.1-Flash 主动清理上下文」方向，六步按 1~6 顺序排期；**5.1 已实施**（用例 10 红灯转绿），**P1-2 的宿主 usage 校准 + 上限双检已补**（5.2 前置，见 §1 P1-2 实施记录），5.2~5.6 尚未实施；§1~§4 的结论不变。
+> 追加（2026-11-09）：§5 新增「让 DeepSeek-V4.1-Flash 主动清理上下文」方向，六步按 1~6 顺序排期；**5.1 已实施**（用例 10 红灯转绿），**P1-2 的宿主 usage 校准 + 上限双检已补**（5.2 前置，见 §1 P1-2 实施记录），**5.2 已实施**（用例 11 红灯转绿；触发阈值默认关闭，待真实 V4.1-Flash 会话标定），5.3~5.6 尚未实施；§1~§4 的结论不变。
 > 状态：评审草稿 / 整改已完成（验收部分）
 > 整改状态（2026-11-09）：§3 的 11 条回归用例，以及一次推送前复核新增的 5 条回归（P1-1 守卫收窄 4 条、I-2 触顶重置 1 条）全部转绿（`npm test` 114/114、`npm run check`、`npm run typecheck` 通过），生产代码与文档已同步；逐项说明见 `changelog.md` 的「0.1.13（当前版本）」。**回归用例转绿不等于第 1 节打回项全部结案**：P1-2 的「宿主 usage 校准 + 估算/上限双检」已实现（2026-11-09，Pi `getContextUsage()` 与 DSH `sessionProjections` 的 `tokenUsage` / `contextPressure` 进入共享门；`npm test` 118/118），§5.2 的用量行与候选触发仍未做；P1-3 的「编辑 diff/审计/最小回滚、审批/签名」仍未实现（P1-3 只落地了运行时来源标签 + 显式保留字黑名单，不是对任意注入指令的内容审计）；§2 改进项中 I-1、I-2 已修，I-3~I-9 及「规则外清单」（安全姿态、真实宿主行为、撤除试验、维护代价）仍需人工复核 / 排期。
 > 审查对象：当前 checkout（`package.json` 0.1.12，HEAD `b14b187`）
@@ -139,7 +139,7 @@ npm pack --dry-run
 
 ## 5. 方向：让 DeepSeek-V4.1-Flash 主动清理上下文（待排期，六步按序）
 
-> 状态：5.1 已实施（2026-11-09，用例 10 先红灯后转绿），5.2~5.6 待排期。对应上一轮「先定方向」的结论。本节 6 项按 §0 判为**改进 / 排期项**，不新增打回项；§1 / §2 的既有结论不变。判定仍落在插件代码 + 真实 V4.1-Flash session 日志，笔记仅作视角（见 §4 追加）。
+> 状态：5.1~5.4 已实施（2026-11-09，用例 10~13 先红灯后转绿；5.2 的触发阈值默认关闭，待真实会话标定），5.5~5.6 待排期。对应上一轮「先定方向」的结论。本节 6 项按 §0 判为**改进 / 排期项**，不新增打回项；§1 / §2 的既有结论不变。判定仍落在插件代码 + 真实 V4.1-Flash session 日志，笔记仅作视角（见 §4 追加）。
 
 ### 5.0 方向、顺序与验收口径
 
@@ -194,6 +194,7 @@ npm pack --dry-run
   4. **turn 内字节稳定**：候选与用量行按 turn 边界计算、turn 内不变，复用 `dsh-bridge.ts:246-266` 的节流与快照去重；compaction / cleanup 后按 `dsh/index.ts:536-540` 的既有逻辑失效缓存。
 - **红灯（用例 11）**：`test/features/live-context/dsh-bridge.test.ts` 断言「用量行含百分比」「命中阈值产出具体 ranges + 预计节省」「未命中不产出候选」「同一 turn 内渲染文本字节不变」「候选 ID 全部合法且不含 1」。
 - **依赖 / 风险**：依赖 5.1 的策略句；受前缀缓存约束，只能低频触发；真实 usage 取不到时的降级必须显式标注 `~`，否则退回静默估算等于没修 P1-2。
+- **实施记录（2026-11-09）**：用例 11 先写红灯断言并确认 `npm test` 失败，再改生产代码转绿。新增 `src/features/live-context/context-trigger.ts`（纯函数 `planCleanupTrigger` / `formatUsageLine` / `renderCleanupCandidates`），阈值全部默认 `0`（关闭）——`CLM_TRIGGER_PCT`、`CLM_TRIGGER_TURNS`、`CLM_TRIGGER_TOOL_RATIO`、`CLM_TRIGGER_SINCE`，另有 `CLM_TRIGGER_CANDIDATES`（默认 3）、`CLM_TRIGGER_MIN_TOKENS`（默认 0）与 `CLM_CONTEXT_WINDOW`（估算模式的窗口兜底）；机制先以可关闭形态交付，标定后再打开。`dshTriggerView` 在 DSH 动态 context 头部输出用量行（宿主精确值优先，缺失标 `~`，窗口未知写 `window unknown`）；命中阈值时把候选写进同一个 `<oh-my-clm-block-index>`：只取已完成 turn、按「可省 token × 陈旧度」排序、永不包含 block 1 与当前 turn，并给出可直接确认的 `cleanup({ ranges, skipRoles: ["user"] })` 与每区间理由（推送前复核补：turn 以 user 块开头，裸区间会连人类请求一起删掉，因此候选固定带 `skipRoles: ["user"]`，引用的节省数字也已扣除被保留的 user 块）。用量行与候选按 `(已完成 turn 数, 触发配置)` 缓存，同一 turn 内逐字节不变；`cleanup` / mirror edit 生效与 compaction 后失效。`npm test` 123/123、`npm run check`、`npm run typecheck`、`npm pack --dry-run`、`npm run build:dsh:plugin` 全通过。
 
 ### 5.3 收编 Pi 的独立 nudge 到同一次请求
 
@@ -205,6 +206,7 @@ npm pack --dry-run
   4. 注入角色保持 `system`（P1-3 已修的口径，不要退回合成 user）。
 - **红灯（用例 12）**：`test/adapters/extension.test.ts`（或 `session-integration.test.ts`）断言「未设 `CLM_CONTEXT_BUDGET` 时用量过高仍注入」「不产生额外 assistant turn」「连续两轮无进展后中止」「注入角色为 system」。
 - **依赖 / 风险**：与 5.2 共用候选格式，必须同一步调；改成同请求注入后 `messages.some(含 marker)` 的旧去重守卫仍不可靠，中止条件以 state 里的四件套为准。
+- **实施记录（2026-11-09）**：用例 12 先写红灯断言并确认 `npm test` 失败，再改生产代码转绿。`extensions/clm.ts` 的 `contextBudgetNudge` 不再声称 "context-only turn"，也不再要求模型停手：它改为在同一次请求里追加一条 `system` 行，内容为 5.2 的用量行 + 可直接确认的 `cleanup({ ranges, skipRoles: ["user"] })` 候选（复用 `formatUsageLine` / `assembleCleanupCandidates` / `renderCleanupCandidates`，候选装配从 `planCleanupTrigger` 抽出为纯函数）。预算默认取宿主窗口（`ctx.getContextUsage()?.contextWindow`），未设 `CLM_CONTEXT_BUDGET` 也会在真实水位触发；用量优先取宿主精确值，取不到才退回估算并保留 `~`。**推送前复核补**：显式设了预算时，用量行与 `usage Z%` 信号统一以该预算为分母（原先信号用宿主窗口，`CLM_CONTEXT_BUDGET=32000` + 200k 窗口会渲染成“usage 15% ≥ 75%”），并新增该场景的回归用例。I-2 四件套原样保留：每轮必须进步、连续两轮无进展即中止、`MAX_NUDGE_ROUNDS` 上限、压力消失 / 真实收缩后重置；注入角色仍是 `system`。静态附录里的触发句同步改成「确认候选或做一次编辑，然后继续任务」，长度守卫 Pi 996/1000。`formatUsageLine` 新增 `turnWord`，Pi 用 `step` 计数（Pi 在 `turn_end` 按 step 提交），并在 state 里记录 `lastCleanupStep`。
 
 ### 5.4 软卸载：给删除一个低损、可保留要点的替代
 
@@ -216,6 +218,7 @@ npm pack --dry-run
   4. 保留占位使「删错」从永久丢失变成留得住要点，5.2 的触发才敢更频繁命中。
 - **红灯（用例 13）**：`test/features/live-context/context-cleanup.test.ts` 断言「offload 后块仍在、正文变短且含占位标记」「占位不破坏 `CLM_SNAPSHOT` / 配对」「offload 与 omit 混用后总 token 严格下降」「body 内引用 marker 不被误当顶层块」。
 - **依赖 / 风险**：占位替换同样打断前缀缓存，5.0 的低频约束继续适用；本步只解决「丢要点」，**不替代** I-4 的 diff / 回滚，两者都要留痕。
+- **实施记录（2026-11-09）**：用例 13 先写红灯断言并确认 `npm test` 失败，再改生产代码转绿。`cleanup` 新增 `offload: [{ blockId, note }]`：保留 ID / role / 顶层 marker 与块顺序，只把正文换成一行 `[offloaded: <note>]`（`offloadBody` / `OFFLOAD_PREFIX`，`MAX_OFFLOAD_NOTE_CHARS = 240`）；要点由模型填，插件不引入第二个 summarizer。占位文本保留英文，与其余模型可见字符串同语种（计划里的 `[已卸载: …]` 是示意）。校验沿用既有口径：未知 / 重复 / 与 `blockIds`·`ranges` 冲突的 ID 整体拒绝，`list` 仍只读，block 1 拒绝，user / custom 拒绝（改写人类正文），单条 note 必须单行且**按估算 token 严格短于原正文**（防止绕过 shrink-only）。落地走同一条顶层 span 扫描：`context-format.ts` 新增 `rewriteMirrorBlocks({ remove, replace })`，Pi 在工具里改写 mirror、`turn_end` 仍按 `planContextEdits` 提交 `replace`；DSH 走既有 `appendContentReplacement`（toolResult 内容改写、assistant 变成 developer/message），offload assistant tool-call 块时沿用配对级联把配对结果 omit。`cleanupToolResult` / `formatCleanupToolResult` 如实报告 `offloadedBlockIds`（`cleanup applied; offloaded 1 block(s): 2.`）。`reservedBodyReason` 从 mirror 编辑路径抽出，offload note 复用同一保留字检查。`npm test` 132/132、`npm run check`、`npm run typecheck`、`npm pack --dry-run`、`npm run build:dsh:plugin` 全通过。
 
 ### 5.5 触发器的审计抽查流（防门控盲区）
 
@@ -244,9 +247,9 @@ npm pack --dry-run
 | 本节步 | 关联既有项 | 关系 |
 |---|---|---|
 | 5.1 | I-7（提示词口径） | 顺手统一，不新增打回 |
-| 5.2 | I-2、I-6、P1-2 | I-2、P1-2 已补齐（2026-11-09）；I-6 的代价可观测仍待 5.6 |
-| 5.3 | I-2 | 双宿主一致，沿用四件套 |
-| 5.4 | I-4、P1-3 | 只解决「丢要点」，不替代 diff / 审计 / 回滚 |
+| 5.2 | I-2、I-6、P1-2 | 已实施（2026-11-09，阈值默认关闭待标定）；I-6 的代价可观测仍待 5.6 |
+| 5.3 | I-2 | 已实施（2026-11-09，同请求 system 行 + 宿主窗口默认预算）；四件套不变 |
+| 5.4 | I-4、P1-3 | 已实施（2026-11-09，`offload` 保留要点）；不替代 diff / 审计 / 回滚 |
 | 5.5 | I-10（规则外清单） | 新增一条需人复核的维度 |
 | 5.6 | I-5、I-6、I-9 | 撤除试验 + 诚实定位 |
 

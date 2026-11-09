@@ -9,6 +9,7 @@ import {
 	buildDshMirrorRecords,
 	dshBlockIndexText,
 	dshOpenTurnStep,
+	dshTriggerView,
 	executeDshCleanup,
 	reconcileDshMirror,
 	type DshBridgeOptions,
@@ -33,6 +34,7 @@ import {
 	type CleanupResultCopy,
 	type CleanupToolResult,
 } from "../src/features/live-context/context-cleanup.ts";
+import type { CleanupTriggerOptions } from "../src/features/live-context/context-trigger.ts";
 
 export const name = "oh-my-clm";
 const PROMPT_SECTION = "oh-my-clm:live-context";
@@ -107,6 +109,29 @@ interface DshAgent {
 function positiveEnv(name: string, fallback: number): number {
 	const value = Number.parseInt(process.env[name] ?? "", 10);
 	return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/** Thresholds use `0` as "disabled", so the positive-only parser cannot be reused. */
+function nonNegativeEnv(name: string, fallback: number): number {
+	const value = Number.parseInt(process.env[name] ?? "", 10);
+	return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+/**
+ * Cleanup trigger switches (docs/plan.md §5.2). Every threshold defaults to 0
+ * because none of them is calibrated on a real DeepSeek-V4.1-Flash session yet;
+ * the mechanism ships disabled, and enabling it is a deliberate, documented act.
+ * `CLM_TRIGGER_TOOL_RATIO` is a percentage (60 = 60% of editable tokens).
+ */
+function triggerOptions(): CleanupTriggerOptions {
+	return {
+		usagePercent: nonNegativeEnv("CLM_TRIGGER_PCT", 0),
+		completedTurns: nonNegativeEnv("CLM_TRIGGER_TURNS", 0),
+		toolResultShare: Math.min(100, nonNegativeEnv("CLM_TRIGGER_TOOL_RATIO", 0)) / 100,
+		turnsSinceCleanup: nonNegativeEnv("CLM_TRIGGER_SINCE", 0),
+		maxCandidates: positiveEnv("CLM_TRIGGER_CANDIDATES", 3),
+		minSavingsTokens: nonNegativeEnv("CLM_TRIGGER_MIN_TOKENS", 0),
+	};
 }
 
 function readText(filePath: string): string | undefined {
@@ -236,6 +261,7 @@ function hostUsageFor(session: DshSessionLike): HostUsage | undefined {
 function optionsFor(session: DshSessionLike): DshBridgeOptions {
 	const sessionId = String(session.id);
 	const mirrorPath = sessionMirrorPath(sessionId);
+	const configuredWindow = positiveEnv("CLM_CONTEXT_WINDOW", 0);
 	return {
 		mirrorPath,
 		mirrorDisplayPath: mirrorPath,
@@ -243,6 +269,8 @@ function optionsFor(session: DshSessionLike): DshBridgeOptions {
 		maxMirrorChars: positiveEnv("CLM_MAX_MIRROR_CHARS", 96_000),
 		fixedTokens: positiveEnv("CLM_CONTEXT_FIXED_TOKENS", 0),
 		hostUsage: hostUsageFor(session),
+		...(configuredWindow > 0 ? { contextWindow: configuredWindow } : {}),
+		trigger: triggerOptions(),
 		cleanupResult: cleanupResultCopy(),
 		indexMode: indexMode(),
 		blockIndex: {
@@ -257,10 +285,26 @@ function optionsFor(session: DshSessionLike): DshBridgeOptions {
 }
 
 /**
+ * Put the cleanup candidates inside the block index the model already reads, so
+ * the confirmation and the IDs it refers to arrive as one payload.
+ */
+function withCleanupCandidates(index: string, candidateText: string): string {
+	if (!candidateText) return index;
+	const close = "</oh-my-clm-block-index>";
+	const at = index.lastIndexOf(close);
+	if (at < 0) return `${index}\n${candidateText}`;
+	return `${index.slice(0, at)}${candidateText}\n${index.slice(at)}`;
+}
+
+/**
  * Render the current editable block index into DSH's dynamic runtime context.
  * DSH appends this snapshot as a sourced user message, so the same 1-based IDs
  * that `cleanup` accepts are visible in chat context without a mirror read. A
  * failure returns empty text rather than breaking prompt assembly.
+ *
+ * The usage line and any cleanup candidates ride along with the index: they are
+ * computed once per turn boundary (`dshTriggerView`), so the same turn still
+ * appends one snapshot instead of one per step.
  *
  * The concrete mirror path belongs here rather than in the static section: the
  * section is registered once per process and could only show the
@@ -275,14 +319,16 @@ function blockIndexContextText(
 	if (!session) return "";
 	try {
 		const options = optionsFor(session);
+		const state = states.get(String(session.id));
 		const index = dshBlockIndexText(
 			session,
 			options,
-			states.get(String(session.id)),
+			state,
 			positiveEnv("CLM_INDEX_REFRESH_STEPS", 4),
 		);
 		if (!index) return "";
-		return `Mirror: ${options.mirrorPath}\n${index}`;
+		const { usageLine, candidateText } = dshTriggerView(session, options, state);
+		return `Mirror: ${options.mirrorPath}\n${usageLine}\n${withCleanupCandidates(index, candidateText)}`;
 	} catch {
 		return "";
 	}
@@ -313,9 +359,22 @@ const cleanupParameters = {
 			items: { type: "string", enum: ["user", "assistant", "toolResult", "custom"] },
 			description: "Roles to keep even when a requested range covers them; use [\"user\"] to drop a turn's tool noise but keep the human message.",
 		},
+		offload: {
+			type: "array",
+			items: {
+				type: "object",
+				properties: {
+					blockId: { type: "integer", minimum: 1 },
+					note: { type: "string", minLength: 1, maxLength: 240 },
+				},
+				required: ["blockId", "note"],
+				additionalProperties: false,
+			},
+			description: "Keep a block in place and replace its body with `[offloaded: <note>]`, a shorter line you write. Use it when the block's fact still matters; the placeholder must shrink the block. assistant and toolResult blocks only; block 1 and user blocks cannot be offloaded.",
+		},
 		list: {
 			type: "string",
-			description: "Read-only: return the rows of this inclusive ID range (\"3-16\" or \"42\") without removing anything. Use it to inspect a range the index named but did not list. Cannot be combined with blockIds, ranges, or skipRoles.",
+			description: "Read-only: return the rows of this inclusive ID range (\"3-16\" or \"42\") without removing anything. Use it to inspect a range the index named but did not list. Cannot be combined with blockIds, ranges, skipRoles, or offload.",
 		},
 	},
 	additionalProperties: false,
@@ -334,6 +393,7 @@ const cleanupOutputSchema = {
 		requestedBlockIds: { type: "array", items: { type: "integer" } },
 		removedBlockIds: { type: "array", items: { type: "integer" } },
 		pairedRemovalIds: { type: "array", items: { type: "integer" } },
+		offloadedBlockIds: { type: "array", items: { type: "integer" } },
 		reason: { type: "string" },
 		blockIndex: { type: "string" },
 		rows: { type: "string" },
@@ -345,7 +405,7 @@ const cleanupOutputSchema = {
 function createDshCleanupTool(getState: (sessionId: string) => DshBridgeState | undefined) {
 	return {
 		name: "cleanup",
-		description: "Remove stale CLM context blocks by ID range or by individual ID from the live block index without reading or reconstructing their bodies, or list the rows of a range (read-only) to identify targets the index only named.",
+		description: "Remove stale CLM context blocks by ID range or by individual ID from the live block index without reading or reconstructing their bodies, keep one with a shorter `[offloaded: <note>]` body, or list the rows of a range (read-only) to identify targets the index only named.",
 		parameters: cleanupParameters,
 		output: {
 			schema: cleanupOutputSchema,
@@ -609,6 +669,7 @@ export function apply(ctx: DshContext): void {
 		// going through cleanup or a mirror edit.
 		if (typeof event?.type === "string" && event.type.includes("compaction")) {
 			state.blockIndex = undefined;
+			state.trigger = undefined;
 		}
 	});
 

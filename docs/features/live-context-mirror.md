@@ -46,7 +46,7 @@ Pi context_edit entry
 - 可以缩短已有 block，也可以删除过时 block；
 - 初始任务受保护，user-authored block 只能省略不能改写；
 - rewrite/edit 都必须在一个 host-side 工具调用内完成，不读取或打印整个 mirror；
-- `pi-clm-budget-nudge` 出现时，这是只整理上下文的 turn，不要做任务工作。
+- `pi-clm-budget-nudge` 出现时，在同一次请求里确认它的清理候选或做一次编辑，然后继续任务（不占用单独回合）。
 
 ### 2.2 `context`：生成 mirror 和临时预算提醒
 
@@ -57,15 +57,20 @@ Pi context_edit entry
 
 如果 agent turn 外有进程直接修改 mirror，下一次同步会恢复 canonical projection；未经 `turn_end` 校验的文件内容不会静默进入 session。
 
-配置了 `CLM_CONTEXT_BUDGET` 且估算的请求接近目标时，`context` hook 会额外返回一条临时 user message：
+请求用量接近目标时，`context` hook 会在同一次请求里追加一条临时 `system` 消息（P1-3 的口径，不是合成 user）：
 
 ```text
 <pi-clm-budget-nudge>
-...
+Usage: 92k/100k tokens (92%) · 18 editable blocks · no cleanup yet
+Suggested cleanup (usage 92% ≥ 75%): cleanup({ ranges: ["3-4"], skipRoles: ["user"] }) frees ~120 tok.
+Candidates: 3-4 (~120 tok, 1 turn old), ...; block 1, user messages, and the current turn stay.
+Confirm it in this same request, then continue the task.
 </pi-clm-budget-nudge>
 ```
 
-它只存在于这一次 provider request，不写入 session，也不会触发额外的模型 turn。若 Pi 的原生 context window 已没有足够空间，扩展不再追加 nudge，交给 Pi 的 native auto-compaction 处理。
+它与 DSH 的清理候选共用 `context-trigger.ts` 的用量行 / 候选装配（§5.2 / §5.3），模型只做确认或改范围，不占单独回合、也不要求停下手头任务。用量优先取 `ctx.getContextUsage()` 的宿主精确值（缺失时保留 `~`），预算默认取宿主窗口 `contextWindow`，因此未设 `CLM_CONTEXT_BUDGET` 时也会在真实水位触发；一旦显式设了 `CLM_CONTEXT_BUDGET`，用量行与百分比都改以该预算为分母（触发判定用的也是它），不会出现“按预算触发、按窗口显示百分比”的自相矛盾。
+
+nudge 只存在于这一次 provider request，不写入 session，也不会触发额外的模型 turn。I-2 的停止条件仍在 state 里：每轮必须进步、连续两轮无进展即中止（`MAX_NUDGE_ROUNDS`）、压力消失或真实收缩后重置。若 Pi 的原生 context window 已没有足够空间，扩展不再追加 nudge，交给 Pi 的 native auto-compaction 处理。
 
 ### 2.3 agent turn：模型整理文件或调用 cleanup
 
@@ -236,7 +241,7 @@ the dump showed
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `CLM_CONTEXT_BUDGET` | 无 | 近似目标 token；接近目标时触发一次临时 budget nudge。正整数才生效 |
+| `CLM_CONTEXT_BUDGET` | 宿主窗口 | 近似目标 token；接近目标时在同一次请求追加临时 budget nudge。未设置时跟随 `ctx.getContextUsage().contextWindow`（窗口也不可知则不触发）。正整数才生效 |
 
 例如：
 
@@ -245,7 +250,7 @@ CLM_CONTEXT_BUDGET=32000 \
 pi --extension ./extensions/clm.ts
 ```
 
-如果不设置目标预算，扩展仍会生成 mirror、校验模型编辑并使用 Pi native context limit/auto-compaction。
+如果不设置目标预算，扩展仍会按宿主窗口在水位较高时注入 nudge，并生成 mirror、校验模型编辑、使用 Pi native context limit/auto-compaction。
 
 ## 8. 代码结构
 
@@ -253,10 +258,10 @@ pi --extension ./extensions/clm.ts
 | --- | --- |
 | [`extensions/clm.ts`](../../extensions/clm.ts) | Pi lifecycle handlers、mirror 同步、临时预算 nudge、`/clm status`、self-read guard |
 | [`src/features/live-context/context-format.ts`](../../src/features/live-context/context-format.ts) | Pi/DSH 共用的 record 构建、文本投影、序号 ID、mirror 渲染/解析、snapshot、编辑规划和 token/gate 校验 |
-| [`src/features/live-context/context-cleanup.ts`](../../src/features/live-context/context-cleanup.ts) | 双宿主共用的 block-ID cleanup 参数、配对/保护校验和完整 span 删除；不依赖截断 preview |
+| [`src/features/live-context/context-cleanup.ts`](../../src/features/live-context/context-cleanup.ts) | 双宿主共用的 block-ID cleanup 参数、配对/保护校验、完整 span 删除与 `offload` 软卸载；不依赖截断 preview |
 | [`src/lib/clm-files.ts`](../../src/lib/clm-files.ts) | session mirror 的原子写入和私有文件权限（目录 0700、文件 0600） |
 | [`test/features/live-context/context-format.test.ts`](../../test/features/live-context/context-format.test.ts) | 协议、截断、gate、stale snapshot、tool 配对和安全边界测试 |
-| [`test/adapters/extension.test.ts`](../../test/adapters/extension.test.ts) | Pi extension 生命周期、持久化 edit、预算 nudge 和 self-read guard 测试 |
+| [`test/adapters/extension.test.ts`](../../test/adapters/extension.test.ts) | Pi extension 生命周期、持久化 edit、同请求预算 nudge（§5.3）和 self-read guard 测试 |
 | [`test/adapters/session-integration.test.ts`](../../test/adapters/session-integration.test.ts) | Pi `SessionManager` 对 context edit、原始历史和 branch 隔离的集成测试 |
 
 cleanup 的实现与测试见 [cleanup-tool.md](./cleanup-tool.md)；DSH host entry、bridge 和契约测试见 [dsh-surface-bridge.md](./dsh-surface-bridge.md)。完整的目录职责、导入边界和新增文件放置规则见 [project-structure.md](../project-structure.md)。
@@ -282,10 +287,10 @@ Pi 侧关键不变量包括：
 6. Pi context edit 不会修改原始消息；
 7. branch 切换不会泄漏另一个 branch 的编辑；
 8. 读取 live mirror 的 tool result 不会被再次复制进未来 context；
-9. budget nudge 是临时请求内容，不会生成持久化 compact/receipt entry；
+9. budget nudge 是同一次请求里的临时 system 行，不会生成额外 assistant turn 或持久化 compact/receipt entry；
 10. session mirror 写入使用私有权限，避免 reasoning 和 tool output 被同机其他用户直接读取。
 
-cleanup 的 ID、block 1 和配对删除不变量见 [cleanup-tool.md](./cleanup-tool.md#8-验证)；DSH 的 replacement 与 append-only 不变量见 [dsh-surface-bridge.md](./dsh-surface-bridge.md#6-验证与未验证边界)。
+cleanup 的 ID、block 1 和配对删除不变量见 [cleanup-tool.md](./cleanup-tool.md#9-验证)；DSH 的 replacement 与 append-only 不变量见 [dsh-surface-bridge.md](./dsh-surface-bridge.md#6-验证与未验证边界)。
 
 ## 10. 当前取舍与限制
 

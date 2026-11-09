@@ -44,7 +44,8 @@ bridge 会对 mirror 编辑执行与 Pi 侧相同的 snapshot、结构安全和 
 
 | 操作 | DSH replacement |
 | --- | --- |
-| cleanup 删除 | 全部是 `replacement: null`，因此只追加空的 `developer/message` omission。 |
+| cleanup 删除 | `replacement: null`，因此只追加空的 `developer/message` omission。 |
+| cleanup 软卸载 `offload` | 保留节点：tool result 追加 content-only `tool/result` replacement（正文变为 `[offloaded: …]`），assistant 追加缩短文本的 `developer/message` replacement；带 tool call 的 assistant 会级联 omit 配对 result。 |
 | 普通 mirror 编辑改写 tool result | 追加 content-only `tool/result` replacement，保持原 event envelope，并带 `sourceEventSeqs: [targetSeq]`。 |
 | 改写 assistant | 追加缩短文本的 `developer/message` replacement。 |
 | 删除 assistant | 追加空 content 的 `developer/message` replacement。 |
@@ -81,9 +82,22 @@ host bridge 可选读取以下变量；它们只影响 mirror preview、shrink-o
 | `CLM_MAX_BLOCK_CHARS` | 与 Pi 相同的固定值 | 单个 block 的 preview 上限。 |
 | `CLM_MAX_MIRROR_CHARS` | 与 Pi 相同的固定值 | 所有可编辑 preview 的总上限。 |
 | `CLM_CONTEXT_FIXED_TOKENS` | 无 | 额外计入 shrink-only gate 的固定 token。 |
+| `CLM_CONTEXT_WINDOW` | 无 | 宿主不提供 `contextPressure.contextWindow` 时的窗口兜底；窗口未知时用量行写 `window unknown`。 |
+| `CLM_TRIGGER_PCT` | `0`（关闭） | 用量达到窗口的百分比时触发清理候选。 |
+| `CLM_TRIGGER_TURNS` | `0`（关闭） | 已完成 turn 数达到该值时触发。 |
+| `CLM_TRIGGER_TOOL_RATIO` | `0`（关闭） | toolResult 占可编辑 token 的百分比达到该值时触发。 |
+| `CLM_TRIGGER_SINCE` | `0`（关闭） | 距上次成功清理的 turn 数达到该值时触发。 |
+| `CLM_TRIGGER_CANDIDATES` | `3` | 一次触发最多给出多少个候选区间。 |
+| `CLM_TRIGGER_MIN_TOKENS` | `0` | 小于该估算 token 的 turn 不作为候选。 |
+
+所有 `CLM_TRIGGER_*` 默认关闭：阈值尚未在真实 DeepSeek-V4.1-Flash 会话上标定，机制先以可关闭形态交付（见 `docs/plan.md` §5.2）。命中后在 `systemPrompt.context()` 的同一个 `<oh-my-clm-block-index>` 里追加一行用量和一条可直接确认的候选：
+
+- 用量行 `Usage: X/Y tokens (Z%) · N editable blocks · last cleanup at turn K` 的 `X` 优先取宿主精确值（`sessionProjections` 的 `tokenUsage`），取不到才退回 `~` 估算，窗口未知时显式写 `window unknown`，不静默冒充精确值。Pi 侧的 budget nudge 复用同一套用量行与候选格式（§5.3），只是触发源换成 Pi 的预算水位。
+- 候选只取已完成的 turn（正在进行的 turn 仍可能补齐 tool 配对），按“可省 token × 陈旧度”排序，并永不包含 block 1；候选以“区间 + 保留规则”的形式给出（`ranges` 加 `skipRoles: ["user"]`），因为 turn 以 user 块开头，裸区间会连人类请求一起删掉，而引用的节省数字已经扣除了被保留的 user 块；模型只做确认或改范围，开放题变成核对。
+- 用量行与候选按 turn 边界渲染并按 `(已完成 turn 数, 触发配置)` 缓存，同一 turn 内逐字节不变，因此 DSH 仍然只在 turn 边界追加一次快照；`cleanup` / mirror edit 生效或 compaction 后清空缓存（删除会重排 ID）。
 | `CLM_CLEANUP_RESULT` | `compact` | `compact` / `full` / `none`，只影响 cleanup 的模型可见结果。 |
 
-block index 的 `CLM_INDEX_*` 开关、`/clm mode` 和 `cleanup` 结果语义见 [cleanup-tool.md](./cleanup-tool.md#6-配置)。`CLM_CONTEXT_BUDGET` 是 Pi 侧的目标预算和 nudge 开关，DSH bridge 不实现预算机制。
+block index 的 `CLM_INDEX_*` 开关、`/clm mode` 和 `cleanup` 结果语义见 [cleanup-tool.md](./cleanup-tool.md#7-配置)。`CLM_CONTEXT_BUDGET` 是 Pi 侧的目标预算（未设置时跟随宿主窗口），DSH bridge 不实现预算机制。
 
 ## 6. 验证与未验证边界
 
@@ -107,7 +121,8 @@ node test/harness/clm-dsh-host-test.mjs /home/deepseek-agent/oh-my-clm
 | --- | --- |
 | [`dsh/index.ts`](../../dsh/index.ts) | Cordis host entry：system prompt、agent/session 生命周期、索引 runtime context、工具注册和文件 I/O。 |
 | [`src/features/live-context/dsh-bridge.ts`](../../src/features/live-context/dsh-bridge.ts) | DSH surface 适配、mirror 生命周期、安全校验和 `Session.append()` replacement mutation；cleanup 直接走 active surface。 |
+| [`src/features/live-context/context-trigger.ts`](../../src/features/live-context/context-trigger.ts) | 与宿主无关的触发判定、用量行和候选装配（阈值默认关闭）。 |
 | [`src/features/live-context/context-format.ts`](../../src/features/live-context/context-format.ts) | Pi/DSH 共用的 record 构建、mirror 渲染/解析、snapshot 和编辑规划。 |
 | [`dsh-plugin.json`](../../dsh-plugin.json) | DSH Community v0.15 host manifest；`cordis.patch.yml` 是官方 bundle 安装层。 |
-| [`test/features/live-context/dsh-bridge.test.ts`](../../test/features/live-context/dsh-bridge.test.ts) | surface replacement、reentrant append、pre-step 延迟、配对和拒绝路径测试。 |
+| [`test/features/live-context/dsh-bridge.test.ts`](../../test/features/live-context/dsh-bridge.test.ts) | surface replacement、reentrant append、pre-step 延迟、配对、`offload` 和拒绝路径测试。 |
 | [`test/package`](../../test/package) | manifest 和发布元数据契约测试。 |

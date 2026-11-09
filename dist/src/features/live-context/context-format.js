@@ -729,6 +729,85 @@ export function scanMirrorBlocks(text) {
     const malformed = missingEndIds.length > 0 || (empty && blocks.length > 0);
     return { blocks, empty, malformed, duplicateIds, missingEndIds };
 }
+/**
+ * Rewrite a mirror in place: drop whole spans and/or replace only the body of a
+ * kept span. This is the single text primitive behind omission (empty
+ * `replace`) and soft offload, and it reads structure only through
+ * `scanMirrorBlocks`, so a marker quoted inside a body is never a target and a
+ * truncated preview is never reconstructed.
+ *
+ * A replaced span keeps its opening marker, ID, role and position; the new
+ * body is escaped exactly like a rendered one, so it round-trips through
+ * `parseMirror` and cannot introduce a second top-level block.
+ */
+export function rewriteMirrorBlocks(text, options = {}) {
+    const normalized = String(text ?? "").replace(/\r\n?/g, "\n");
+    const lines = normalized.split("\n");
+    const scan = scanMirrorBlocks(normalized);
+    if (scan.malformed) {
+        const missing = scan.missingEndIds.length > 0
+            ? `unclosed CLM_ENTRY id(s): ${scan.missingEndIds.join(", ")}`
+            : "the empty marker coexists with blocks";
+        return { ok: false, reason: `the live mirror is malformed (${missing})` };
+    }
+    if (scan.duplicateIds.length > 0) {
+        return { ok: false, reason: `duplicate CLM_ENTRY id(s): ${[...new Set(scan.duplicateIds)].join(", ")}` };
+    }
+    const removeTargets = new Set((options.remove ?? []).map((blockId) => String(blockId)));
+    const replaceTargets = new Map();
+    for (const entry of options.replace ?? []) {
+        replaceTargets.set(String(entry.blockId), String(entry.body ?? ""));
+    }
+    const spans = new Map(scan.blocks.map((span) => [span.id, span]));
+    const missingTargets = [...removeTargets, ...replaceTargets.keys()].filter((target) => !spans.has(target));
+    if (missingTargets.length > 0) {
+        return { ok: false, reason: `CLM_ENTRY id(s) not found in the live mirror: ${[...new Set(missingTargets)].join(", ")}` };
+    }
+    const conflicting = [...replaceTargets.keys()].filter((target) => removeTargets.has(target));
+    if (conflicting.length > 0) {
+        return { ok: false, reason: `CLM_ENTRY id(s) cannot be both removed and rewritten: ${conflicting.join(", ")}` };
+    }
+    const dropped = new Set();
+    for (const target of removeTargets) {
+        const span = spans.get(target);
+        if (!span)
+            continue;
+        for (let index = span.startLine; index <= span.endLine; index += 1)
+            dropped.add(index);
+        // The renderer separates entries with one blank line; dropping the span
+        // plus its trailing separator keeps the remaining document canonical.
+        if ((lines[span.endLine + 1] ?? "").trim() === "")
+            dropped.add(span.endLine + 1);
+    }
+    const rewrites = new Map();
+    for (const [target, body] of replaceTargets) {
+        const span = spans.get(target);
+        if (span)
+            rewrites.set(span.startLine, { span, body });
+    }
+    const kept = [];
+    for (let index = 0; index < lines.length; index += 1) {
+        const rewrite = rewrites.get(index);
+        if (rewrite) {
+            kept.push(lines[index] ?? "");
+            kept.push(escapeMirrorBody(rewrite.body.trim()));
+            kept.push(lines[rewrite.span.endLine] ?? "");
+            index = rewrite.span.endLine;
+            continue;
+        }
+        if (!dropped.has(index))
+            kept.push(lines[index] ?? "");
+    }
+    const retainedBlocks = scan.blocks.length - removeTargets.size;
+    let result = kept.join("\n");
+    if (!result.endsWith("\n"))
+        result += "\n";
+    const hasEmptyMarker = kept.some((line) => line.trim() === EMPTY_MARKER);
+    if (retainedBlocks === 0 && !hasEmptyMarker) {
+        result = result.trimEnd() + `\n\n${EMPTY_MARKER}\n`;
+    }
+    return { ok: true, text: result };
+}
 function normalizeText(text) {
     return String(text ?? "").replace(/\r\n?/g, "\n").trim();
 }
@@ -954,6 +1033,21 @@ function hasLossyPreview(record) {
         || record.renderText.includes(MIRROR_SELF_REFERENCE_ELIDED_MARKER);
 }
 /**
+ * Why runtime-authored body text may not become block content: the same two
+ * reserved strings that a model mirror body cannot carry. Provenance is
+ * closed by the planners, and a truncation marker must only mean "the renderer
+ * cut this", never "a body says so".
+ */
+export function reservedBodyReason(text) {
+    if (MIRROR_PREVIEW_TRUNCATED_PATTERN.test(text)) {
+        return "a body cannot contain the reserved preview-truncated marker";
+    }
+    if (RESERVED_PROVENANCE_PATTERN.test(text)) {
+        return "a body cannot declare a privileged source/owner; provenance is assigned by the runtime";
+    }
+    return undefined;
+}
+/**
  * Why a `replace` body must never be written back into the session. A mirror
  * body is untrusted history text: it is not allowed to overwrite canonical
  * content it cannot see, smuggle the renderer's truncation marker, or declare
@@ -963,13 +1057,7 @@ function unsafeReplacementReason(record, body) {
     if (hasLossyPreview(record)) {
         return "this block shows a truncated or elided preview, so rewriting it would discard unseen canonical text; omit the block or use cleanup instead";
     }
-    if (MIRROR_PREVIEW_TRUNCATED_PATTERN.test(body)) {
-        return "a body cannot contain the reserved preview-truncated marker";
-    }
-    if (RESERVED_PROVENANCE_PATTERN.test(body)) {
-        return "a body cannot declare a privileged source/owner; provenance is assigned by the runtime";
-    }
-    return undefined;
+    return reservedBodyReason(body);
 }
 /**
  * Turn a user/model-edited mirror into append-only Pi context edits. The

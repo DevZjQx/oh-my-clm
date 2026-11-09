@@ -247,7 +247,7 @@ test("DSH cleanup list returns rows and leaves the surface and mirror untouched"
 	const before = [...session.surface.nodes];
 	const listed = executeDshCleanup(
 		session,
-		{ blockIds: [], explicitIds: [], rangedIds: [], skipRoles: [], list: { start: 1, end: 3 } },
+		{ blockIds: [], explicitIds: [], rangedIds: [], skipRoles: [], offload: [], list: { start: 1, end: 3 } },
 		options,
 		files,
 	);
@@ -717,6 +717,161 @@ test("plan §5.1 (case 10, DSH): static prompt states when to clean within the l
 	assert.ok(promptSection.length <= 800, `live-context prompt grew to ${promptSection.length} chars`);
 });
 
+// docs/plan.md §5.2 / case 11 (red): the dynamic context must show usage with a
+// percentage, and only a fired threshold may assemble a confirmation-shaped
+// cleanup candidate. Candidates must stay inside the editable range and must
+// never include block 1, and the payload is frozen at the turn boundary so it
+// cannot append a fresh snapshot on every step.
+test("plan §5.2 (case 11): usage line and cleanup candidates follow host usage and thresholds", async () => {
+	const envKeys = [
+		"CLM_TRIGGER_PCT",
+		"CLM_TRIGGER_TURNS",
+		"CLM_TRIGGER_TOOL_RATIO",
+		"CLM_TRIGGER_SINCE",
+	] as const;
+	const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
+	for (const key of envKeys) delete process.env[key];
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-trigger-"));
+	let tokensUsed = 6_400;
+	const projections = {
+		snapshot() {
+			return {
+				values: {
+					tokenUsage: { cacheReadTokens: tokensUsed, uncachedInputTokens: 0 },
+					contextPressure: { contextWindow: 8_000 },
+				},
+			};
+		},
+	};
+	const append = (session: TestSession, type: string, data: unknown) =>
+		(session.append as (type: string, data: unknown, options: unknown) => unknown)(type, data, { surfaceOp: { op: "append" } });
+	// One completed turn plus the provider-visible block index: the completed
+	// units are the run 1-2 (block 1, not suggestible) and the turn 3-5.
+	const seedSecondTurn = (session: TestSession): void => {
+		append(session, "assistant/message", {
+			turn: 1,
+			step: 1,
+			stream: [],
+			message: {
+				id: "assistant-trigger",
+				role: "assistant",
+				source: { kind: "model", provider: "test", model: "test" },
+				content: [
+					{ type: "text", text: "I grepped the second area." },
+					{ type: "tool-call", id: "call-trigger", name: "grep", arguments: "{}" },
+				],
+			},
+		});
+		append(session, "tool/result", {
+			message: {
+				id: "tool-trigger",
+				role: "tool",
+				source: { kind: "tool", callId: "call-trigger" },
+				toolCallId: "call-trigger",
+				content: [{ type: "text", text: "Settled second-area output that can be omitted." }],
+			},
+		});
+		append(session, "user/message", {
+			id: "user-trigger",
+			role: "user",
+			source: { kind: "user" },
+			content: [{ type: "text", text: "Third request." }],
+		});
+	};
+	const contextFor = async (root: ListenerContext, session: TestSession) => {
+		const agent = { id: `agent-${String(session.id)}`, session, ctx: listenerContext() };
+		await root.emit("agent/created", { agent });
+		const text = root.contexts[0]?.text;
+		assert.equal(typeof text, "function");
+		return () => (typeof text === "function" ? text({ agent }) : "");
+	};
+	try {
+		// Defaults are off: the usage line is visible, no candidate is produced.
+		const quiet = listenerContext();
+		dshHost({ ...quiet, sessionProjections: projections } as any);
+		const quietSession = dshSession(cwd, "dsh-52-off");
+		seedSecondTurn(quietSession);
+		const quietRender = await contextFor(quiet, quietSession);
+		assert.match(quietRender(), /Usage: 6\.4k\/8k tokens \(80%\) · 6 editable blocks · no cleanup yet/);
+		assert.doesNotMatch(quietRender(), /Suggested cleanup/);
+
+		// A fired usage threshold produces one legal, ready-to-confirm candidate.
+		process.env.CLM_TRIGGER_PCT = "70";
+		const root = listenerContext();
+		dshHost({ ...root, sessionProjections: projections } as any);
+		const session = dshSession(cwd, "dsh-52-hit");
+		seedSecondTurn(session);
+		const render = await contextFor(root, session);
+		const triggered = render();
+		assert.match(triggered, /Usage: 6\.4k\/8k tokens \(80%\)/);
+		assert.match(
+			triggered,
+			/Suggested cleanup \(usage 80% ≥ 70%\): cleanup\(\{ ranges: \["3-5"\], skipRoles: \["user"\] \}\) frees ~\d+ tok\./,
+		);
+		assert.match(triggered, /3-5 \(~\d+ tok, 1 turn old\); block 1, user messages, and the current turn stay\./);
+		// The suggested call must keep the human's request inside its own range:
+		// a bare range would delete the user block that starts the turn.
+		const userBlock = buildDshMirrorRecords(session, bridgeOptions(String(session.id)))
+			.filter((record) => !record.protected && record.role === "user");
+		assert.ok(userBlock.length > 0, "the seeded window has a user block to preserve");
+		// Candidates live inside the same block index the model already reads.
+		const indexBody = /<oh-my-clm-block-index>([\s\S]*)<\/oh-my-clm-block-index>/.exec(triggered)?.[1] ?? "";
+		assert.match(indexBody, /Suggested cleanup/);
+		const ranges = [...indexBody.matchAll(/"(\d+)(?:-(\d+))?"/g)].map((match) => ({
+			start: Number(match[1]),
+			end: Number(match[2] ?? match[1]),
+		}));
+		assert.ok(ranges.length > 0, "the trigger must name concrete ranges");
+		const editable = buildDshMirrorRecords(session, bridgeOptions(String(session.id))).filter((record) => !record.protected).length;
+		for (const range of ranges) {
+			assert.ok(range.start >= 2, `block 1 must never be a candidate: ${range.start}`);
+			assert.ok(range.start <= range.end && range.end <= editable, `candidate ${range.start}-${range.end} is outside 2-${editable}`);
+		}
+
+		// The payload is frozen at the turn boundary: host usage growing inside
+		// the same turn must not change one byte of the runtime context.
+		tokensUsed = 7_600;
+		assert.equal(render(), triggered);
+		// A new turn refreshes it with the new host usage.
+		session.record("turn/end", { turn: 1 });
+		session.record("turn/start", { turn: 2 });
+		const nextTurn = render();
+		assert.notEqual(nextTurn, triggered);
+		assert.match(nextTurn, /Usage: 7\.6k\/8k tokens \(95%\)/);
+
+		// A threshold that is not hit yields the usage line but no candidate.
+		process.env.CLM_TRIGGER_PCT = "95";
+		tokensUsed = 6_400;
+		const cold = listenerContext();
+		dshHost({ ...cold, sessionProjections: projections } as any);
+		const coldSession = dshSession(cwd, "dsh-52-miss");
+		seedSecondTurn(coldSession);
+		const coldRender = await contextFor(cold, coldSession);
+		assert.match(coldRender(), /Usage: 6\.4k\/8k tokens \(80%\)/);
+		assert.doesNotMatch(coldRender(), /Suggested cleanup/);
+
+		// Without the host projection service the estimate is labelled `~`.
+		delete process.env.CLM_TRIGGER_PCT;
+		const bare = listenerContext();
+		dshHost({ ...bare } as any);
+		const bareSession = dshSession(cwd, "dsh-52-estimate");
+		seedSecondTurn(bareSession);
+		const bareRender = await contextFor(bare, bareSession);
+		assert.match(bareRender(), /Usage: ~\d+ tokens \(window unknown\)/);
+		assert.doesNotMatch(bareRender(), /Suggested cleanup/);
+	} finally {
+		for (const key of envKeys) {
+			const value = previousEnv.get(key);
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		for (const id of ["dsh-52-off", "dsh-52-hit", "dsh-52-miss", "dsh-52-estimate"]) {
+			fs.rmSync(path.dirname(sessionMirrorPath(id)), { recursive: true, force: true });
+		}
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
 test("mock DSH host loads the entry, registers hooks, and mutates the active surface", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-dsh-host-"));
 	const root = listenerContext();
@@ -1174,4 +1329,36 @@ test("plan §3.4b (P1-3): DSH cleanup replacements carry the runtime provenance"
 			"a cleanup replacement must record which runtime planner produced it",
 		);
 	}
+});
+
+// docs/plan.md §5.4 / case 13: DSH lands an offload as an in-place content
+// replacement, so the node keeps its address and the surface does not shrink
+// by a node even though its text does.
+test("plan §5.4 (case 13, DSH): offload replaces content instead of omitting the node", () => {
+	const session = dshSession();
+	const files = new MemoryFiles();
+	const options = bridgeOptions(String(session.id));
+	const before = [...session.surface.nodes];
+	const result = executeDshCleanup(
+		session,
+		{ blockIds: [], explicitIds: [], rangedIds: [], skipRoles: [], offload: [{ blockId: 2, note: "README read." }] },
+		options,
+		files,
+	);
+	assert.equal(result.status, "applied");
+	assert.deepEqual(result.removedBlockIds, []);
+	assert.deepEqual(result.offloadedBlockIds, [2]);
+	// DSH is append-only: the surface slot keeps a tool/result node, but the node
+	// itself is a new event. The block count and its ordinal are what stay fixed.
+	assert.equal(session.surface.nodes.length, before.length);
+	const replacedSeq = session.surface.nodes[before.indexOf(3)];
+	const replaced = session.snapshotEvents().find((event) => event.seq === replacedSeq);
+	assert.equal(replaced?.type, "tool/result");
+	const replacement = session.snapshotEvents().find((event) => event.type === "tool/result" && event.seq > 6);
+	assert.ok(replacement);
+	assert.deepEqual((replacement.data as any).message.content, [{ type: "text", text: "[offloaded: README read.]" }]);
+	const mirror = files.readText(options.mirrorPath) ?? "";
+	assert.match(mirror, /\[\[CLM_ENTRY id=2 role=toolResult\]\]\n\[offloaded: README read\.\]\n\[\[\/CLM_ENTRY id=2\]\]/);
+	assert.match(mirror, /CLM_ENTRY id=1 role=assistant/);
+	assert.match(formatCleanupToolResult(result), /^cleanup applied; offloaded 1 block\(s\): 2\.$/);
 });

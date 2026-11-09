@@ -29,6 +29,12 @@ import {
 	type MirrorRecord,
 	type ProjectionEntryLike,
 } from "./context-format.ts";
+import {
+	formatUsageLine,
+	planCleanupTrigger,
+	renderCleanupCandidates,
+	type CleanupTriggerOptions,
+} from "./context-trigger.ts";
 
 /**
  * Closed source tags for DSH replacement nodes, derived from the planner-owned
@@ -96,6 +102,10 @@ export interface DshBridgeOptions {
 	fixedTokens?: number;
 	/** Host-reported exact usage for estimate + host-cap double checking (P1-2). */
 	hostUsage?: HostUsage;
+	/** Window fallback when the host projection service is unavailable. */
+	contextWindow?: number;
+	/** Turn-boundary cleanup trigger; every threshold defaults to off. */
+	trigger?: CleanupTriggerOptions;
 	/** How much of the cleanup tool result is copied into model context. */
 	cleanupResult?: CleanupResultCopy;
 	/** Preview/head/tail budget for the model-facing block index. */
@@ -125,6 +135,27 @@ export interface DshBridgeState {
 	 * stable, so DSH does not append a duplicate snapshot on every step.
 	 */
 	blockIndex?: DshBlockIndexCache;
+	/**
+	 * Turn in which a cleanup or mirror edit was last applied. The trigger's
+	 * "turns since cleanup" signal and its "last cleanup at turn K" line read it.
+	 */
+	lastCleanupTurn?: number;
+	/**
+	 * Usage line plus candidate text, frozen at the turn boundary. Host usage
+	 * grows on every step, so recomputing per render would append a fresh
+	 * runtime-context snapshot on each step and tax the prefix cache instead of
+	 * saving it (docs/plan.md §5.0 / §5.2).
+	 */
+	trigger?: DshTriggerCache;
+}
+
+export interface DshTriggerCache {
+	/** Completed turns when the payload was rendered; the turn-boundary key. */
+	closedTurns: number;
+	/** Serialized trigger options, so a live config change re-renders. */
+	signature: string;
+	usageLine: string;
+	candidateText: string;
 }
 
 export interface DshBlockIndexCache {
@@ -278,10 +309,11 @@ export function dshBlockIndexText(
  */
 function dshBlockIndexEpoch(
 	session: Pick<DshSessionLike, "snapshotEvents"> | undefined,
-): { turn?: number; closedSteps: number } {
-	if (!session || typeof session.snapshotEvents !== "function") return { closedSteps: 0 };
+): { turn?: number; closedSteps: number; closedTurns: number } {
+	if (!session || typeof session.snapshotEvents !== "function") return { closedSteps: 0, closedTurns: 0 };
 	let turn: number | undefined;
 	let closedSteps = 0;
+	let closedTurns = 0;
 	for (const event of session.snapshotEvents()) {
 		if (!isRecord(event) || typeof event.type !== "string") continue;
 		const data = isRecord(event.data) ? event.data : undefined;
@@ -289,11 +321,89 @@ function dshBlockIndexEpoch(
 			turn = positiveSafeInteger(data?.turn) ? data.turn : turn;
 		} else if (event.type === "turn/end") {
 			turn = undefined;
+			closedTurns += 1;
 		} else if (event.type === "step/end") {
 			closedSteps += 1;
 		}
 	}
-	return { turn, closedSteps };
+	return { turn, closedSteps, closedTurns };
+}
+
+/**
+ * Turn number a cleanup applied right now is reported under. Between turns the
+ * upcoming turn is `closedTurns + 1`, which keeps "turns since cleanup"
+ * monotone instead of resetting on `turn/end`.
+ */
+function currentTurnNumber(session: Pick<DshSessionLike, "snapshotEvents"> | undefined): number {
+	const epoch = dshBlockIndexEpoch(session);
+	return epoch.turn ?? epoch.closedTurns + 1;
+}
+
+/** Render the trigger options deterministically for the per-turn cache key. */
+function triggerSignature(options: DshBridgeOptions): string {
+	const trigger = options.trigger ?? {};
+	return JSON.stringify([
+		trigger.usagePercent ?? 0,
+		trigger.completedTurns ?? 0,
+		trigger.toolResultShare ?? 0,
+		trigger.turnsSinceCleanup ?? 0,
+		trigger.maxCandidates ?? 0,
+		trigger.minSavingsTokens ?? 0,
+	]);
+}
+
+export interface DshTriggerView {
+	usageLine: string;
+	candidateText: string;
+}
+
+/**
+ * Build the usage line and cleanup candidates for one turn boundary.
+ *
+ * The payload is cached per (completed turns, trigger config): within a turn it
+ * is byte-identical even as the host reports more usage, so DSH's runtime
+ * context dedupe still appends one snapshot per turn rather than one per step.
+ * Any applied edit clears the cache because removal renumbers the IDs; a
+ * compaction is cleared by the host adapter.
+ */
+export function dshTriggerView(
+	session: DshSessionLike,
+	options: DshBridgeOptions,
+	state: DshBridgeState | undefined,
+): DshTriggerView {
+	const epoch = dshBlockIndexEpoch(session);
+	const signature = triggerSignature(options);
+	const cached = state?.trigger;
+	if (cached && cached.closedTurns === epoch.closedTurns && cached.signature === signature) {
+		return { usageLine: cached.usageLine, candidateText: cached.candidateText };
+	}
+	const records = buildDshMirrorRecords(session, options);
+	const hostUsage = hostUsageOf(options.hostUsage);
+	const fallbackWindow = typeof options.contextWindow === "number"
+		&& Number.isFinite(options.contextWindow)
+		&& options.contextWindow > 0
+		? Math.ceil(options.contextWindow)
+		: undefined;
+	const usageTokens = hostUsage?.tokens ?? fixedTokens(options) + estimateMirrorTokens(records);
+	const contextWindow = hostUsage?.contextWindow ?? fallbackWindow;
+	const usageLine = formatUsageLine({
+		tokens: usageTokens,
+		...(contextWindow !== undefined ? { contextWindow } : {}),
+		exact: hostUsage !== undefined,
+		editableBlocks: records.filter((record) => !record.protected).length,
+		...(state?.lastCleanupTurn !== undefined ? { lastCleanupTurn: state.lastCleanupTurn } : {}),
+	});
+	const plan = planCleanupTrigger(records, {
+		usageTokens,
+		...(contextWindow !== undefined ? { contextWindow } : {}),
+		exactUsage: hostUsage !== undefined,
+		completedTurns: epoch.closedTurns,
+		...(state?.lastCleanupTurn !== undefined ? { lastCleanupTurn: state.lastCleanupTurn } : {}),
+		currentTurn: epoch.turn ?? epoch.closedTurns + 1,
+	}, options.trigger ?? {});
+	const candidateText = renderCleanupCandidates(plan);
+	if (state) state.trigger = { closedTurns: epoch.closedTurns, signature, usageLine, candidateText };
+	return { usageLine, candidateText };
 }
 
 function sequenceFromRecordId(id: string): number | undefined {
@@ -700,8 +810,13 @@ export function executeDshCleanup(
 			}, index, copy);
 		}
 		// Removal renumbers the editable IDs, so the next render must not reuse
-		// the cached index even when this call did not write the mirror.
-		if (state) state.blockIndex = undefined;
+		// the cached index even when this call did not write the mirror. The
+		// trigger payload carries both IDs and "last cleanup at turn K".
+		if (state) {
+			state.blockIndex = undefined;
+			state.trigger = undefined;
+			state.lastCleanupTurn = currentTurnNumber(session);
+		}
 		const nextRecords = buildDshMirrorRecords(session, options);
 		if (io) {
 			// Session.append() has already settled the active surface by the time
@@ -781,7 +896,11 @@ export function reconcileDshMirror(
 		// Session.append() synchronously changes the host projection. Rebuild
 		// from the session log instead of deriving a mirror from the plan.
 		records = buildDshMirrorRecords(session, options);
-		if (mutation?.status === "applied") state.blockIndex = undefined;
+		if (mutation?.status === "applied") {
+			state.blockIndex = undefined;
+			state.trigger = undefined;
+			state.lastCleanupTurn = currentTurnNumber(session);
+		}
 	}
 
 	const rendered = renderMirror(records);

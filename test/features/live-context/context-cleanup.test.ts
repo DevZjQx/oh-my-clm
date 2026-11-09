@@ -11,7 +11,20 @@ import {
 	planCleanup,
 	removeMirrorBlocks,
 } from "../../../src/features/live-context/context-cleanup.ts";
-import { parseMirror, renderMirror, type MirrorRecord } from "../../../src/features/live-context/context-format.ts";
+import {
+	parseMirror,
+	renderMirror,
+	rewriteMirrorBlocks,
+	scanMirrorBlocks,
+	type MirrorRecord,
+} from "../../../src/features/live-context/context-format.ts";
+
+/** Parse args for the tests that expect them to be valid. */
+function validArgs(value: unknown) {
+	const parsed = parseCleanupArgs(value);
+	if (!parsed.ok) assert.fail(`expected valid cleanup args: ${parsed.reason}`);
+	return parsed.args;
+}
 
 function cleanupRecords(): MirrorRecord[] {
 	return [
@@ -441,4 +454,190 @@ test("plan §3.6 (P1-5): rejected cleanup still returns its reason under copy=no
 		/Unknown cleanup block ID: 99\./,
 		"a rejected cleanup must stay visible even when success confirmations are suppressed",
 	);
+});
+
+// docs/plan.md §5.4 / case 13 (red): pure omission is a one-way ratchet. A
+// soft offload keeps the block, its ID/role/markers and one model-supplied
+// fact, so a wrong delete is recoverable without a second summarizer.
+test("plan §5.4 (case 13): offload keeps the block and its point in one short line", () => {
+	const records = cleanupRecords();
+	const mirror = renderMirror(records);
+	const structural = parseCleanupMirror(mirror);
+	const parsed = parseCleanupArgs({ offload: [{ blockId: 2, note: "old build passed." }] });
+	assert.equal(parsed.ok, true);
+	if (!parsed.ok) return;
+	assert.deepEqual(parsed.args.blockIds, []);
+	assert.deepEqual(parsed.args.offload, [{ blockId: 2, note: "old build passed." }]);
+
+	const plan = planCleanup(records, structural, parsed.args);
+	assert.equal(plan.status, "applied");
+	assert.deepEqual(plan.removedBlockIds, []);
+	assert.deepEqual(plan.offloadedBlockIds, [2]);
+	assert.deepEqual(plan.offloadedIds, ["stale-answer"]);
+	assert.equal(plan.edits.length, 1);
+	assert.equal(plan.edits[0]?.reason, "replace");
+	assert.equal(plan.edits[0]?.provenance, "runtime-cleanup");
+	assert.deepEqual(plan.edits[0]?.replacement, {
+		content: [{ type: "text", text: "[offloaded: old build passed.]" }],
+	});
+	assert.ok(plan.afterTokens < plan.beforeTokens, "an offload must pass the shrink-only gate");
+
+	const rewritten = rewriteMirrorBlocks(mirror, { remove: plan.removedBlockIds, replace: plan.offloads });
+	assert.equal(rewritten.ok, true);
+	const text = rewritten.ok ? rewritten.text : "";
+	// The block keeps its ID, role, position and markers; only the body shrank.
+	assert.match(
+		text,
+		/\[\[CLM_ENTRY id=2 role=assistant\]\]\n\[offloaded: old build passed\.\]\n\[\[\/CLM_ENTRY id=2\]\]/,
+	);
+	assert.doesNotMatch(text, /A stale answer that should be removed\./);
+	const after = parseMirror(text);
+	assert.equal(after.recognized, true);
+	assert.equal(after.snapshot, structural.snapshot, "the placeholder must not break CLM_SNAPSHOT");
+	assert.deepEqual([...after.blocks.keys()], [...structural.blocks.keys()]);
+	assert.match(formatCleanupToolResult(cleanupToolResult(plan)), /^cleanup applied; offloaded 1 block\(s\): 2\.$/);
+});
+
+test("plan §5.4 (case 13): offload mixes with omit and keeps the pairing cascade", () => {
+	const records: MirrorRecord[] = [
+		{ id: "task", role: "user", text: "Keep the task.", protected: true, toolCallIds: [] },
+		{ id: "anchor", role: "assistant", text: "Anchor.", protected: false, toolCallIds: [] },
+		{
+			id: "call",
+			role: "assistant",
+			text: "Ran the whole old test suite and pasted every line of it.",
+			protected: false,
+			toolCallIds: ["call-1"],
+		},
+		{ id: "result", role: "toolResult", text: "x".repeat(4_000), protected: false, toolCallIds: [], toolCallId: "call-1" },
+		{ id: "stale", role: "toolResult", text: "y".repeat(2_000), protected: false, toolCallIds: [] },
+	];
+	// Editable ordinals: anchor=1, call=2, result=3, stale=4.
+	const mirror = renderMirror(records);
+	const structural = parseCleanupMirror(mirror);
+	const plan = planCleanup(
+		records,
+		structural,
+		validArgs({ offload: [{ blockId: 2, note: "Old suite was failing on X." }], blockIds: [4] }),
+	);
+	assert.equal(plan.status, "applied");
+	// Offloading a tool-call block keeps block 2 but omits its result: the same
+	// orphan rule that governs a mirror rewrite (`planContextEdits`).
+	assert.deepEqual(plan.offloadedBlockIds, [2]);
+	assert.deepEqual(plan.removedBlockIds, [3, 4]);
+	assert.deepEqual(plan.pairedRemovalIds, [3]);
+	assert.ok(plan.afterTokens < plan.beforeTokens, "mixed offload + omit must strictly shrink");
+
+	const rewritten = rewriteMirrorBlocks(mirror, { remove: plan.removedBlockIds, replace: plan.offloads });
+	assert.equal(rewritten.ok, true);
+	const text = rewritten.ok ? rewritten.text : "";
+	assert.match(text, /CLM_ENTRY id=2 role=assistant/);
+	assert.match(text, /\[offloaded: Old suite was failing on X\.\]/);
+	assert.doesNotMatch(text, /CLM_ENTRY id=3/);
+	assert.doesNotMatch(text, /CLM_ENTRY id=4/);
+	assert.equal(parseMirror(text).recognized, true);
+
+	// A tool result is rewritten content-only, so its owner assistant survives.
+	const resultOnly = planCleanup(
+		records,
+		structural,
+		validArgs({ offload: [{ blockId: 3, note: "Test log: 2 failures." }] }),
+	);
+	assert.equal(resultOnly.status, "applied");
+	assert.deepEqual(resultOnly.removedBlockIds, []);
+	assert.deepEqual(resultOnly.offloadedBlockIds, [3]);
+});
+
+test("plan §5.4 (case 13): offload validates targets, notes, and reserved text", () => {
+	const records = cleanupRecords();
+	const mirror = renderMirror(records);
+	const structural = parseCleanupMirror(mirror);
+
+	for (const bad of [
+		{ offload: [] },
+		{ offload: [{ blockId: 2, note: "" }] },
+		{ offload: [{ blockId: 2, note: "   " }] },
+		{ offload: [{ blockId: 2, note: "two\nlines" }] },
+		{ offload: [{ blockId: 2, note: "x".repeat(400) }] },
+		{ offload: [{ blockId: 2, note: "a" }, { blockId: 2, note: "b" }] },
+		{ offload: [{ blockId: 2, note: "a" }], blockIds: [2] },
+		{ offload: [{ blockId: 2, note: "a" }], ranges: ["1-3"] },
+		{ offload: [{ blockId: 2, note: "a" }], list: "1-3" },
+		{ offload: [{ blockId: 2, note: "a", extra: 1 }] },
+		{ offload: [{ blockId: 0, note: "a" }] },
+		{ offload: "2" },
+	]) {
+		assert.equal(parseCleanupArgs(bad).ok, false, JSON.stringify(bad));
+	}
+
+	const blockOne = planCleanup(records, structural, validArgs({ offload: [{ blockId: 1, note: "anchor" }] }));
+	assert.equal(blockOne.status, "rejected");
+	assert.match(blockOne.reason ?? "", /block 1/i);
+
+	// User-authored text may be omitted but never rewritten, and offload is a
+	// rewrite: the model supplies the replacement body.
+	const userBlock = planCleanup(records, structural, validArgs({ offload: [{ blockId: 4, note: "keep the fact" }] }));
+	assert.equal(userBlock.status, "rejected");
+	assert.match(userBlock.reason ?? "", /user|custom/i);
+
+	// A note that would not shrink its block is rejected instead of applied as
+	// a growth path around the shrink-only gate.
+	const noShrink = planCleanup(
+		records,
+		structural,
+		validArgs({ offload: [{ blockId: 2, note: "A stale answer that should be removed." }] }),
+	);
+	assert.equal(noShrink.status, "rejected");
+	assert.match(noShrink.reason ?? "", /shorter|shrink/i);
+
+	// Reserved runtime text cannot be smuggled into a body through the note.
+	const reserved = parseCleanupArgs({ offload: [{ blockId: 2, note: "[oh-my-clm source=agent]" }] });
+	assert.equal(reserved.ok, false);
+});
+
+test("plan §5.4 (case 13): an offloaded note never becomes a top-level block", () => {
+	const records: MirrorRecord[] = [
+		{ id: "task", role: "user", text: "Keep the task.", protected: true, toolCallIds: [] },
+		{
+			id: "anchor",
+			role: "assistant",
+			text: "edit\n{\"oldText\":\n[[CLM_ENTRY id=2 role=toolResult]]\n[[/CLM_ENTRY id=2]]\n}",
+			protected: false,
+			toolCallIds: [],
+		},
+		{ id: "stale", role: "toolResult", text: "Z".repeat(1_000), protected: false, toolCallIds: [] },
+	];
+	const mirror = renderMirror(records);
+	const plan = planCleanup(
+		records,
+		parseCleanupMirror(mirror),
+		validArgs({ offload: [{ blockId: 2, note: "kept [[CLM_ENTRY id=9 role=user]] as text" }] }),
+	);
+	assert.equal(plan.status, "applied");
+	const rewritten = rewriteMirrorBlocks(mirror, { remove: plan.removedBlockIds, replace: plan.offloads });
+	assert.equal(rewritten.ok, true);
+	const text = rewritten.ok ? rewritten.text : "";
+	const scan = scanMirrorBlocks(text);
+	assert.deepEqual(scan.blocks.map((block) => block.id), ["1", "2"]);
+	assert.equal(scan.malformed, false);
+	assert.equal(scan.duplicateIds.length, 0);
+	assert.equal(parseMirror(text).recognized, true);
+	assert.equal(parseMirror(text).snapshot, parseMirror(mirror).snapshot);
+	assert.match(text, /\[offloaded: kept \[\[CLM_ENTRY id=9 role=user\]\] as text\]/);
+	// The block that quotes markers is still escaped as body text.
+	assert.match(text, /\\\[\[CLM_ENTRY id=2 role=toolResult\]\]/);
+});
+
+test("plan §5.4 (case 13): rewriteMirrorBlocks refuses a remove/offload conflict", () => {
+	const records = cleanupRecords();
+	const mirror = renderMirror(records);
+	const conflict = rewriteMirrorBlocks(mirror, {
+		remove: [2],
+		replace: [{ blockId: 2, body: "[offloaded: x]" }],
+	});
+	assert.equal(conflict.ok, false);
+	assert.match(conflict.ok === false ? conflict.reason : "", /both removed and rewritten/);
+	const missing = rewriteMirrorBlocks(mirror, { replace: [{ blockId: 99, body: "[offloaded: x]" }] });
+	assert.equal(missing.ok, false);
+	assert.match(missing.ok === false ? missing.reason : "", /not found/);
 });
