@@ -438,7 +438,7 @@ test("a malformed mirror is rejected instead of throwing mid-write", () => {
 	assert.match(missing.ok === false ? missing.reason : "", /not found/i);
 });
 
-// docs/plan.md §3 case 6 / P1-5: "none" suppresses only the success
+// P1-5: "none" suppresses only the success
 // confirmation; a rejection must still reach the model with its reason.
 test("plan §3.6 (P1-5): rejected cleanup still returns its reason under copy=none", () => {
 	const rejected = {
@@ -456,7 +456,7 @@ test("plan §3.6 (P1-5): rejected cleanup still returns its reason under copy=no
 	);
 });
 
-// docs/plan.md §5.4 / case 13 (red): pure omission is a one-way ratchet. A
+// Case 13 (red): pure omission is a one-way ratchet. A
 // soft offload keeps the block, its ID/role/markers and one model-supplied
 // fact, so a wrong delete is recoverable without a second summarizer.
 test("plan §5.4 (case 13): offload keeps the block and its point in one short line", () => {

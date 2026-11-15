@@ -60,7 +60,7 @@ export const DEFAULT_PAYBACK_TURNS = 10;
  * The candidate half of a trigger, without the threshold decision. The Pi
  * adapter already knows it is under pressure (its budget nudge), so it reuses
  * the same ranking and rendering as the DSH turn-boundary trigger instead of
- * inventing a second candidate format (docs/plan.md §5.3).
+ * inventing a second candidate format.
  *
  * `tokens` is always what the rendered `skipRoles` call frees, never the whole
  * turn: a suggestion that quietly deletes the human's request would be safe to
@@ -176,7 +176,7 @@ export function planCleanupTrigger(records, context, options = {}) {
 /**
  * The model-visible half: a ready-to-confirm `cleanup` call plus the per-range
  * reason. The answer space is a confirmation, not an open "should I clean"
- * question (docs/plan.md §5.0). Empty when nothing is worth suggesting.
+ * question. Empty when nothing is worth suggesting.
  */
 /** `{3,5}` -> `3-5`, `{5,5}` -> `5`; one spelling for the call and the detail line. */
 function candidateRange(candidate) {

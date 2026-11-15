@@ -44,7 +44,7 @@ jobs:
           fi
 
       - run: npm ci
-      # Keep the tag gate identical to the local baseline in docs/plan.md §3.
+      # Keep the tag gate identical to the local baseline.
       - run: npm test
       - run: npm run check
       - run: npm run typecheck

@@ -21,6 +21,7 @@ import {
 	renderBlockDigest,
 	renderBlockIndex,
 	renderMirror,
+	type BlockClearMark,
 	type BlockIndexOptions,
 	type ContextEditDraft,
 	type ContextEditProvenance,
@@ -110,6 +111,10 @@ export interface DshBridgeOptions {
 	cleanupResult?: CleanupResultCopy;
 	/** Preview/head/tail budget for the model-facing block index. */
 	blockIndex?: BlockIndexOptions;
+	/** Re-render the index at most once per this many completed steps. */
+	refreshSteps?: number;
+	/** Tell the index that clearing runs automatically (header wording). */
+	autoClear?: boolean;
 	/**
 	 * Model-facing index shape. `blocks` lists individual editable blocks;
 	 * `digest` lists one line per closed turn (ID range, size) and is stable
@@ -144,7 +149,7 @@ export interface DshBridgeState {
 	 * Usage line plus candidate text, frozen at the turn boundary. Host usage
 	 * grows on every step, so recomputing per render would append a fresh
 	 * runtime-context snapshot on each step and tax the prefix cache instead of
-	 * saving it (docs/plan.md §5.0 / §5.2).
+	 * saving it.
 	 */
 	trigger?: DshTriggerCache;
 }
@@ -161,6 +166,8 @@ export interface DshTriggerCache {
 export interface DshBlockIndexCache {
 	/** Turn that was open when this text was rendered; a new turn always re-renders. */
 	turn?: number;
+	/** Cleared records visible when this text was rendered; a new record re-renders. */
+	clearedCount?: number;
 	/**
 	 * Completed `step/end` events when this text was rendered. DSH renders the
 	 * runtime context before it appends the upcoming `step/start`, so the open
@@ -254,12 +261,18 @@ export function buildDshMirrorRecords(
 export function renderDshBlockIndex(
 	session: DshSessionLike,
 	options: DshBridgeOptions,
+	cleared?: ReadonlyMap<string, BlockClearMark>,
 ): string {
 	const records = buildDshMirrorRecords(session, options);
+	const indexOptions = {
+		...options.blockIndex,
+		...(cleared === undefined ? {} : { cleared }),
+		...(options.autoClear === true ? { autoClear: true } : {}),
+	};
 	if (options.indexMode === "digest") {
-		return renderBlockDigest(records, options.blockIndex);
+		return renderBlockDigest(records, indexOptions);
 	}
-	return renderBlockIndex(records, options.blockIndex);
+	return renderBlockIndex(records, indexOptions);
 }
 
 /**
@@ -284,20 +297,23 @@ export function dshBlockIndexText(
 	options: DshBridgeOptions,
 	state: DshBridgeState | undefined,
 	refreshSteps = 4,
+	cleared?: ReadonlyMap<string, BlockClearMark>,
 ): string {
 	const epoch = dshBlockIndexEpoch(session);
 	const cached = state?.blockIndex;
 	const window = Math.max(1, Math.floor(refreshSteps));
+	const clearedCount = cleared?.size ?? 0;
 	if (
 		cached
 		&& cached.turn === epoch.turn
+		&& (cached.clearedCount ?? 0) === clearedCount
 		&& epoch.closedSteps >= cached.closedSteps
 		&& epoch.closedSteps - cached.closedSteps < window
 	) {
 		return cached.text;
 	}
-	const text = renderDshBlockIndex(session, options);
-	if (state) state.blockIndex = { turn: epoch.turn, closedSteps: epoch.closedSteps, text };
+	const text = renderDshBlockIndex(session, options, cleared);
+	if (state) state.blockIndex = { turn: epoch.turn, closedSteps: epoch.closedSteps, clearedCount, text };
 	return text;
 }
 
@@ -372,6 +388,7 @@ export function dshTriggerView(
 	session: DshSessionLike,
 	options: DshBridgeOptions,
 	state: DshBridgeState | undefined,
+	cleared?: ReadonlyMap<string, BlockClearMark>,
 ): DshTriggerView {
 	const epoch = dshBlockIndexEpoch(session);
 	const signature = triggerSignature(options);
@@ -386,7 +403,10 @@ export function dshTriggerView(
 		&& options.contextWindow > 0
 		? Math.ceil(options.contextWindow)
 		: undefined;
-	const usageTokens = hostUsage?.tokens ?? fixedTokens(options) + estimateMirrorTokens(records);
+	const clearedTokens = cleared === undefined
+		? 0
+		: [...cleared.values()].reduce((sum, mark) => sum + Math.max(0, mark.tokens), 0);
+	const usageTokens = hostUsage?.tokens ?? Math.max(0, fixedTokens(options) + estimateMirrorTokens(records) - clearedTokens);
 	const contextWindow = hostUsage?.contextWindow ?? fallbackWindow;
 	const usageLine = formatUsageLine({
 		tokens: usageTokens,

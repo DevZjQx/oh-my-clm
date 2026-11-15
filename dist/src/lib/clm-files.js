@@ -28,3 +28,17 @@ export function writePrivateText(filePath, content) {
         }
     }
 }
+/**
+ * Append one already-serialized line to a private per-session artifact.
+ *
+ * The canary log is append-only on purpose: a crash or an early exit must not
+ * lose the observations that preceded it, and rewriting the whole file each
+ * time would make every append cost grow with the session.
+ */
+export function appendPrivateLine(filePath, line) {
+    const directory = path.dirname(filePath);
+    fs.mkdirSync(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+    fs.chmodSync(directory, PRIVATE_DIRECTORY_MODE);
+    fs.appendFileSync(filePath, `${line}\n`, { encoding: "utf8", mode: PRIVATE_FILE_MODE });
+    fs.chmodSync(filePath, PRIVATE_FILE_MODE);
+}

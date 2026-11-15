@@ -150,6 +150,12 @@ export interface MirrorRecord {
 	sourceMessage?: unknown;
 }
 
+/** One record whose model-visible body a clearing projection replaced. */
+export interface BlockClearMark {
+	readonly label: string;
+	readonly tokens: number;
+}
+
 export interface ParsedMirrorBlock {
 	id: string;
 	role: string;
@@ -229,7 +235,7 @@ export interface HostUsage {
  * 3.5 chars/token estimate is not a provider tokenizer (README), so at high
  * occupancy a small estimated shrink is not evidence that the next request
  * fits; this leaves room for the response and estimator error. Calibrate on
- * real V4.1-Flash sessions (docs/plan.md §5.0) instead of copying a model's
+ * real V4.1-Flash sessions instead of copying a model's
  * threshold from elsewhere.
  */
 export const HOST_CAP_HEADROOM = 0.05;
@@ -541,6 +547,10 @@ export interface BlockIndexOptions {
 	tailBlocks?: number;
 	/** Digest mode: maximum listed turns before older ones collapse. */
 	maxLines?: number;
+	/** Records whose body was cleared by a projection; keyed by MirrorRecord.id. */
+	cleared?: ReadonlyMap<string, BlockClearMark>;
+	/** True when clearing runs automatically; switches the header wording. */
+	autoClear?: boolean;
 }
 
 function blockPreview(text: string, maxChars: number): string {
@@ -585,6 +595,10 @@ export function renderBlockIndex(
 	const tailCount = Math.max(0, Math.floor(options.tailBlocks ?? DEFAULT_BLOCK_INDEX_TAIL));
 	const lineFor = (record: MirrorRecord): string => {
 		const blockId = displayIds.get(record.id) ?? record.id;
+		const cleared = options.cleared?.get(record.id);
+		if (cleared) {
+			return `${blockId}. ${record.role}: [cleared ${compactTokens(Math.max(0, cleared.tokens))} · ${blockPreview(cleared.label, maxPreviewChars)}]`;
+		}
 		return `${blockId}. ${record.role}: ${blockPreview(record.text, maxPreviewChars)}`;
 	};
 	const omittedLine = (start: number, end: number): string => {
@@ -610,9 +624,12 @@ export function renderBlockIndex(
 	} else {
 		appendOmittedRun(headEnd + 1, editable.length);
 	}
+	const header = options.autoClear
+		? "Editable blocks by cleanup ID; [cleared] blocks hold a re-read pointer, not the body. Ranges are inclusive; cleanup remains for manual removal."
+		: "Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them, cleanup({ list: \"A-B\" }) to read a range's rows.";
 	return [
 		"<oh-my-clm-block-index>",
-		"Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them, cleanup({ list: \"A-B\" }) to read a range's rows.",
+		header,
 		...lines,
 		"</oh-my-clm-block-index>",
 	].join("\n");
@@ -700,6 +717,10 @@ export interface BlockDigestOptions {
 	maxPreviewChars?: number;
 	/** Maximum listed turns before older ones collapse into an omission line. */
 	maxLines?: number;
+	/** Records whose body was cleared by a projection; keyed by MirrorRecord.id. */
+	cleared?: ReadonlyMap<string, BlockClearMark>;
+	/** True when clearing runs automatically; switches the header wording. */
+	autoClear?: boolean;
 }
 
 /**
@@ -725,8 +746,20 @@ function compactTokens(tokens: number): string {
 	return `${thousands >= 10 ? Math.round(thousands) : thousands.toFixed(1)}k tok`;
 }
 
-function unitTokens(unit: BlockDigestUnit): number {
-	return estimateMirrorTokens(unit.records);
+function unitTokens(unit: BlockDigestUnit, cleared?: ReadonlyMap<string, BlockClearMark>): number {
+	const total = estimateMirrorTokens(unit.records);
+	if (!cleared || cleared.size === 0) return total;
+	let clearedTokens = 0;
+	for (const record of unit.records) clearedTokens += Math.max(0, cleared.get(record.id)?.tokens ?? 0);
+	return Math.max(0, total - clearedTokens);
+}
+
+/** How many records of one unit a clearing projection already replaced. */
+function unitClearedCount(unit: BlockDigestUnit, cleared?: ReadonlyMap<string, BlockClearMark>): number {
+	if (!cleared || cleared.size === 0) return 0;
+	let count = 0;
+	for (const record of unit.records) if (cleared.has(record.id)) count += 1;
+	return count;
 }
 
 function runRoleLabel(records: readonly MirrorRecord[]): string {
@@ -799,14 +832,16 @@ export function renderBlockDigest(
 	const visible = units.filter((unit) => !unit.open);
 	const lines: string[] = [];
 	const lineFor = (unit: BlockDigestUnit): string => {
-		const tokens = compactTokens(unitTokens(unit));
+		const tokens = compactTokens(unitTokens(unit, options.cleared));
+		const clearedCount = unitClearedCount(unit, options.cleared);
+		const clearedNote = clearedCount > 0 ? `, ${clearedCount} cleared` : "";
 		const first = unit.records[0];
 		const preview = first ? blockPreview(first.text, maxPreviewChars) : "(empty)";
 		const load = unit.records.length;
 		const count = load > 1 ? ` ×${load}` : "";
 		const where = unit.start === unit.end ? `${unit.start}` : `${unit.start}-${unit.end}`;
 		if (unit.kind === "run") {
-			return `${where}. ${runRoleLabel(unit.records)}${count} (${tokens}): ${blockPreview(first?.text ?? "", maxPreviewChars)}`;
+			return `${where}. ${runRoleLabel(unit.records)}${count} (${tokens}${clearedNote}): ${blockPreview(first?.text ?? "", maxPreviewChars)}`;
 		}
 		if (load === 1) {
 			// A turn that is just the user message needs no "turn/user" double label.
@@ -815,7 +850,7 @@ export function renderBlockDigest(
 		const userTokens = first ? compactTokens(estimateMirrorTokens([first])) : "0 tok";
 		const noise = load - 1;
 		const noiseNote = noise > 0 ? ` + ${noise} noise` : "";
-		return `${where}. turn${count} (${tokens}): user (${userTokens})${noiseNote}: ${preview}`;
+		return `${where}. turn${count} (${tokens}${clearedNote}): user (${userTokens})${noiseNote}: ${preview}`;
 	};
 	const omittedLine = (start: number, end: number): string => {
 		const count = end - start + 1;
@@ -834,12 +869,14 @@ export function renderBlockDigest(
 	// line only reads completed units, so it stays byte-stable inside a turn.
 	const shown = new Set(selected);
 	const hidden = visible.filter((unit) => !shown.has(unit));
-	const rankedHidden = [...hidden].sort((a, b) => unitTokens(b) - unitTokens(a)).slice(0, 3);
+	const rankedHidden = [...hidden]
+		.sort((a, b) => unitTokens(b, options.cleared) - unitTokens(a, options.cleared))
+		.slice(0, 3);
 	const hiddenLine = rankedHidden.length === 0
 		? undefined
 		: `... largest omitted turns: ${rankedHidden.map((unit) => {
 			const where = unit.start === unit.end ? `${unit.start}` : `${unit.start}-${unit.end}`;
-			return `${where} (${compactTokens(unitTokens(unit))})`;
+			return `${where} (${compactTokens(unitTokens(unit, options.cleared))})`;
 		}).join(", ")}.`;
 	let hiddenNamed = false;
 	const emitHiddenLine = (): void => {
@@ -867,9 +904,12 @@ export function renderBlockDigest(
 		lines.push(`IDs ${open.start}.. (current turn, not listed): ${blockPreview(open.records[0]?.text ?? "", maxPreviewChars)}`);
 	}
 
+	const header = options.autoClear
+		? "Editable blocks by cleanup ID; one line per turn. [cleared] blocks hold a re-read pointer, not the body; cleanup remains for manual removal."
+		: "Editable blocks by cleanup ID; ranges are inclusive. One line per turn; call cleanup({ ranges: [\"A-B\"] }) to omit a turn, cleanup({ list: \"A-B\" }) to read its rows.";
 	return [
 		"<oh-my-clm-block-index>",
-		"Editable blocks by cleanup ID; ranges are inclusive. One line per turn; call cleanup({ ranges: [\"A-B\"] }) to omit a turn, cleanup({ list: \"A-B\" }) to read its rows.",
+		header,
 		...lines,
 		"</oh-my-clm-block-index>",
 	].join("\n");

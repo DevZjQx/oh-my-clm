@@ -30,7 +30,7 @@ test("DSH community manifest and official bundle metadata point at the built hos
 	assert.equal(fs.existsSync(path.join(root, "icon.svg")), true);
 });
 
-// docs/plan.md §3 case 7 / P1-6: a declared fs permission scope must describe
+// P1-6: a declared fs permission scope must describe
 // where the plugin actually writes. Artifacts live in the host temp root, so a
 // "workspace" scope is a decorative claim that implies isolation it cannot give.
 test("plan §3.7 (P1-6): manifest fs scopes match the real artifact root", () => {

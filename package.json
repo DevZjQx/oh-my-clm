@@ -1,7 +1,7 @@
 {
   "name": "oh-my-clm",
   "version": "0.1.18",
-  "description": "A Pi extension and minimal DSH bridge for self-editable live context inspired by the Facebook Research CLM harness.",
+  "description": "Pi extension + DSH plugin: manual live-context cleanup and automatic, replay-safe tool-result clearing.",
   "icon": "./icon.svg",
   "repository": {
     "type": "git",
@@ -18,11 +18,10 @@
     "docs/README.md",
     "docs/features",
     "docs/project-structure.md",
-    "docs/reference",
-    "docs/reports",
     "extensions/clm.ts",
     "src/lib",
     "src/features/live-context",
+    "scripts/canary-replay.mjs",
     "dsh",
     "dist",
     "dsh-plugin.json",
@@ -63,8 +62,9 @@
     "test": "node --experimental-strip-types --test \"test/**/*.test.ts\"",
     "build:dsh": "tsc -p tsconfig.dsh.json",
     "build:dsh:plugin": "node scripts/build-dsh-plugin.mjs",
-    "check": "node scripts/check-boundaries.mjs && npm run build:dsh && node --experimental-strip-types --check extensions/clm.ts && node --experimental-strip-types --check src/features/live-context/context-format.ts && node --experimental-strip-types --check src/features/live-context/dsh-bridge.ts && node --check dist/dsh/index.js && node --check scripts/build-dsh-plugin.mjs && node scripts/check-dsh-package.mjs",
+    "check": "node scripts/check-boundaries.mjs && npm run build:dsh && node --experimental-strip-types --check extensions/clm.ts && node --experimental-strip-types --check src/features/live-context/context-format.ts && node --experimental-strip-types --check src/features/live-context/dsh-bridge.ts && node --check dist/dsh/index.js && node --check scripts/build-dsh-plugin.mjs && node --check scripts/canary-replay.mjs && node scripts/check-dsh-package.mjs",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.dsh.json --noEmit",
+    "canary:replay": "node scripts/canary-replay.mjs --all",
     "prepack": "npm run build:dsh"
   },
   "peerDependencies": {

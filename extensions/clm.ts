@@ -12,8 +12,6 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	buildMirrorRecords,
-	DEFAULT_MAX_BLOCK_CHARS,
-	DEFAULT_MAX_MIRROR_CHARS,
 	estimateMessageTokens,
 	estimateMirrorTokens,
 	hostUsageOf,
@@ -45,6 +43,7 @@ import {
 	renderCleanupCandidates,
 	type CleanupTriggerPlan,
 } from "../src/features/live-context/context-trigger.ts";
+import { loadClmConfig } from "../src/lib/clm-config.ts";
 import { writePrivateText } from "../src/lib/clm-files.ts";
 import { sessionMirrorPath } from "../src/lib/clm-paths.ts";
 const PROMPT_MARKER = "<pi-clm-live-context>";
@@ -79,30 +78,27 @@ interface MirrorSnapshot {
 	signature: string;
 }
 
-function positiveEnv(name: string, fallback: number): number {
-	const value = Number.parseInt(process.env[name] ?? "", 10);
-	return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
-/** Price ratios accept `0`, so the positive-only parser cannot be reused. */
-function nonNegativeEnv(name: string, fallback: number): number {
-	const value = Number.parseInt(process.env[name] ?? "", 10);
-	return Number.isFinite(value) && value >= 0 ? value : fallback;
-}
-
-function config(): Config {
+/**
+ * Read the session's effective config.
+ *
+ * The project file is keyed by the session's working directory, so two repos
+ * can carry different budgets without restarting Pi. The user file underneath
+ * holds endpoint calibration shared by every project.
+ */
+function config(ctx: ExtensionContext): Config {
+	const loaded = loadClmConfig(ctx.cwd);
 	return {
-		budgetTokens: positiveEnv("CLM_CONTEXT_BUDGET", 0),
-		maxBlockChars: DEFAULT_MAX_BLOCK_CHARS,
-		maxMirrorChars: DEFAULT_MAX_MIRROR_CHARS,
-		// Same knobs as DSH (`CLM_CACHE_DISCOUNT` is a percentage: 2 = 1/50).
-		// Measured on deepseek-flash through Pi's own cost table (2026-11-09):
-		// input $0.30/M vs cacheRead $0.006/M. Lower is the fail-safe direction.
-		cacheDiscount: Math.min(100, nonNegativeEnv("CLM_CACHE_DISCOUNT", 2)) / 100,
-		paybackTurns: positiveEnv("CLM_CACHE_PAYBACK_TURNS", 10),
-		// Host-independent triggers, same names as DSH. Both default off.
-		triggerSince: nonNegativeEnv("CLM_TRIGGER_SINCE", 0),
-		triggerToolShare: Math.min(100, nonNegativeEnv("CLM_TRIGGER_TOOL_RATIO", 0)) / 100,
+		budgetTokens: loaded.config.context.budgetTokens,
+		maxBlockChars: loaded.config.context.maxBlockChars,
+		maxMirrorChars: loaded.config.context.maxMirrorChars,
+		// A percentage in the file, a fraction in the cleanup math. Measured on
+		// deepseek-flash through Pi's own cost table (2026-11-09): input $0.30/M
+		// vs cacheRead $0.006/M. Lower is the fail-safe direction.
+		cacheDiscount: loaded.config.cleanup.cacheDiscountPercent / 100,
+		paybackTurns: loaded.config.cleanup.paybackTurns,
+		// Host-independent triggers. Both default off.
+		triggerSince: loaded.config.cleanup.trigger.turnsSinceCleanup,
+		triggerToolShare: loaded.config.cleanup.trigger.toolResultSharePercent / 100,
 	};
 }
 
@@ -161,7 +157,7 @@ function syncMirror(ctx: ExtensionContext, force = false): MirrorSnapshot {
 	const state = sessionState(ctx);
 	const filePath = mirrorPath(ctx);
 	const projection = getProjection(ctx);
-	const settings = config();
+	const settings = config(ctx);
 	const records = buildMirrorRecords(projection.entries, {
 		mirrorPath: filePath,
 		maxBlockChars: settings.maxBlockChars,
@@ -215,7 +211,7 @@ function discardedEditNotice(ctx: ExtensionContext, previous: MirrorSnapshot, cu
  * Pi's interface is the mirror file itself, so the path and block markers are
  * model-actionable and stay. Everything else follows the DSH standard: this
  * text rides in every request, so it carries no API restatement
- * (`cleanupParameters` owns that), no protocol internals, no env switches, and
+ * (`cleanupParameters` owns that), no protocol internals, no config switches, and
  * no instruction repeated elsewhere. The budget nudge adds the only
  * turn-scoped line at runtime.
  *
@@ -232,7 +228,7 @@ ${PROMPT_MARKER}`;
 
 function statusText(ctx: ExtensionContext, snapshot: MirrorSnapshot | undefined): string {
 	const current = snapshot ?? syncMirror(ctx);
-	const settings = config();
+	const settings = config(ctx);
 	const usage = ctx.getContextUsage();
 	const estimatedRequest = fixedRequestTokens(ctx) + estimateMirrorTokens(current.records);
 	const currentTokens = usage?.tokens ?? estimatedRequest;
@@ -385,7 +381,7 @@ function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolRe
 	if (!parsedArgs.ok) return rejectedCleanupResult([], parsedArgs.reason);
 
 	const filePath = mirrorPath(ctx);
-	const settings = config();
+	const settings = config(ctx);
 	const buildRecords = () => buildMirrorRecords(getProjection(ctx).entries, {
 		mirrorPath: filePath,
 		maxBlockChars: settings.maxBlockChars,
@@ -462,7 +458,7 @@ function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolRe
 
 /**
  * Budget pressure as one system line inside the request that is already going
- * out (docs/plan.md §5.3). The old shape claimed a whole "context-only" turn
+ * out. The old shape claimed a whole "context-only" turn
  * and told the model to stop task work; this one hands it the same usage line
  * and candidate payload as the DSH turn-boundary trigger, so the answer is a
  * confirmation rather than an interruption.
@@ -478,7 +474,7 @@ function contextBudgetNudge(
 	records: readonly MirrorRecord[],
 	state: SessionState,
 ): string | undefined {
-	const settings = config();
+	const settings = config(ctx);
 	const hostUsage = hostUsageOfContext(ctx);
 	const hostWindow = hostUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 	if (messages.some((message) => messageText(message).includes(CONTEXT_NUDGE_MARKER))) return undefined;
@@ -575,6 +571,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		states.set(sessionKey(ctx), freshState());
+		// A bad config key must not be silent: the plugin falls back to that key's
+		// default, and the user needs to know which line was ignored.
+		for (const warning of loadClmConfig(ctx.cwd).warnings) {
+			notify(ctx, `oh-my-clm config: ${warning}`, "warning");
+		}
 		// A session switch (including `/resume`) does not necessarily trigger a
 		// model request immediately. Rebuild the external mirror here, after Pi
 		// has bound the new SessionManager, so it cannot retain the previous

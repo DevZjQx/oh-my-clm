@@ -28,7 +28,7 @@
       {
         "icon": "./icon.svg",
         "title": "oh-my-clm",
-        "description": "Mirrors editable DSH session context and applies safe shrink-only edits through Session.append surface replacement.",
+        "description": "Mirrors editable DSH session context for manual shrink-only cleanup and, when enabled, writes ignorable clearing records that a message projection turns into re-read pointers.",
         "locales": [
           "locale/en.json",
           "locale/zh.json"

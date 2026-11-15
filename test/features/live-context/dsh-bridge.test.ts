@@ -22,6 +22,16 @@ import {
 import { renderMirror } from "../../../src/features/live-context/context-format.ts";
 import { formatCleanupToolResult } from "../../../src/features/live-context/context-cleanup.ts";
 
+/** Write the project config the DSH plugin reads for a session's cwd. */
+function writeConfig(cwd: string, config: unknown): void {
+	fs.writeFileSync(path.join(cwd, ".oh-my-clm.json"), JSON.stringify(config), "utf8");
+}
+
+// The loader also reads a user-level config from the ambient home directory, so
+// pin that root before any test runs: the suite's outcome must not depend on the
+// machine it runs on. (This is a file-location seam, not a plugin switch.)
+process.env.XDG_CONFIG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-user-config-"));
+
 class MemoryFiles implements DshFileSystem {
 	readonly files = new Map<string, string>();
 
@@ -649,7 +659,6 @@ test("DSH cleanup tool value passes the declared output schema", async () => {
 	const tool = root.tools.definitions.get("cleanup");
 	assert.ok(tool?.output?.schema);
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-dsh-output-"));
-	const previous = process.env.CLM_CLEANUP_RESULT;
 	const run = async (id: string) => {
 		const session = dshSession(cwd, id);
 		const args = { blockIds: [3] };
@@ -661,17 +670,17 @@ test("DSH cleanup tool value passes the declared output schema", async () => {
 		// additionalProperties: false) before rendering. Host-only rendering state
 		// such as the copy mode must not ride along, or every call fails with
 		// ToolOutputError(INVALID_TOOL_OUTPUT).
-		delete process.env.CLM_CLEANUP_RESULT;
+		writeConfig(cwd, {});
 		const compact = await run("dsh-output-tool");
 		assert.deepEqual(validateJsonSchemaValue(tool.output.schema, compact.value, "value"), []);
 		assert.deepEqual(compact.rendered, [{ type: "text", text: "cleanup applied; removed 1 block(s): 3." }]);
 
-		process.env.CLM_CLEANUP_RESULT = "none";
+		writeConfig(cwd, { cleanup: { resultMode: "none" } });
 		const silent = await run("dsh-output-tool-none");
 		assert.deepEqual(validateJsonSchemaValue(tool.output.schema, silent.value, "value"), []);
 		assert.deepEqual(silent.rendered, [{ type: "text", text: "" }]);
 
-		process.env.CLM_CLEANUP_RESULT = "full";
+		writeConfig(cwd, { cleanup: { resultMode: "full" } });
 		const full = await run("dsh-output-tool-full");
 		assert.deepEqual(validateJsonSchemaValue(tool.output.schema, full.value, "value"), []);
 		const fullText = full.rendered[0]?.text ?? "";
@@ -679,7 +688,7 @@ test("DSH cleanup tool value passes the declared output schema", async () => {
 
 		// A read-only listing is a distinct status with its own payload, and it
 		// must pass the same declared schema.
-		delete process.env.CLM_CLEANUP_RESULT;
+		writeConfig(cwd, {});
 		const listSession = dshSession(cwd, "dsh-output-tool-list");
 		const listArgs = { list: "1-3" };
 		const listed = await tool.execute(listArgs, { agent: { session: listSession } });
@@ -689,13 +698,11 @@ test("DSH cleanup tool value passes the declared output schema", async () => {
 		assert.match(listedText, /^<oh-my-clm-block-list>\nRead-only rows for IDs 1-3; nothing was removed\./);
 		assert.deepEqual(listSession.surface.nodes, [0, 1, 2, 3, 4]);
 	} finally {
-		if (previous === undefined) delete process.env.CLM_CLEANUP_RESULT;
-		else process.env.CLM_CLEANUP_RESULT = previous;
 		fs.rmSync(cwd, { recursive: true, force: true });
 	}
 });
 
-// docs/plan.md §5.1 / case 10 (red): the DSH static prompt must state *when*
+// Case 10 (red): the DSH static prompt must state *when*
 // to clean (an explicit trigger condition), must not end by telling the model
 // that nothing is required, and must stay inside the standing-tax budget.
 // Today it only says *how* to clean and closes with "Nothing else is required
@@ -717,23 +724,15 @@ test("plan §5.1 (case 10, DSH): static prompt states when to clean within the l
 	assert.ok(promptSection.length <= 800, `live-context prompt grew to ${promptSection.length} chars`);
 });
 
-// docs/plan.md §5.2 / case 11 (red): the dynamic context must show usage with a
+// Case 11 (red): the dynamic context must show usage with a
 // percentage, and only a fired threshold may assemble a confirmation-shaped
 // cleanup candidate. Candidates must stay inside the editable range and must
 // never include block 1, and the payload is frozen at the turn boundary so it
 // cannot append a fresh snapshot on every step.
 test("plan §5.2 (case 11): usage line and cleanup candidates follow host usage and thresholds", async () => {
-	const envKeys = [
-		"CLM_TRIGGER_PCT",
-		"CLM_TRIGGER_TURNS",
-		"CLM_TRIGGER_TOOL_RATIO",
-		"CLM_TRIGGER_SINCE",
-		"CLM_CACHE_DISCOUNT",
-		"CLM_CACHE_PAYBACK_TURNS",
-	] as const;
-	const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
-	for (const key of envKeys) delete process.env[key];
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-trigger-"));
+	// Every threshold is off by default; each scenario rewrites this file.
+	writeConfig(cwd, {});
 	let tokensUsed = 6_400;
 	const projections = {
 		snapshot() {
@@ -801,7 +800,7 @@ test("plan §5.2 (case 11): usage line and cleanup candidates follow host usage 
 		assert.doesNotMatch(quietRender(), /Suggested cleanup/);
 
 		// A fired usage threshold produces one legal, ready-to-confirm candidate.
-		process.env.CLM_TRIGGER_PCT = "70";
+		writeConfig(cwd, { cleanup: { trigger: { usagePercent: 70 } } });
 		const root = listenerContext();
 		dshHost({ ...root, sessionProjections: projections } as any);
 		const session = dshSession(cwd, "dsh-52-hit");
@@ -845,7 +844,7 @@ test("plan §5.2 (case 11): usage line and cleanup candidates follow host usage 
 		assert.match(nextTurn, /Usage: 7\.6k\/8k tokens \(95%\)/);
 
 		// A threshold that is not hit yields the usage line but no candidate.
-		process.env.CLM_TRIGGER_PCT = "95";
+		writeConfig(cwd, { cleanup: { trigger: { usagePercent: 95 } } });
 		tokensUsed = 6_400;
 		const cold = listenerContext();
 		dshHost({ ...cold, sessionProjections: projections } as any);
@@ -856,7 +855,7 @@ test("plan §5.2 (case 11): usage line and cleanup candidates follow host usage 
 		assert.doesNotMatch(coldRender(), /Suggested cleanup/);
 
 		// Without the host projection service the estimate is labelled `~`.
-		delete process.env.CLM_TRIGGER_PCT;
+		writeConfig(cwd, {});
 		const bare = listenerContext();
 		dshHost({ ...bare } as any);
 		const bareSession = dshSession(cwd, "dsh-52-estimate");
@@ -865,11 +864,6 @@ test("plan §5.2 (case 11): usage line and cleanup candidates follow host usage 
 		assert.match(bareRender(), /Usage: ~\d+(?:\.\d+)?k? tokens \(window unknown\)/);
 		assert.doesNotMatch(bareRender(), /Suggested cleanup/);
 	} finally {
-		for (const key of envKeys) {
-			const value = previousEnv.get(key);
-			if (value === undefined) delete process.env[key];
-			else process.env[key] = value;
-		}
 		for (const id of ["dsh-52-off", "dsh-52-hit", "dsh-52-miss", "dsh-52-estimate"]) {
 			fs.rmSync(path.dirname(sessionMirrorPath(id)), { recursive: true, force: true });
 		}
@@ -898,7 +892,7 @@ test("mock DSH host loads the entry, registers hooks, and mutates the active sur
 	// compression interface. The schema still owns the API, and bridge internals
 	// and env switches stay out of model-visible text.
 	assert.match(promptSection, /\/tmp\/clm-<session-id>\/LIVE_CTX_MAIN\.md/);
-	assert.doesNotMatch(promptSection, /blockIds|skipRoles|CLM_CLEANUP_RESULT|CLM_INDEX_|CLM_MAX_|Session\.append|sourceEventSeqs/);
+	assert.doesNotMatch(promptSection, /blockIds|skipRoles|autoClear\.enabled|cleanup\.resultMode|index\.mode|maxBlockChars|Session\.append|sourceEventSeqs/);
 	assert.ok(promptSection.length <= 800, `live-context prompt grew to ${promptSection.length} chars`);
 	assert.equal(root.contexts[0]?.name, "oh-my-clm:block-index");
 	assert.equal(root.contexts[0]?.order, 200);
@@ -945,9 +939,8 @@ test("mock DSH host loads the entry, registers hooks, and mutates the active sur
 test("DSH host caches the block index across steps and invalidates on compaction", async () => {
 	// This covers the blocks-mode text, which changes on every appended block.
 	// The digest default is covered by the turn-digest tests.
-	const previousMode = process.env.CLM_INDEX_MODE;
-	process.env.CLM_INDEX_MODE = "blocks";
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-index-cache-"));
+	writeConfig(cwd, { index: { mode: "blocks" } });
 	const root = listenerContext();
 	const agentContext = listenerContext();
 	dshHost({ ...root } as any);
@@ -986,8 +979,6 @@ test("DSH host caches the block index across steps and invalidates on compaction
 		await root.emit("session/event", session, { seq: 999, type: "compaction/summary", data: {} });
 		assert.match(text({ agent }), /Post compaction block/);
 	} finally {
-		if (previousMode === undefined) delete process.env.CLM_INDEX_MODE;
-		else process.env.CLM_INDEX_MODE = previousMode;
 		fs.rmSync(cwd, { recursive: true, force: true });
 		fs.rmSync(path.dirname(sessionMirrorPath(String(session.id))), { recursive: true, force: true });
 	}
@@ -1146,7 +1137,7 @@ test("DSH reads contextPressure occupancy from sessionProjections and labels the
 		);
 
 		// Without the projection service the fallback must be visibly labelled,
-		// never passed off as an exact value (P1-2 / docs/plan.md §5.2).
+		// never passed off as an exact value (P1-2).
 		const bare = listenerContext();
 		dshHost({ ...bare } as any);
 		const fallback = await bare.commands.definitions.get("clm").handler(invocation);
@@ -1316,13 +1307,12 @@ test("DSH digest index collapses a turn and stays byte-stable while it grows", (
 
 test("DSH digest mode renders turn ranges and the cleanup tool accepts a range", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-digest-mode-"));
+	writeConfig(cwd, { index: { mode: "digest" } });
 	const root = listenerContext();
 	const agentContext = listenerContext();
 	dshHost({ ...root } as any);
 	const session = dshSession(cwd, "dsh-digest-mode");
 	const agent = { id: "agent-digest-mode", session, ctx: agentContext };
-	const previous = process.env.CLM_INDEX_MODE;
-	process.env.CLM_INDEX_MODE = "digest";
 	try {
 		await root.emit("agent/created", { agent });
 		const text = root.contexts[0]?.text as (context: { agent: unknown }) => string;
@@ -1341,8 +1331,6 @@ test("DSH digest mode renders turn ranges and the cleanup tool accepts a range",
 		assert.deepEqual(output.removedBlockIds, [3]);
 		assert.deepEqual(output.pairedRemovalIds, []);
 	} finally {
-		if (previous === undefined) delete process.env.CLM_INDEX_MODE;
-		else process.env.CLM_INDEX_MODE = previous;
 		fs.rmSync(cwd, { recursive: true, force: true });
 		fs.rmSync(path.dirname(sessionMirrorPath(String(session.id))), { recursive: true, force: true });
 	}
@@ -1380,7 +1368,7 @@ test("DSH /clm mode switches the index shape live and clears the cached preview"
 		assert.equal(invalid.kind, "error");
 		const auto = await command.handler(invocation("mode auto"));
 		assert.equal(auto.kind, "success", auto.text);
-		// Without CLM_INDEX_MODE the process default is the digest.
+		// Without an index.mode override the config default is the digest.
 		assert.match(text({ agent }), /\n1-2\. assistant\+toolResult ×2/);
 	} finally {
 		// The override is module state: reset it so later tests see the default.
@@ -1390,7 +1378,7 @@ test("DSH /clm mode switches the index shape live and clears the cached preview"
 	}
 });
 
-// docs/plan.md §3 case 4b / P1-3: the source field is owned by the runtime, so a
+// P1-3: the source field is owned by the runtime, so a
 // model-driven replacement must not be attributed to a human user. Assert the
 // exact planner-derived kind: `notEqual(..., "user")` alone passed when the
 // source was missing entirely, and did not prove provenance reached the event.
@@ -1411,7 +1399,7 @@ test("plan §3.4b (P1-3): DSH cleanup replacements carry the runtime provenance"
 	}
 });
 
-// docs/plan.md §5.4 / case 13: DSH lands an offload as an in-place content
+// Case 13: DSH lands an offload as an in-place content
 // replacement, so the node keeps its address and the surface does not shrink
 // by a node even though its text does.
 test("plan §5.4 (case 13, DSH): offload replaces content instead of omitting the node", () => {

@@ -80,12 +80,17 @@ export function buildDshMirrorRecords(session, options) {
  * ordinal space the cleanup tool accepts, so the model never needs to open the
  * mirror just to discover IDs or identify a block.
  */
-export function renderDshBlockIndex(session, options) {
+export function renderDshBlockIndex(session, options, cleared) {
     const records = buildDshMirrorRecords(session, options);
+    const indexOptions = {
+        ...options.blockIndex,
+        ...(cleared === undefined ? {} : { cleared }),
+        ...(options.autoClear === true ? { autoClear: true } : {}),
+    };
     if (options.indexMode === "digest") {
-        return renderBlockDigest(records, options.blockIndex);
+        return renderBlockDigest(records, indexOptions);
     }
-    return renderBlockIndex(records, options.blockIndex);
+    return renderBlockIndex(records, indexOptions);
 }
 /**
  * Render the block index at most once per `refreshSteps` inside one turn.
@@ -104,19 +109,21 @@ export function renderDshBlockIndex(session, options) {
  * omit newer blocks but cannot point a listed ID at the wrong block.
  * `refreshSteps = 1` reproduces the per-step rendering.
  */
-export function dshBlockIndexText(session, options, state, refreshSteps = 4) {
+export function dshBlockIndexText(session, options, state, refreshSteps = 4, cleared) {
     const epoch = dshBlockIndexEpoch(session);
     const cached = state?.blockIndex;
     const window = Math.max(1, Math.floor(refreshSteps));
+    const clearedCount = cleared?.size ?? 0;
     if (cached
         && cached.turn === epoch.turn
+        && (cached.clearedCount ?? 0) === clearedCount
         && epoch.closedSteps >= cached.closedSteps
         && epoch.closedSteps - cached.closedSteps < window) {
         return cached.text;
     }
-    const text = renderDshBlockIndex(session, options);
+    const text = renderDshBlockIndex(session, options, cleared);
     if (state)
-        state.blockIndex = { turn: epoch.turn, closedSteps: epoch.closedSteps, text };
+        state.blockIndex = { turn: epoch.turn, closedSteps: epoch.closedSteps, clearedCount, text };
     return text;
 }
 /**
@@ -180,7 +187,7 @@ function triggerSignature(options) {
  * Any applied edit clears the cache because removal renumbers the IDs; a
  * compaction is cleared by the host adapter.
  */
-export function dshTriggerView(session, options, state) {
+export function dshTriggerView(session, options, state, cleared) {
     const epoch = dshBlockIndexEpoch(session);
     const signature = triggerSignature(options);
     const cached = state?.trigger;
@@ -194,7 +201,10 @@ export function dshTriggerView(session, options, state) {
         && options.contextWindow > 0
         ? Math.ceil(options.contextWindow)
         : undefined;
-    const usageTokens = hostUsage?.tokens ?? fixedTokens(options) + estimateMirrorTokens(records);
+    const clearedTokens = cleared === undefined
+        ? 0
+        : [...cleared.values()].reduce((sum, mark) => sum + Math.max(0, mark.tokens), 0);
+    const usageTokens = hostUsage?.tokens ?? Math.max(0, fixedTokens(options) + estimateMirrorTokens(records) - clearedTokens);
     const contextWindow = hostUsage?.contextWindow ?? fallbackWindow;
     const usageLine = formatUsageLine({
         tokens: usageTokens,

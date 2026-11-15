@@ -20,6 +20,50 @@ const pluginRoot = path.resolve(
 );
 const entry = path.join(pluginRoot, "dist/dsh/index.js");
 
+// The plugin resolves the host's ignorable-record seam dynamically, because a
+// profile install does not resolve host packages for its plugins. This stand-in
+// is the harness's host: it commits `ignorable: true`, like
+// `@deepseek-ai/dsh-session`'s `appendPluginRecord`, so a record here is the same
+// kind of event the real persistence reader retains and skips.
+const recordSeamModule = path.join(os.tmpdir(), `clm-plugin-record-seam-${process.pid}.mjs`);
+fs.writeFileSync(
+	recordSeamModule,
+	[
+		"export function appendPluginRecord(session, type, data) {",
+		"\tconst seq = session.events.length === 0 ? 0 : session.events.at(-1).seq + 1;",
+		"\tsession.events.push({ type, seq, time: Date.now(), data, ignorable: true });",
+		"\treturn seq;",
+		"}",
+	].join("\n"),
+	"utf8",
+);
+
+// Sessions point at a temporary project directory; config changes are ordinary
+// file writes, the same path a real user edits. No plugin switch is read from the
+// environment. The user-level config root is pinned to a temporary directory so
+// the harness cannot inherit whatever the machine running it has configured.
+process.env.XDG_CONFIG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "clm-harness-user-config-"));
+const harnessCwd = fs.mkdtempSync(path.join(os.tmpdir(), "clm-harness-"));
+let harnessConfig = {
+	host: { pluginRecordModule: pathToFileURL(recordSeamModule).href },
+};
+function writeHarnessConfig() {
+	fs.writeFileSync(path.join(harnessCwd, ".oh-my-clm.json"), JSON.stringify(harnessConfig), "utf8");
+}
+function setHarnessAutoClear(patch) {
+	harnessConfig = { ...harnessConfig, autoClear: { ...(harnessConfig.autoClear ?? {}), ...patch } };
+	writeHarnessConfig();
+}
+function setHarnessHost(patch) {
+	harnessConfig = { ...harnessConfig, host: { ...(harnessConfig.host ?? {}), ...patch } };
+	writeHarnessConfig();
+}
+function setHarnessSection(section, patch) {
+	harnessConfig = { ...harnessConfig, [section]: { ...(harnessConfig[section] ?? {}), ...patch } };
+	writeHarnessConfig();
+}
+writeHarnessConfig();
+
 let pass = 0;
 let fail = 0;
 const failures = [];
@@ -46,15 +90,17 @@ function section(title) {
 // ---------------------------------------------------------------------------
 // Mock Cordis host (only the surfaces the bridge uses).
 // ---------------------------------------------------------------------------
-function createCtx({ sectionOrder } = {}) {
+function createCtx({ sectionOrder, deferInject } = {}) {
 	const handlers = new Map();
 	const ownedDisposers = [];
 	const log = [];
+	const injections = [];
 	const sections = [];
 	const contexts = [];
 	const effects = [];
 	const tools = new Map();
 	const commands = new Map();
+	const projections = [];
 	const ctx = {
 		tools: {
 			register(definition) {
@@ -71,6 +117,18 @@ function createCtx({ sectionOrder } = {}) {
 				ownedDisposers.push(dispose);
 				return dispose;
 			},
+		},
+		sessions: {
+			registerMessageProjection(definition) {
+				projections.push(definition);
+				return () => {};
+			},
+		},
+		inject(deps, callback) {
+			// Real DSH defers until the named services exist; tests choose whether
+			// that happens before or after the first turn boundary.
+			if (deferInject) injections.push({ deps, callback });
+			else callback(ctx);
 		},
 		logger: {
 			info: (message) => log.push({ level: "info", message: String(message) }),
@@ -115,6 +173,10 @@ function createCtx({ sectionOrder } = {}) {
 		effects,
 		tools,
 		commands,
+		projections,
+		runInjections() {
+			for (const { callback } of injections.splice(0)) callback(ctx);
+		},
 		listenerCount: (event) => (handlers.get(event) ?? []).length,
 		emit: async (event, ...args) => {
 			const list = [...(handlers.get(event) ?? [])];
@@ -138,7 +200,7 @@ const SURFACE_EVENT_TYPES = new Set(["system/message", "user/message", "assistan
 class FakeSession {
 	constructor(id, events = []) {
 		this.id = id;
-		this.header = { cwd: "/home/deepseek-agent" };
+		this.header = { cwd: harnessCwd };
 		this.events = events;
 		this.surfaceSeq = events.filter((event) => SURFACE_EVENT_TYPES.has(event.type)).map((event) => event.seq);
 	}
@@ -225,8 +287,8 @@ function editMirror(id, mutate) {
 }
 
 /** Boot the plugin with one agent + one session and return the drive handles. */
-async function boot(plugin, { sessionId, session, order, agentId }) {
-	const host = createCtx({ sectionOrder: order });
+async function boot(plugin, { sessionId, session, order, agentId, deferInject }) {
+	const host = createCtx({ sectionOrder: order, deferInject });
 	plugin.apply(host.ctx);
 	const agentCtx = createCtx();
 	// The bridge keys its state map by session id, so a mismatched agent id is
@@ -279,17 +341,15 @@ section("2. system prompt section");
 		clmStatus.kind === "success" && /^oh-my-clm status \(DSH\)/.test(clmStatus.text) && clmStatus.text.includes("editable blocks: 3"),
 		clmStatus.text,
 	);
-	check("section stays a minimal contract", typeof sectionValue.text === "string" && sectionValue.text.length <= 800 && !/blockIds|skipRoles|CLM_CLEANUP_RESULT|CLM_INDEX_/.test(sectionValue.text), typeof sectionValue.text === "string" ? `${sectionValue.text.length} chars` : "no text");
+	check("section stays a minimal contract", typeof sectionValue.text === "string" && sectionValue.text.length <= 800 && !/blockIds|skipRoles|autoClear\.enabled|cleanup\.resultMode|index\.mode/.test(sectionValue.text), typeof sectionValue.text === "string" ? `${sectionValue.text.length} chars` : "no text");
 	check("runtime block index context registered exactly once", host.contexts.length === 1, `got ${host.contexts.length}`);
 	check("runtime block index context name", host.contexts[0]?.name === "oh-my-clm:block-index", String(host.contexts[0]?.name));
 	check("runtime block index context sorts after host policy", host.contexts[0]?.order === 200, String(host.contexts[0]?.order));
 	// The production default is the turn digest; the per-block listing is the
-	// fallback shape, so render it explicitly instead of depending on the default.
-	const previousIndexMode = process.env.CLM_INDEX_MODE;
-	process.env.CLM_INDEX_MODE = "blocks";
+	// fallback shape, so select it explicitly instead of depending on the default.
+	setHarnessSection("index", { mode: "blocks" });
 	const blockIndex = typeof host.contexts[0]?.text === "function" ? host.contexts[0].text({ agent }) : "";
-	if (previousIndexMode === undefined) delete process.env.CLM_INDEX_MODE;
-	else process.env.CLM_INDEX_MODE = previousIndexMode;
+	setHarnessSection("index", { mode: "digest" });
 	check("block index lists editable 1-based IDs", blockIndex.includes("1. assistant:") && blockIndex.includes("3. assistant:"), blockIndex);
 	check("block index excludes the protected initial task", !blockIndex.includes("PROTECTED INITIAL TASK"), blockIndex);
 	check("runtime context resolves the concrete mirror path", blockIndex.startsWith("Mirror: /tmp/clm-") && blockIndex.includes("LIVE_CTX_MAIN.md"), blockIndex.slice(0, 160));
@@ -393,15 +453,13 @@ section("5b. direct cleanup tool");
 	// `copy` is host-only render state and is stripped before DSH validates the
 	// declared output schema; compact mode is visible through the absent index.
 	check("cleanup result copy is compact by default", rejected?.status === "rejected" && rejected.blockIndex === undefined && !("copy" in rejected), JSON.stringify(rejected));
-	process.env.CLM_CLEANUP_RESULT = "full";
+	setHarnessSection("cleanup", { resultMode: "full" });
 	// The refreshed index in `full` copy must be the per-block listing, which is
 	// the fallback shape; the default digest lists turns instead of blocks.
-	const previousIndexMode = process.env.CLM_INDEX_MODE;
-	process.env.CLM_INDEX_MODE = "blocks";
+	setHarnessSection("index", { mode: "blocks" });
 	const result = await cleanupTool.execute({ blockIds: [3] }, { agent: { session } });
-	if (previousIndexMode === undefined) delete process.env.CLM_INDEX_MODE;
-	else process.env.CLM_INDEX_MODE = previousIndexMode;
-	delete process.env.CLM_CLEANUP_RESULT;
+	setHarnessSection("index", { mode: "digest" });
+	setHarnessSection("cleanup", { resultMode: "compact" });
 	check("cleanup returns an applied canonical result", result?.status === "applied", JSON.stringify(result));
 	check("cleanup removes the selected active-surface block", session.surfaceSeq.join(",") === "0,3,4,8", session.surfaceSeq.join(","));
 	check("cleanup writes the canonical mirror before tool return", !((readIfExists(mirrorPath(session.id)) ?? "").includes("CLM_ENTRY id=3 role=assistant")) && (readIfExists(mirrorPath(session.id)) ?? "").includes("CLM_ENTRY id=1 role=assistant"));
@@ -582,6 +640,247 @@ section("10. disposal");
 	check("tool registration is removed on dispose", host.tools.has("cleanup") === false);
 	cleanup(session.id);
 }
+
+section("11. clearing canary");
+{
+	setHarnessAutoClear({ canary: true });
+	const session = sessionWithHistory("t-canary");
+	const { host } = await boot(plugin, { sessionId: session.id, session });
+	const before = session.events.length;
+	const feed = async (type, data) => {
+		const appended = session.append(type, data);
+		await host.emit("session/event", session, { type, seq: appended.seq, data: appended.data });
+	};
+	const output = "match ".repeat(900);
+	await feed("tool/call", { turn: 1, step: 3, callId: "call_grep_1", name: "grep", arguments: JSON.stringify({ pattern: "needle" }) });
+	await feed("tool/result", { turn: 1, step: 3, message: toolResultMessage("call_grep_1", output) });
+	await feed("tool/call", { turn: 1, step: 4, callId: "call_grep_2", name: "grep", arguments: JSON.stringify({ pattern: "needle" }) });
+	await feed("tool/result", { turn: 1, step: 4, message: toolResultMessage("call_grep_2", output) });
+	await feed("turn/end", { turn: 1 });
+	const canaryFile = path.join("/tmp", `clm-${encodeURIComponent(session.id)}`, "CANARY.jsonl");
+	const lines = (readIfExists(canaryFile) ?? "").trim().split("\n").filter(Boolean);
+	check("canary writes one decision per turn end", lines.length === 1, String(lines.length));
+	let record;
+	try {
+		record = JSON.parse(lines[0] ?? "{}");
+	} catch (error) {
+		record = { parseError: String(error) };
+	}
+	check("canary blames the superseded block", record.candidates?.[0]?.blockId === "call_grep_1", JSON.stringify(record.candidates?.[0] ?? null));
+	check("canary opens the gate for one large dead block", record.gate === true, JSON.stringify(record.gate));
+	check("canary frees the whole block, not just the call output", record.tokens > 900, String(record.tokens));
+	check("canary writes no session event", session.events.length === before + 5, String(session.events.length - before));
+	check("canary leaves the surface untouched", session.surfaceSeq.length === session.events.filter((event) => SURFACE_EVENT_TYPES.has(event.type)).length);
+	host.disposeAll();
+	cleanup(session.id);
+
+	// With autoClear.enabled the same decision becomes a durable record that the
+	// registered projection turns into a model-visible pointer.
+	setHarnessAutoClear({ enabled: true });
+	const clearSession = sessionWithHistory("t-auto-clear");
+	const clearBoot = await boot(plugin, { sessionId: clearSession.id, session: clearSession });
+	const clearFeed = async (type, data) => {
+		const appended = clearSession.append(type, data);
+		await clearBoot.host.emit("session/event", clearSession, { type, seq: appended.seq, data: appended.data });
+		return appended;
+	};
+	const bigOutput = "match ".repeat(900);
+	await clearFeed("tool/call", { turn: 1, step: 3, callId: "call_auto_1", name: "grep", arguments: JSON.stringify({ pattern: "needle" }) });
+	const firstResult = await clearFeed("tool/result", { turn: 1, step: 3, message: toolResultMessage("call_auto_1", bigOutput) });
+	await clearFeed("tool/call", { turn: 1, step: 4, callId: "call_auto_2", name: "grep", arguments: JSON.stringify({ pattern: "needle" }) });
+	await clearFeed("tool/result", { turn: 1, step: 4, message: toolResultMessage("call_auto_2", bigOutput) });
+	await clearFeed("turn/end", { turn: 1 });
+	const clearRecords = clearSession.events.filter((event) => event.type === "plugin:oh-my-clm/clear");
+	check("auto clearing appends one durable record", clearRecords.length === 1, String(clearRecords.length));
+	check(
+		"the record is ignorable, so a reader that does not know it skips instead of refusing the session",
+		clearRecords.every((event) => event.ignorable === true),
+		JSON.stringify(clearRecords.map((event) => event.ignorable ?? null)),
+	);
+	const clearTargets = clearRecords[0]?.data?.targets ?? [];
+	check("the record targets the superseded tool result", clearTargets[0]?.seq === firstResult.seq, JSON.stringify(clearTargets));
+	check("the record carries a pointer label", typeof clearTargets[0]?.label === "string" && clearTargets[0].label.startsWith("grep "), String(clearTargets[0]?.label));
+	check("the record adds no surface node", clearSession.surfaceSeq.includes(clearRecords[0]?.seq) === false);
+	const registered = clearBoot.host.projections.find((definition) => definition.type === "plugin:oh-my-clm/clear");
+	check("the plugin registered the clearing projection", registered !== undefined);
+	let projected;
+	try {
+		projected = registered.project(clearRecords[0], {
+			nodes: clearSession.surfaceSeq,
+			events: clearSession.events,
+			baseSeq: 0,
+			messages: new Map(),
+		});
+	} catch (error) {
+		projected = undefined;
+		console.log(`        ${String(error)}`);
+	}
+	const rewritten = projected?.get(firstResult.seq);
+	const rewrittenText = Array.isArray(rewritten?.content) ? rewritten.content.map((block) => block.text ?? "").join("") : "";
+	check("the projection replaces the body with a re-read pointer", rewrittenText.startsWith("[cleared"), rewrittenText.slice(0, 60));
+	check("the projection keeps the message identity", rewritten?.id === `tcall_auto_1` && rewritten?.toolCallId === "call_auto_1", JSON.stringify({ id: rewritten?.id }));
+	check("the durable event keeps the original body", firstResult.data.message.content[0].text.length === bigOutput.length);
+
+	// Two re-fetches of a cleared target inside the window trip the breaker.
+	for (const step of [5, 6]) {
+		await clearFeed("tool/call", { turn: 1, step, callId: `call_retry_${step}`, name: "grep", arguments: JSON.stringify({ pattern: "needle" }) });
+	}
+	const status = clearBoot.host.commands.get("clm").handler({ agent: clearBoot.agent, rawInput: "status" });
+	check("the breaker stops clearing after a re-read", String(status.text).includes("stopped (breaker)"), String(status.text).split("\n").at(-1));
+	clearBoot.host.disposeAll();
+	setHarnessAutoClear({ enabled: false });
+	cleanup(clearSession.id);
+
+	// Real DSH registers services in dependency order, not plugin order: the
+	// clearing projection must wait for `sessions` and must not clear before it
+	// is there (a record without its projection would clear nothing).
+	setHarnessAutoClear({ enabled: true });
+	const lateSession = sessionWithHistory("t-auto-clear-late");
+	const lateBoot = await boot(plugin, { sessionId: lateSession.id, session: lateSession, deferInject: true });
+	const lateFeed = async (type, data) => {
+		const appended = lateSession.append(type, data);
+		await lateBoot.host.emit("session/event", lateSession, { type, seq: appended.seq, data: appended.data });
+		return appended;
+	};
+	const lateOutput = "match ".repeat(900);
+	await lateFeed("tool/call", { turn: 1, step: 3, callId: "call_late_1", name: "grep", arguments: JSON.stringify({ pattern: "late" }) });
+	await lateFeed("tool/result", { turn: 1, step: 3, message: toolResultMessage("call_late_1", lateOutput) });
+	await lateFeed("tool/call", { turn: 1, step: 4, callId: "call_late_2", name: "grep", arguments: JSON.stringify({ pattern: "late" }) });
+	await lateFeed("tool/result", { turn: 1, step: 4, message: toolResultMessage("call_late_2", lateOutput) });
+	await lateFeed("turn/end", { turn: 1 });
+	const beforeInject = lateSession.events.filter((event) => event.type === "plugin:oh-my-clm/clear").length;
+	check("no clearing record before the projection is registered", beforeInject === 0, String(beforeInject));
+	lateBoot.host.runInjections();
+	check("the plugin waits for the sessions service", lateBoot.host.projections.length === 1, String(lateBoot.host.projections.length));
+	await lateFeed("tool/call", { turn: 2, step: 1, callId: "call_late_3", name: "grep", arguments: JSON.stringify({ pattern: "later" }) });
+	await lateFeed("tool/result", { turn: 2, step: 1, message: toolResultMessage("call_late_3", lateOutput) });
+	await lateFeed("tool/call", { turn: 2, step: 2, callId: "call_late_4", name: "grep", arguments: JSON.stringify({ pattern: "later" }) });
+	await lateFeed("tool/result", { turn: 2, step: 2, message: toolResultMessage("call_late_4", lateOutput) });
+	await lateFeed("turn/end", { turn: 2 });
+	const afterInject = lateSession.events.filter((event) => event.type === "plugin:oh-my-clm/clear").length;
+	check("clearing resumes once the projection is ready", afterInject === 1, String(afterInject));
+	lateBoot.host.disposeAll();
+	setHarnessAutoClear({ enabled: false });
+	cleanup(lateSession.id);
+
+	// A resumed session is seeded from its recorded log, so a block that died
+	// before the plugin loaded is still reported once — at the next turn end.
+	const resumed = new FakeSession("t-canary-resume");
+	resumed.append("tool/call", { turn: 1, step: 1, callId: "call_resume_1", name: "grep", arguments: JSON.stringify({ pattern: "resume" }) });
+	resumed.append("tool/result", { turn: 1, step: 1, message: toolResultMessage("call_resume_1", "hit ".repeat(800)) });
+	resumed.append("tool/call", { turn: 1, step: 2, callId: "call_resume_2", name: "grep", arguments: JSON.stringify({ pattern: "resume" }) });
+	resumed.append("tool/result", { turn: 1, step: 2, message: toolResultMessage("call_resume_2", "hit ".repeat(800)) });
+	const resumedBoot = await boot(plugin, { sessionId: resumed.id, session: resumed });
+	const endEvent = resumed.append("turn/end", { turn: 2 });
+	await resumedBoot.host.emit("session/event", resumed, { type: "turn/end", seq: endEvent.seq, data: endEvent.data });
+	const resumedFile = path.join("/tmp", `clm-${encodeURIComponent(resumed.id)}`, "CANARY.jsonl");
+	const resumedLines = (readIfExists(resumedFile) ?? "").trim().split("\n").filter(Boolean);
+	check("seeded canary reports a pre-load dead block once", resumedLines.length === 1, String(resumedLines.length));
+	const resumedRecord = JSON.parse(resumedLines[0] ?? "{}");
+	check("seeded canary still names the dead block", resumedRecord.candidates?.[0]?.blockId === "call_resume_1", JSON.stringify(resumedRecord.candidates?.[0] ?? null));
+	resumedBoot.host.disposeAll();
+	cleanup(resumed.id);
+
+	// The realistic resume shape: the log already ends with the turn/end that
+	// closed the supersession. Replaying that boundary must not consume the
+	// candidate — the first *live* boundary still has to report it.
+	const closed = new FakeSession("t-canary-resume-closed");
+	closed.append("tool/call", { turn: 1, step: 1, callId: "call_closed_1", name: "grep", arguments: JSON.stringify({ pattern: "closed" }) });
+	closed.append("tool/result", { turn: 1, step: 1, message: toolResultMessage("call_closed_1", "hit ".repeat(800)) });
+	closed.append("tool/call", { turn: 1, step: 2, callId: "call_closed_2", name: "grep", arguments: JSON.stringify({ pattern: "closed" }) });
+	closed.append("tool/result", { turn: 1, step: 2, message: toolResultMessage("call_closed_2", "hit ".repeat(800)) });
+	closed.append("turn/end", { turn: 1 });
+	const closedBoot = await boot(plugin, { sessionId: closed.id, session: closed });
+	const closedEnd = closed.append("turn/end", { turn: 2 });
+	await closedBoot.host.emit("session/event", closed, { type: "turn/end", seq: closedEnd.seq, data: closedEnd.data });
+	const closedFile = path.join("/tmp", `clm-${encodeURIComponent(closed.id)}`, "CANARY.jsonl");
+	const closedLines = (readIfExists(closedFile) ?? "").trim().split("\n").filter(Boolean);
+	check("a recorded turn boundary does not consume the candidate it replayed", closedLines.length === 1, String(closedLines.length));
+	closedBoot.host.disposeAll();
+	cleanup(closed.id);
+	setHarnessAutoClear({ canary: false });
+}
+
+section("12. clearing both sides of a skipped pass");
+{
+	// A dead block below both gate floors must survive the boundary it was
+	// skipped at, so the next boundary can pay for it together with a new one.
+	setHarnessAutoClear({ enabled: true });
+	const session = sessionWithHistory("t-auto-clear-accumulate");
+	const { host } = await boot(plugin, { sessionId: session.id, session });
+	const feed = async (type, data) => {
+		const appended = session.append(type, data);
+		await host.emit("session/event", session, { type, seq: appended.seq, data: appended.data });
+		return appended;
+	};
+	const small = "tiny ".repeat(80);
+	const records = () => session.events.filter((event) => event.type === "plugin:oh-my-clm/clear");
+	await feed("tool/call", { turn: 1, step: 3, callId: "call_acc_1", name: "grep", arguments: JSON.stringify({ pattern: "alpha" }) });
+	await feed("tool/result", { turn: 1, step: 3, message: toolResultMessage("call_acc_1", small) });
+	await feed("tool/call", { turn: 1, step: 4, callId: "call_acc_2", name: "grep", arguments: JSON.stringify({ pattern: "alpha" }) });
+	await feed("tool/result", { turn: 1, step: 4, message: toolResultMessage("call_acc_2", small) });
+	await feed("turn/end", { turn: 1 });
+	check("a batch under both floors clears nothing", records().length === 0, String(records().length));
+	await feed("tool/call", { turn: 2, step: 1, callId: "call_acc_3", name: "grep", arguments: JSON.stringify({ pattern: "beta" }) });
+	await feed("tool/result", { turn: 2, step: 1, message: toolResultMessage("call_acc_3", small) });
+	await feed("tool/call", { turn: 2, step: 2, callId: "call_acc_4", name: "grep", arguments: JSON.stringify({ pattern: "beta" }) });
+	await feed("tool/result", { turn: 2, step: 2, message: toolResultMessage("call_acc_4", small) });
+	await feed("turn/end", { turn: 2 });
+	const accumulated = records().at(-1)?.data?.targets ?? [];
+	check("the skipped candidate comes back with the next boundary", accumulated.length === 2, JSON.stringify(accumulated));
+	check("the accumulated batch names both blocks", new Set(accumulated.map((target) => target.label)).size === 2, JSON.stringify(accumulated.map((target) => target.label)));
+	// Compaction can remove a cleared node, and a projection that refused to load
+	// the session over a pointer nobody can read would cost the whole transcript.
+	const projection = host.projections[0];
+	const record = records().at(-1);
+	const projectWith = (nodes) => {
+		try {
+			return projection.project(record, { nodes, events: session.events, baseSeq: 0, messages: new Map() });
+		} catch (error) {
+			console.log(`        ${String(error)}`);
+			return undefined;
+		}
+	};
+	const partlyStale = projectWith(session.surfaceSeq.filter((seq) => seq !== accumulated[0]?.seq));
+	check("a stale target does not stop its live sibling", partlyStale?.size === 1, String(partlyStale?.size));
+	const fullyStale = projectWith([]);
+	check("a record whose targets are all gone is skipped, not fatal", fullyStale?.size === 0, String(fullyStale?.size));
+	host.disposeAll();
+	setHarnessAutoClear({ enabled: false });
+	cleanup(session.id);
+}
+
+section("13. a host without the ignorable-record seam");
+{
+	// No seam means no durable record, so clearing must stay off rather than
+	// write an event this host's own persistence reader would refuse.
+	setHarnessHost({ pluginRecordModule: "@deepseek-ai/does-not-exist" });
+	setHarnessAutoClear({ enabled: true });
+	const seamless = await import(`${pathToFileURL(entry).href}?no-record-seam`);
+	const session = sessionWithHistory("t-auto-clear-no-seam");
+	const { host, agent } = await boot(seamless, { sessionId: session.id, session });
+	const feed = async (type, data) => {
+		const appended = session.append(type, data);
+		await host.emit("session/event", session, { type, seq: appended.seq, data: appended.data });
+	};
+	const output = "match ".repeat(900);
+	await feed("tool/call", { turn: 1, step: 3, callId: "call_seam_1", name: "grep", arguments: JSON.stringify({ pattern: "seam" }) });
+	await feed("tool/result", { turn: 1, step: 3, message: toolResultMessage("call_seam_1", output) });
+	await feed("tool/call", { turn: 1, step: 4, callId: "call_seam_2", name: "grep", arguments: JSON.stringify({ pattern: "seam" }) });
+	await feed("tool/result", { turn: 1, step: 4, message: toolResultMessage("call_seam_2", output) });
+	await feed("turn/end", { turn: 1 });
+	check("no session event is written without the seam", session.events.filter((event) => event.type === "plugin:oh-my-clm/clear").length === 0);
+	const status = String(host.commands.get("clm").handler({ agent, rawInput: "status" }).text);
+	check("the status line says the seam is missing", status.includes("no ignorable plugin-record seam"), status.split("\n").at(-1));
+	check("clearing is reported as stopped, not silently idle", status.includes("stopped (unrecordable)"), status.split("\n").at(-1));
+	check("the missing seam is warned about once at load", host.log.some((entry) => entry.level === "warn" && entry.message.includes("no appendPluginRecord seam")), JSON.stringify(host.log.filter((entry) => entry.level === "warn").map((entry) => entry.message)));
+	host.disposeAll();
+	setHarnessHost({ pluginRecordModule: pathToFileURL(recordSeamModule).href });
+	setHarnessAutoClear({ enabled: false });
+	cleanup(session.id);
+}
+
+fs.rmSync(harnessCwd, { recursive: true, force: true });
 
 console.log(`\n${pass} passed, ${fail} failed, ${observations.length} observation(s)`);
 if (observations.length > 0) {

@@ -8,7 +8,7 @@
  * DSH appends a new snapshot whenever the rendered text changes and never
  * removes older ones, so the snapshot count and byte total are the real cost
  * of the index design. This script reports that cost, the step gap between
- * snapshots (a working `CLM_INDEX_REFRESH_STEPS=4` throttle shows gaps of 4),
+ * snapshots (a working `index.refreshSteps: 4` throttle shows gaps of 4),
  * and the shape of every real `cleanup` call.
  *
  * Usage:

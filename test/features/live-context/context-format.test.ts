@@ -737,7 +737,7 @@ test("an unescaped marker quoted in a body stays inside that body", () => {
 });
 
 // ---------------------------------------------------------------------------
-// docs/plan.md §3 regression cases. These assert the DESIRED behavior: they
+// Regression cases. These assert the DESIRED behavior: they
 // were intentionally red on the 0.1.12 review baseline and are the acceptance
 // criteria for the rectification (now green). Keep them strict; do not weaken
 // them back into descriptions of whatever the code currently does.
@@ -811,7 +811,7 @@ test("plan §3.3 (P1-2): a language swap that grows real tokens is rejected unde
 	assert.equal(plan.status, "rejected", "a shrink-only gate must not be bypassed by switching scripts");
 });
 
-// docs/plan.md §5.1 实施记录 / P1-2: "进入 5.2 前须先补 P1-2 的宿主 usage
+// P1-2 实施记录: "进入 5.2 前须先补 P1-2 的宿主 usage
 // 校准"，否则 5.2 的触发与计价不成立。当前 shrink 门只看 3.5 chars/token
 // 估算 (context-format.ts:922)；ctx.getContextUsage() 的精确 tokens 仅出现在
 // status 文本里 (extensions/clm.ts:189)，从未进入编辑规划层。以下断言描述
@@ -1045,4 +1045,29 @@ test("P1-1 follow-up: truncated and self-referential previews are still rejected
 	const selfPlan = planContextEdits(selfReference, parseMirror(selfEdit), { allowGrowth: false });
 	assert.equal(selfPlan.status, "rejected", "an elided preview must stay non-rewritable");
 	assert.match(selfPlan.reason ?? "", /truncated or elided/);
+});
+
+test("a cleared block is marked in the index and its body is not shown", () => {
+	const cleared = new Map([["tool-1", { label: "read /src/x.ts:120-260", tokens: 3_400 }]]);
+	const index = renderBlockIndex(records, { cleared, autoClear: true });
+	assert.match(index, /\[cleared 3\.4k tok · read \/src\/x\.ts:120-260\]/);
+	assert.doesNotMatch(index, /A very large command output/);
+	assert.match(index, /\[cleared\] blocks hold a re-read pointer/);
+});
+
+test("a cleared block is subtracted from the digest's turn cost", () => {
+	const digestRecords: MirrorRecord[] = [
+		{ id: "u1", role: "user", text: "first", protected: false, toolCallIds: [] },
+		{ id: "t1", role: "toolResult", text: "x".repeat(700), protected: false, toolCallIds: [] },
+		{ id: "u2", role: "user", text: "second", protected: false, toolCallIds: [] },
+	];
+	const full = renderBlockDigest(digestRecords);
+	const cleared = renderBlockDigest(digestRecords, {
+		cleared: new Map([["t1", { label: "read /a.ts", tokens: estimateMirrorTokens(digestRecords.slice(1, 2)) }]]),
+		autoClear: true,
+	});
+	assert.match(full, /turn ×2 \(/);
+	assert.match(cleared, /1 cleared/);
+	assert.match(cleared, /\[cleared\] blocks hold a re-read pointer/);
+	assert.notEqual(cleared, full);
 });

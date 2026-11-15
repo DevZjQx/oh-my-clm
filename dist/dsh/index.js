@@ -1,8 +1,13 @@
 import * as fs from "node:fs";
-import { CLM_MIRROR_FILENAME, CLM_TEMP_ROOT, sessionMirrorPath, } from "../src/lib/clm-paths.js";
-import { writePrivateText } from "../src/lib/clm-files.js";
+import { CLM_MIRROR_FILENAME, CLM_TEMP_ROOT, sessionCanaryPath, sessionMirrorPath, } from "../src/lib/clm-paths.js";
+import { loadClmConfig } from "../src/lib/clm-config.js";
+import { appendPrivateLine, writePrivateText } from "../src/lib/clm-files.js";
+import { REFETCH_TOOL_NAMES, SupersessionTracker, batchPassesGate, fitBatch, parseToolArguments, targetKeyOf, } from "../src/features/live-context/auto-clear.js";
+import { CLEAR_EVENT_TYPE, CLEAR_VERSION, CLEAR_LABEL_MAX_CHARS, clearProjection, } from "../src/features/live-context/clear-projection.js";
+import { dshPromptText } from "../src/features/live-context/context-prompt.js";
+import { resolvePluginRecordWriter, } from "../src/features/live-context/plugin-record.js";
 import { buildDshMirrorRecords, dshBlockIndexText, dshOpenTurnStep, dshTriggerView, executeDshCleanup, reconcileDshMirror, } from "../src/features/live-context/dsh-bridge.js";
-import { DEFAULT_BLOCK_INDEX_HEAD, DEFAULT_BLOCK_INDEX_PREVIEW_CHARS, DEFAULT_BLOCK_INDEX_TAIL, DEFAULT_DIGEST_MAX_LINES, estimateMirrorTokens, hostUsageOf, renderMirror, } from "../src/features/live-context/context-format.js";
+import { estimateMirrorTokens, estimateTokens, hostUsageOf, renderMirror, } from "../src/features/live-context/context-format.js";
 import { formatCleanupToolResult, parseCleanupArgs, parseCleanupResultCopy, } from "../src/features/live-context/context-cleanup.js";
 export const name = "oh-my-clm";
 const PROMPT_SECTION = "oh-my-clm:live-context";
@@ -10,34 +15,374 @@ const BLOCK_INDEX_CONTEXT = "oh-my-clm:block-index";
 const DEFAULT_ORDER = 3240;
 /** Runtime context sorts after the host's sandbox/approval facts. */
 const BLOCK_INDEX_ORDER = 200;
-function positiveEnv(name, fallback) {
-    const value = Number.parseInt(process.env[name] ?? "", 10);
-    return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-/** Thresholds use `0` as "disabled", so the positive-only parser cannot be reused. */
-function nonNegativeEnv(name, fallback) {
-    const value = Number.parseInt(process.env[name] ?? "", 10);
-    return Number.isFinite(value) && value >= 0 ? value : fallback;
+function sessionConfig(session) {
+    const cwd = typeof session.header?.cwd === "string" ? session.header.cwd : process.cwd();
+    return loadClmConfig(cwd).config;
 }
 /**
- * Cleanup trigger switches (docs/plan.md §5.2). Every threshold defaults to 0
+ * Cleanup trigger switches. Every threshold defaults to 0
  * because none of them is calibrated on a real DeepSeek-V4.1-Flash session yet;
  * the mechanism ships disabled, and enabling it is a deliberate, documented act.
- * `CLM_TRIGGER_TOOL_RATIO` is a percentage (60 = 60% of editable tokens).
  */
-function triggerOptions() {
+function triggerOptions(config) {
+    const trigger = config.cleanup.trigger;
     return {
-        usagePercent: nonNegativeEnv("CLM_TRIGGER_PCT", 0),
-        completedTurns: nonNegativeEnv("CLM_TRIGGER_TURNS", 0),
-        toolResultShare: Math.min(100, nonNegativeEnv("CLM_TRIGGER_TOOL_RATIO", 0)) / 100,
-        turnsSinceCleanup: nonNegativeEnv("CLM_TRIGGER_SINCE", 0),
-        maxCandidates: positiveEnv("CLM_TRIGGER_CANDIDATES", 3),
-        minSavingsTokens: nonNegativeEnv("CLM_TRIGGER_MIN_TOKENS", 0),
-        // `r` in `r·L + (1−r)·B`, as a percentage (10 = cached reads cost 1/10).
-        // Per-endpoint, so it is an env value, not a hardcoded constant.
-        cacheDiscount: Math.min(100, nonNegativeEnv("CLM_CACHE_DISCOUNT", 2)) / 100,
-        paybackTurns: positiveEnv("CLM_CACHE_PAYBACK_TURNS", 10),
+        usagePercent: trigger.usagePercent,
+        completedTurns: trigger.completedTurns,
+        toolResultShare: trigger.toolResultSharePercent / 100,
+        turnsSinceCleanup: trigger.turnsSinceCleanup,
+        maxCandidates: trigger.maxCandidates,
+        minSavingsTokens: trigger.minSavingsTokens,
+        // `r` in `r·L + (1−r)·B` as a fraction. Per-endpoint, so it is a config
+        // value rather than a hardcoded constant.
+        cacheDiscount: config.cleanup.cacheDiscountPercent / 100,
+        paybackTurns: config.cleanup.paybackTurns,
     };
+}
+/** Tool results a cleared target may come back within and still count as a miss. */
+const BREAKER_WINDOW_RESULTS = 3;
+/** `autoClear.canary` arms the clearing canary. Off by default. */
+function canaryEnabled(config) {
+    return config.autoClear.canary;
+}
+/** Both floors are calibrated against real sessions; the config file owns them. */
+function canaryGate(config) {
+    return {
+        minTokens: config.autoClear.minTokens,
+        minBlocks: config.autoClear.minBlocks,
+    };
+}
+/**
+ * `autoClear.enabled` arms clearing itself. Off by default: the selector is
+ * calibrated, but the breaker thresholds are not, and a clear is the first thing
+ * this plugin does that changes what the model reads.
+ */
+function autoClearEnabled(config) {
+    return config.autoClear.enabled;
+}
+/** Occupancy at which clearing hands the session back to host compaction. */
+function autoClearStopPercent(config) {
+    return config.autoClear.stopPercent;
+}
+/** Total tokens one session may clear before the budget stops it. */
+function autoClearBudget(config) {
+    return config.autoClear.maxTokens;
+}
+function canaryValue(value, name) {
+    if (typeof value !== "object" || value === null)
+        return undefined;
+    return value[name];
+}
+function canaryString(value, name) {
+    const field = canaryValue(value, name);
+    return typeof field === "string" && field.length > 0 ? field : undefined;
+}
+function canaryText(value) {
+    if (Array.isArray(value))
+        return value.map(canaryText).join("");
+    if (typeof value !== "object" || value === null)
+        return "";
+    const text = value.text;
+    return typeof text === "string" ? text : "";
+}
+function isRefetchTool(name) {
+    return REFETCH_TOOL_NAMES.includes(name);
+}
+/**
+ * Follow one session's tool traffic for the clearing canary.
+ *
+ * This writes no session event and changes nothing the model sees: at each turn
+ * boundary it appends the blocks a clearing pass *would* have freed, with the
+ * facts needed to judge the decision (size, call age, gate outcome). The log
+ * lives beside the mirror in the session's private temporary directory.
+ */
+function feedCanary(ctx, session, event, state) {
+    const seq = event.seq;
+    if (typeof seq !== "number")
+        return;
+    const data = event.data;
+    if (event.type === "tool/call") {
+        const callId = canaryString(data, "callId");
+        const name = canaryString(data, "name");
+        if (callId === undefined || name === undefined || !isRefetchTool(name))
+            return;
+        state.callSeqs.set(callId, seq);
+        const args = parseToolArguments(canaryValue(data, "arguments"));
+        noteRefetch(ctx, state, name, args);
+        state.tracker.noteCall({ name, args, blockId: callId, seq, blockAge: state.tracker.resultsSeen });
+        return;
+    }
+    if (event.type === "tool/ptc-dispatch") {
+        // One program call runs several tools; the model-visible block is the root
+        // call's result, so every sub-call is attributed to it.
+        const rootCallId = canaryString(data, "rootCallId");
+        const name = canaryString(data, "name");
+        if (rootCallId === undefined || name === undefined || !isRefetchTool(name))
+            return;
+        const args = canaryValue(data, "arguments");
+        noteRefetch(ctx, state, name, args);
+        state.tracker.noteCall({ name, args, blockId: rootCallId, seq, blockAge: state.tracker.resultsSeen });
+        state.tracker.noteOutput(seq, estimateTokens([canaryText(canaryValue(data, "content"))]));
+        return;
+    }
+    if (event.type === "tool/result") {
+        const message = canaryValue(data, "message");
+        const callId = canaryString(message, "toolCallId");
+        if (callId === undefined)
+            return;
+        const tokens = estimateTokens([canaryText(canaryValue(message, "content"))]);
+        state.tracker.noteBlockLanding();
+        state.tracker.noteBlockTokens(callId, tokens, seq);
+        const callSeq = state.callSeqs.get(callId);
+        if (callSeq !== undefined) {
+            state.callSeqs.delete(callId);
+            state.tracker.noteOutput(callSeq, tokens);
+        }
+        return;
+    }
+    if (event.type !== "turn/end")
+        return;
+    // A boundary is the only place a pass runs, and `peekBatch` is read-only: a
+    // pass the gate, the occupancy floor, or a missing projection skips leaves
+    // its candidates for the next boundary instead of consuming them.
+    const batch = state.tracker.peekBatch();
+    if (batch.candidates.length === 0)
+        return;
+    const gate = batchPassesGate(batch, state.gate);
+    if (canaryEnabled(state.config))
+        writeCanaryRecord(ctx, session, canaryValue(data, "turn"), batch, gate, state.reported);
+    if (!autoClearEnabled(state.config))
+        return;
+    if (admitClear(session, state, gate) !== undefined)
+        return;
+    // The budget is a cumulative cap, not a whole-batch veto: a 73k batch
+    // against a 40k cap used to latch `stopped (budget)` before clearing
+    // anything. Slice instead, oldest-first; the first pass may overshoot by
+    // one candidate when the only dead block is larger than the cap.
+    const remaining = autoClearBudget(state.config) - state.auto.clearedTokens;
+    if (remaining <= 0) {
+        state.auto.stop = "budget";
+        return;
+    }
+    const fitted = fitBatch(batch, remaining, state.auto.clearedTokens === 0);
+    if (fitted === undefined) {
+        state.auto.stop = "budget";
+        return;
+    }
+    applyClear(ctx, session, state, fitted);
+}
+/** Append one canary line per newly dead block; a failed write must not disturb the session. */
+function writeCanaryRecord(ctx, session, turn, batch, gate, reported) {
+    // A skipped pass re-offers the same candidates at the next boundary. The
+    // ledger keeps one line per block, so repeated skipping cannot bury the
+    // session's decisions under duplicates.
+    const fresh = batch.candidates.filter((candidate) => !reported.has(candidate.blockId));
+    if (fresh.length === 0)
+        return;
+    const record = {
+        at: Date.now(),
+        turn: turn ?? null,
+        tokens: fresh.reduce((total, candidate) => total + candidate.tokens, 0),
+        candidates: fresh,
+        gate,
+    };
+    try {
+        appendPrivateLine(sessionCanaryPath(session.id), JSON.stringify(record));
+        for (const candidate of fresh)
+            reported.add(candidate.blockId);
+    }
+    catch (error) {
+        ctx.logger?.warn?.(`oh-my-clm: canary log write failed: ${String(error)}`);
+    }
+}
+/**
+ * Why this pass must not run, or `undefined` to run it.
+ *
+ * The limits answer different failures: the breaker answers a selector that
+ * cleared something live, the budget answers unbounded churn, the missing
+ * record seam answers a host that cannot store the decision safely, and the
+ * occupancy stop hands the tail of the job to host compaction instead of
+ * fighting it. The breaker, the budget and the seam latch; occupancy and
+ * projection readiness are re-measured every pass.
+ */
+function admitClear(session, state, gate) {
+    if (state.auto.stop !== undefined)
+        return state.auto.stop;
+    if (state.writer.state === "missing")
+        return "unrecordable";
+    // `pending` is not fatal: the writer is resolved from this session's config
+    // after the canary seeds its history, so the first boundary skips the pass.
+    if (state.writer.state === "pending")
+        return "unavailable";
+    // Not latched: the projection is registered once `sessions` is available, so a
+    // pass that runs before that is skipped, not fatal.
+    if (!state.projection.ready)
+        return "unavailable";
+    if (!gate)
+        return "gate";
+    const usage = hostUsageFor(session, state.config);
+    if (usage !== undefined && (usage.tokens / usage.contextWindow) * 100 >= autoClearStopPercent(state.config)) {
+        return "occupancy";
+    }
+    return undefined;
+}
+/** Append the durable decision that the registered projection interprets. */
+function applyClear(ctx, session, state, batch) {
+    if (state.writer.state !== "ready")
+        return;
+    const targets = [];
+    const retired = [];
+    let tokens = 0;
+    for (const candidate of batch.candidates) {
+        if (!Number.isSafeInteger(candidate.seq) || candidate.seq < 0)
+            continue;
+        if (candidate.label.length === 0 || candidate.label.length > CLEAR_LABEL_MAX_CHARS)
+            continue;
+        const size = Math.max(0, Math.round(candidate.tokens));
+        targets.push({ seq: candidate.seq, label: candidate.label, tokens: size });
+        retired.push(candidate.blockId);
+        tokens += size;
+    }
+    if (targets.length === 0)
+        return;
+    try {
+        // An ignorable plugin record: no surfaceOp, so it adds no model-visible
+        // node, and a reader that does not know the type skips it.
+        state.writer.write(session, CLEAR_EVENT_TYPE, { v: CLEAR_VERSION, targets });
+    }
+    catch (error) {
+        ctx.logger?.warn?.(`oh-my-clm: clearing record rejected: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+    }
+    // Only a committed decision retires a block; a rejected append leaves the
+    // candidates available for the next boundary.
+    state.tracker.retire(retired);
+    state.auto.passes += 1;
+    state.auto.clearedTokens += tokens;
+    state.auto.clearedTotal += retired.length;
+    const now = state.tracker.resultsSeen;
+    for (const candidate of batch.candidates) {
+        for (const key of candidate.keys)
+            state.auto.recent.push({ key, at: now });
+    }
+    pruneRecent(state);
+    ctx.logger?.info?.(`oh-my-clm: cleared ${targets.length} block(s) (~${tokens} tokens); the model now reads a re-read pointer`);
+}
+/** Drop breaker evidence older than its window so the list cannot grow with the session. */
+function pruneRecent(state) {
+    const now = state.tracker.resultsSeen;
+    state.auto.recent = state.auto.recent.filter((entry) => now - entry.at <= BREAKER_WINDOW_RESULTS);
+}
+/**
+ * Count a cleared target the model asked for again, and trip the breaker.
+ *
+ * A re-read is *not* by itself a mistake: the placeholder invites one, and a
+ * file that changed after the clear legitimately needs re-reading. What the
+ * breaker watches is the rate — when most cleared targets come straight back,
+ * clearing is manufacturing tool calls instead of removing dead weight, and the
+ * session stops clearing.
+ */
+function noteRefetch(ctx, state, name, args) {
+    if (state.auto.stop !== undefined)
+        return;
+    pruneRecent(state);
+    if (state.auto.recent.length === 0)
+        return;
+    const key = targetKeyOf(name, args);
+    if (key === undefined)
+        return;
+    for (const cleared of state.auto.recent) {
+        if (cleared.key !== key)
+            continue;
+        state.auto.misselects += 1;
+        const total = Math.max(state.auto.clearedTotal, 1);
+        if (state.auto.misselects < 2 || state.auto.misselects * 2 < total)
+            continue;
+        state.auto.stop = "breaker";
+        ctx.logger?.warn?.(`oh-my-clm: clearing stopped for this session: ${state.auto.misselects} of ${total} cleared target(s) were re-read within ${BREAKER_WINDOW_RESULTS} tool results`);
+        return;
+    }
+}
+/**
+ * Register the clearing projection, waiting for the `sessions` service.
+ *
+ * Without this projection a clearing record would be inert: the model would keep
+ * reading the full body while the ledger claimed a clear. So the flag stays
+ * false until registration actually succeeded, and clearing stays disabled.
+ */
+function installClearProjection(ctx, state) {
+    const install = (target) => {
+        const sessions = optionalService(target, "sessions");
+        if (typeof sessions?.registerMessageProjection !== "function")
+            return;
+        try {
+            sessions.registerMessageProjection(clearProjection);
+            state.ready = true;
+        }
+        catch (error) {
+            ctx.logger?.warn?.(`oh-my-clm: clearing projection unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    };
+    if (typeof ctx.inject === "function") {
+        ctx.inject(["sessions"], (injected) => install(injected));
+        return;
+    }
+    install(ctx);
+}
+/**
+ * Build a canary that already knows the session's history.
+ *
+ * A resumed session reaches the plugin with its log intact, so the selector is
+ * fed the recorded tool traffic first and the recorded decisions retire the
+ * blocks a previous run already cleared. A recorded turn boundary is skipped on
+ * purpose: replaying it would consume candidates the first live boundary has to
+ * report, and a boundary that already happened decided nothing in this run.
+ */
+function seedCanary(ctx, session, projection, config) {
+    const state = {
+        config,
+        tracker: new SupersessionTracker(),
+        callSeqs: new Map(),
+        gate: canaryGate(config),
+        projection,
+        reported: new Set(),
+        auto: { recent: [], clearedTotal: 0, clearedTokens: 0, passes: 0, misselects: 0 },
+        writer: { state: "pending" },
+    };
+    const history = session.snapshotEvents?.() ?? [];
+    for (const event of history) {
+        const seeded = event;
+        if (seeded.type === "turn/end")
+            continue;
+        if (seeded.type === CLEAR_EVENT_TYPE) {
+            seedCleared(state, seeded.data);
+            continue;
+        }
+        feedCanary(ctx, session, seeded, state);
+    }
+    return state;
+}
+/**
+ * Replay one recorded decision: retire its targets and carry its cost forward.
+ *
+ * Without this a resumed session would clear the same block twice (the record is
+ * log-only, so the original body is still there) and forget the tokens it had
+ * already spent against the session budget.
+ */
+function seedCleared(state, data) {
+    const targets = canaryValue(data, "targets");
+    if (!Array.isArray(targets))
+        return;
+    for (const target of targets) {
+        const seq = canaryValue(target, "seq");
+        if (typeof seq !== "number")
+            continue;
+        state.tracker.retireBySeq(seq);
+        state.auto.clearedTotal += 1;
+        const tokens = canaryValue(target, "tokens");
+        if (typeof tokens === "number" && Number.isFinite(tokens))
+            state.auto.clearedTokens += Math.max(0, tokens);
+    }
 }
 function readText(filePath) {
     try {
@@ -49,20 +394,20 @@ function readText(filePath) {
 }
 const fileSystem = { readText, writeText: writePrivateText };
 /**
- * Live mode override set by `/clm mode`. The DSH process reads its environment
- * once at launch, so an environment-only switch cannot be A/B tested inside a
- * running session; this field keeps that experiment possible without a restart.
+ * Live mode override set by `/clm mode`. The config file can change between
+ * requests, but a live override must still A/B-test the index shape without a
+ * restart; this field keeps that experiment possible.
  */
 const indexModeOverride = {};
 /**
  * `digest` lists one line per closed turn and is the default; `blocks` lists
- * individual blocks. `CLM_INDEX_MODE` selects the process default, and
- * `/clm mode` selects it for the lifetime of the running process.
+ * individual blocks. `index.mode` in the config file selects the process
+ * default, and `/clm mode` selects it for the lifetime of the running process.
  */
-function indexMode() {
+function indexMode(config) {
     if (indexModeOverride.value)
         return indexModeOverride.value;
-    return process.env.CLM_INDEX_MODE === "blocks" ? "blocks" : "digest";
+    return config.index.mode;
 }
 /**
  * The model-visible contract for the live-context index.
@@ -82,28 +427,23 @@ function indexMode() {
  * - the mirror file format, edit validation, refresh cadence, host-vs-sandbox
  *   `/tmp` differences, and session event ordering: the model has no action for
  *   any of them;
- * - environment variables or operational switches.
+ * - config keys or operational switches.
  *
  * `test/features/live-context/dsh-bridge.test.ts` caps the rendered length, so
  * growth fails the suite instead of silently taxing every request.
  */
 function promptText() {
     const mirrorTemplate = `${CLM_TEMP_ROOT}/clm-<session-id>/${CLM_MIRROR_FILENAME}`;
-    return `<oh-my-clm-dsh-live-context>
-\`<oh-my-clm-block-index>\` lists compacted-away history as 1-based IDs; a turn's range is inclusive.
-Prefer \`cleanup\` to free window: whole-turn ranges (e.g. \`["3-16"]\`) remove in one call, and \`cleanup({ list: "A-B" })\` inspects a range without removing anything.
-To compress instead, edit the session mirror at \`${mirrorTemplate}\` (the exact path is above the block index): shorten the block body, and keep the protocol header, the \`CLM_SNAPSHOT\` line, IDs, roles, and markers unchanged. Rewriting a tool-call block also omits its tool result: put the fact in that body.
-Block 1 and the initial task are protected. At a subtask boundary, use one \`cleanup\` to drop settled tool noise, then continue.
-</oh-my-clm-dsh-live-context>`;
+    return dshPromptText({ mirrorTemplate });
 }
 /**
  * Copy mode for the model-visible cleanup result. The bridge stamps it into its
  * transient result, but the tool strips that host-only field before DSH
- * validates the output; the renderer parses the same environment switch
+ * validates the output; the renderer parses the same config value
  * independently, so both sides stay in sync.
  */
-function cleanupResultCopy() {
-    return parseCleanupResultCopy(process.env.CLM_CLEANUP_RESULT);
+function cleanupResultCopy(config) {
+    return parseCleanupResultCopy(config.cleanup.resultMode);
 }
 /** Process-scoped host Context, like indexModeOverride; set by apply(). */
 let activeContext;
@@ -154,7 +494,7 @@ const nonNegativeCount = (value) => typeof value === "number" && Number.isFinite
  * No sample yet (or no window) returns undefined, so callers label the
  * estimate `~` instead of passing a cumulative total off as exact.
  */
-function hostUsageFor(session) {
+function hostUsageFor(session, config) {
     const projections = optionalService(activeContext, "sessionProjections");
     if (typeof projections?.snapshot !== "function")
         return undefined;
@@ -179,7 +519,7 @@ function hostUsageFor(session) {
         return undefined;
     const stats = record.sessionStats;
     const windowCandidate = pressure.contextWindow ?? stats?.contextWindow;
-    const configuredWindow = positiveEnv("CLM_CONTEXT_WINDOW", 0);
+    const configuredWindow = config.context.windowTokens;
     const contextWindow = typeof windowCandidate === "number" && windowCandidate > 0
         ? windowCandidate
         : (configuredWindow > 0 ? configuredWindow : undefined);
@@ -190,25 +530,26 @@ function hostUsageFor(session) {
 function optionsFor(session) {
     const sessionId = String(session.id);
     const mirrorPath = sessionMirrorPath(sessionId);
-    const configuredWindow = positiveEnv("CLM_CONTEXT_WINDOW", 0);
+    const config = sessionConfig(session);
+    const configuredWindow = config.context.windowTokens;
     return {
         mirrorPath,
         mirrorDisplayPath: mirrorPath,
-        maxBlockChars: positiveEnv("CLM_MAX_BLOCK_CHARS", 12_000),
-        maxMirrorChars: positiveEnv("CLM_MAX_MIRROR_CHARS", 96_000),
-        fixedTokens: positiveEnv("CLM_CONTEXT_FIXED_TOKENS", 0),
-        hostUsage: hostUsageFor(session),
+        maxBlockChars: config.context.maxBlockChars,
+        maxMirrorChars: config.context.maxMirrorChars,
+        fixedTokens: config.context.fixedTokens,
+        hostUsage: hostUsageFor(session, config),
         ...(configuredWindow > 0 ? { contextWindow: configuredWindow } : {}),
-        trigger: triggerOptions(),
-        cleanupResult: cleanupResultCopy(),
-        indexMode: indexMode(),
+        trigger: triggerOptions(config),
+        cleanupResult: cleanupResultCopy(config),
+        indexMode: indexMode(config),
+        autoClear: autoClearEnabled(config),
+        refreshSteps: config.index.refreshSteps,
         blockIndex: {
-            maxPreviewChars: positiveEnv("CLM_INDEX_PREVIEW", DEFAULT_BLOCK_INDEX_PREVIEW_CHARS),
-            headBlocks: positiveEnv("CLM_INDEX_HEAD", DEFAULT_BLOCK_INDEX_HEAD),
-            // `CLM_INDEX_MIDDLE` is the pre-rename knob; it is honoured as a
-            // fallback so an existing profile keeps its override.
-            tailBlocks: positiveEnv("CLM_INDEX_TAIL", positiveEnv("CLM_INDEX_MIDDLE", DEFAULT_BLOCK_INDEX_TAIL)),
-            maxLines: positiveEnv("CLM_INDEX_LINES", DEFAULT_DIGEST_MAX_LINES),
+            maxPreviewChars: config.index.previewChars,
+            headBlocks: config.index.headBlocks,
+            tailBlocks: config.index.tailBlocks,
+            maxLines: config.index.maxLines,
         },
     };
 }
@@ -224,6 +565,44 @@ function withCleanupCandidates(index, candidateText) {
     if (at < 0)
         return `${index}\n${candidateText}`;
     return `${index.slice(0, at)}${candidateText}\n${index.slice(at)}`;
+}
+function isRecord(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+/**
+ * Fold the clearing records in a session log into the marks the index shows.
+ *
+ * The projection already hides the body from the model; the index must agree
+ * with it, or the model sees a preview for content it can no longer read. The
+ * map is keyed by the same `dsh:<seq>` id `buildMirrorRecords` assigns.
+ */
+function clearedMarksOf(session) {
+    const marks = new Map();
+    // Optional call on purpose: a host built without the log view exposes no
+    // `snapshotEvents`, and the index must then simply show original bodies rather
+    // than fail and blank the whole block index.
+    for (const event of session.snapshotEvents?.() ?? []) {
+        if (event.type !== CLEAR_EVENT_TYPE)
+            continue;
+        const data = event.data;
+        if (!isRecord(data) || !Array.isArray(data.targets))
+            continue;
+        for (const target of data.targets) {
+            if (!isRecord(target))
+                continue;
+            const seq = target.seq;
+            const label = target.label;
+            const tokens = target.tokens;
+            if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0)
+                continue;
+            if (typeof label !== "string" || label.length === 0)
+                continue;
+            if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0)
+                continue;
+            marks.set(`dsh:${seq}`, { label, tokens: Math.round(tokens) });
+        }
+    }
+    return marks;
 }
 /**
  * Render the current editable block index into DSH's dynamic runtime context.
@@ -247,10 +626,11 @@ function blockIndexContextText(context, states) {
     try {
         const options = optionsFor(session);
         const state = states.get(String(session.id));
-        const index = dshBlockIndexText(session, options, state, positiveEnv("CLM_INDEX_REFRESH_STEPS", 4));
+        const cleared = clearedMarksOf(session);
+        const index = dshBlockIndexText(session, options, state, options.refreshSteps ?? 4, cleared);
         if (!index)
             return "";
-        const { usageLine, candidateText } = dshTriggerView(session, options, state);
+        const { usageLine, candidateText } = dshTriggerView(session, options, state, cleared);
         return `Mirror: ${options.mirrorPath}\n${usageLine}\n${withCleanupCandidates(index, candidateText)}`;
     }
     catch {
@@ -324,6 +704,11 @@ const cleanupOutputSchema = {
     additionalProperties: false,
 };
 function createDshCleanupTool(getState) {
+    // The tool's value is validated against `cleanupOutputSchema` with
+    // `additionalProperties: false`, so the host-only copy mode cannot ride in the
+    // returned object. Keep it beside the value instead; the render callback
+    // receives that same object.
+    const renderCopy = new WeakMap();
     return {
         name: "cleanup",
         description: "Remove stale CLM context blocks by ID range or by individual ID from the live block index without reading or reconstructing their bodies, keep one with a shorter `[offloaded: <note>]` body, or list the rows of a range (read-only) to identify targets the index only named.",
@@ -333,7 +718,7 @@ function createDshCleanupTool(getState) {
             render: (_args, value) => [
                 {
                     type: "text",
-                    text: formatCleanupToolResult(value, cleanupResultCopy()),
+                    text: formatCleanupToolResult(value, (typeof value === "object" && value !== null ? renderCopy.get(value) : undefined) ?? "compact"),
                 },
             ],
         },
@@ -352,7 +737,9 @@ function createDshCleanupTool(getState) {
             // `copy` steers how much text output.render emits. It is host-side
             // rendering state, not tool-output data, so keep it out of the value
             // DSH snapshots and validates against cleanupOutputSchema.
-            const { copy: _copy, ...output } = result;
+            const { copy, ...output } = result;
+            if (typeof copy === "string")
+                renderCopy.set(output, copy);
             return output;
         },
     };
@@ -397,41 +784,61 @@ function dshStatusText(session, options) {
         `mirror limits: ${options.maxBlockChars ?? 12_000} chars/block, ${options.maxMirrorChars ?? 96_000} chars total`,
     ].join("\n");
 }
-function createDshClmCommand(onModeChange) {
+/** One status line for `/clm`, so the user can see what clearing did. */
+function autoClearStatusText(state) {
+    if (state === undefined) {
+        return "auto-clear: not armed (set autoClear.canary to record decisions; autoClear.enabled also clears)";
+    }
+    if (!state.config.autoClear.enabled) {
+        const stop = state.auto.stop === undefined ? "open" : `stopped (${state.auto.stop})`;
+        return `auto-clear: canary only · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.misselects} re-read(s)`;
+    }
+    const armed = state.writer.state === "missing"
+        ? "off: this host exposes no ignorable plugin-record seam"
+        : state.writer.state === "pending"
+            ? "starting: resolving the host record seam"
+            : state.projection.ready ? "armed" : "armed, no projection";
+    const stop = state.auto.stop === undefined ? "open" : `stopped (${state.auto.stop})`;
+    return `auto-clear: ${armed} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.misselects} re-read(s)`;
+}
+function createDshClmCommand(onModeChange, autoStatus) {
     return {
         name: "clm",
         description: "Show the oh-my-clm live context status or switch the index mode",
         input: { hint: "status | mode [blocks|digest|auto]" },
         handler: (invocation) => {
             const input = invocation.rawInput.trim();
+            const session = invocation.agent?.session;
+            const config = session ? sessionConfig(session) : loadClmConfig(process.cwd()).config;
             if (input.startsWith("mode")) {
                 const requested = input.slice(4).trim();
                 if (requested === "") {
-                    const current = indexMode();
-                    const source = indexModeOverride.value ? "process override" : `CLM_INDEX_MODE=${process.env.CLM_INDEX_MODE ?? "unset"}`;
+                    const current = indexMode(config);
+                    const source = indexModeOverride.value ? "process override" : `config index.mode=${config.index.mode}`;
                     return { kind: "success", text: `oh-my-clm index mode: ${current} (${source})` };
                 }
                 if (requested !== "blocks" && requested !== "digest" && requested !== "auto") {
                     return { kind: "error", text: CLM_COMMAND_USAGE };
                 }
                 indexModeOverride.value = requested === "auto" ? undefined : requested;
-                onModeChange(indexMode());
+                onModeChange(indexMode(config));
                 return {
                     kind: "success",
                     text: requested === "auto"
-                        ? `oh-my-clm index mode: ${indexMode()} (auto; follows CLM_INDEX_MODE, default digest).`
-                        : `oh-my-clm index mode: ${requested}. The next step re-renders the block index; this override lasts until the process restarts (set CLM_INDEX_MODE to persist it, or /clm mode auto to drop it).`,
+                        ? `oh-my-clm index mode: ${indexMode(config)} (auto; follows index.mode in the config file, default digest).`
+                        : `oh-my-clm index mode: ${requested}. The next step re-renders the block index; this override lasts until the process restarts (set index.mode in .oh-my-clm.json to persist it, or /clm mode auto to drop it).`,
                 };
             }
             if (input.length > 0 && input !== "status") {
                 return { kind: "error", text: CLM_COMMAND_USAGE };
             }
-            const session = invocation.agent?.session;
             if (!session) {
                 return { kind: "error", text: "oh-my-clm: the active DSH agent has no session." };
             }
             try {
-                return { kind: "success", text: dshStatusText(session, optionsFor(session)) };
+                const status = dshStatusText(session, optionsFor(session));
+                const extra = autoStatus?.(String(session.id));
+                return { kind: "success", text: extra ? `${status}\n${extra}` : status };
             }
             catch (error) {
                 return {
@@ -495,8 +902,12 @@ export function apply(ctx) {
     activeContext = ctx;
     const states = new Map();
     const queues = new WeakMap();
+    const canaries = new Map();
+    const projection = { ready: false };
+    installClearProjection(ctx, projection);
     ctx.effect?.(() => () => {
         states.clear();
+        canaries.clear();
         if (activeContext === ctx)
             activeContext = undefined;
     }, "oh-my-clm.state");
@@ -530,12 +941,12 @@ export function apply(ctx) {
             // Mode changes the rendered index; every cached preview is now wrong.
             for (const state of states.values())
                 state.blockIndex = undefined;
-        }));
+        }, (sessionId) => autoClearStatusText(canaries.get(sessionId))));
     }
     else {
         ctx.logger?.warn?.("oh-my-clm: DSH commands runtime unavailable; /clm was not registered");
     }
-    ctx.on("agent/created", ({ agent }) => {
+    ctx.on("agent/created", async ({ agent }) => {
         const session = agent.session;
         if (!session) {
             ctx.logger?.warn?.("oh-my-clm: agent has no session; DSH bridge is inactive for it");
@@ -546,6 +957,33 @@ export function apply(ctx) {
         // both look it up by session id, and a subagent's agent id need not match.
         const key = String(session.id);
         states.set(key, state);
+        const loaded = loadClmConfig(typeof session.header?.cwd === "string" ? session.header.cwd : process.cwd());
+        const config = loaded.config;
+        for (const warning of loaded.warnings)
+            ctx.logger?.warn?.(`oh-my-clm: ${warning}`);
+        // This listener is async and the host does not await it, so an exception
+        // here would surface as an unhandled rejection instead of a broken session.
+        // Failing to arm clearing only costs the optimisation, never the transcript.
+        try {
+            if (canaryEnabled(config) || autoClearEnabled(config)) {
+                const canary = seedCanary(ctx, session, projection, config);
+                canaries.set(key, canary);
+                if (autoClearEnabled(config)) {
+                    // Resolving the seam is async because the plugin cannot depend on the
+                    // host package. A boundary that arrives meanwhile skips (not latches);
+                    // a host without the seam latches `unrecordable` and says why once.
+                    const writer = await resolvePluginRecordWriter(config.host.pluginRecordModule);
+                    canary.writer = writer ? { state: "ready", write: writer } : { state: "missing" };
+                    if (!writer) {
+                        canary.auto.stop = "unrecordable";
+                        ctx.logger?.warn?.(`oh-my-clm: autoClear.enabled is set but ${config.host.pluginRecordModule} exposes no appendPluginRecord seam; clearing stays off for session ${key}`);
+                    }
+                }
+            }
+        }
+        catch (error) {
+            ctx.logger?.warn?.(`oh-my-clm: live-context clearing could not be armed for session ${key}: ${error instanceof Error ? error.message : String(error)}`);
+        }
         const agentContext = agent.ctx ?? ctx;
         const disposePreStep = agentContext.on("agent/pre-step", async (_payload, next) => {
             // agent/pre-step runs before step/start, so DSH is not accepting a
@@ -564,6 +1002,9 @@ export function apply(ctx) {
     });
     ctx.on("session/event", (session, event) => {
         const key = String(session.id);
+        const canary = canaries.get(key);
+        if (canary !== undefined)
+            feedCanary(ctx, session, event, canary);
         const state = states.get(key);
         if (!state)
             return;
@@ -575,6 +1016,13 @@ export function apply(ctx) {
             void enqueueReconcile(ctx, session, state, queues, () => states.get(key) === state);
             return;
         }
+        // A clearing record changes the projection and the index, but it is not a
+        // surface edit, so neither reconcile nor the compaction branch sees it.
+        if (event?.type === CLEAR_EVENT_TYPE) {
+            state.blockIndex = undefined;
+            state.trigger = undefined;
+            return;
+        }
         // Compaction rewrites the surface and can renumber editable IDs without
         // going through cleanup or a mirror edit.
         if (typeof event?.type === "string" && event.type.includes("compaction")) {
@@ -583,7 +1031,9 @@ export function apply(ctx) {
         }
     });
     ctx.on("agent/disposed", ({ agent }) => {
-        states.delete(String(agent.session?.id ?? agent.id));
+        const key = String(agent.session?.id ?? agent.id);
+        states.delete(key);
+        canaries.delete(key);
     });
 }
 /**

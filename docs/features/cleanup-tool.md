@@ -1,59 +1,49 @@
 # Cleanup 与 block index
 
-`cleanup` 是 Pi 和 DSH 共用的历史整理入口：模型按 **1-based editable block ID** 删除 stale、重复或自指内容，不需要读取完整 block body，也不会因为 mirror preview 被截断而构造出错误的 `old_string`。删除是单向的，所以还有一种低损动作 `offload`：保留 block 的 ID、role 和位置，只把正文换成一行由模型撰写的 `[offloaded: <一句关键事实>]`。block index 则把可操作的地址放进模型可见的 runtime context，让模型不必先打开 mirror 才能决定删什么。
+`cleanup` 是 Pi 与 DSH 共用的历史整理入口。模型按 **1-based editable block ID** 删除 stale、重复或自指内容，不需要读取完整 body，也不会受 mirror preview 截断影响。删除不可逆，因此另有 `offload`：保留 block 的 ID、role 和位置，只把正文换成一行由模型撰写的 `[offloaded: <note>]`。
 
-> mirror 协议、snapshot 和 turn_end 校验见 [live-context-mirror.md](./live-context-mirror.md)；DSH 如何把删除应用到 active surface 见 [dsh-surface-bridge.md](./dsh-surface-bridge.md)。
+block index 把可操作的地址放进模型可见的 runtime context，使模型不必先打开 mirror 就能决定删什么。
 
-## 1. 为什么优先用 cleanup
-
-- **不依赖正文**：删除计划直接使用 ID 和 host 侧 records，preview 截断、超长 tool output 都不影响。
-- **一次调用完成**：所有目标必须批量放进同一个 host-side 工具调用；ID 在删除后会重新编号，分多次调用会更容易指错。
-- **保护 load-bearing block**：协议头、`CLM_SNAPSHOT`、block 1 和 user-authored block 的改写限制不会被绕过。
-- **配对处理**：删除 assistant tool turn 时，配对的 tool result 会一起删除；反过来删除 tool result 也会删除其 owner assistant，避免下一轮出现孤立的 tool message。
-- **可审计**：工具调用和结果事件仍完整保留在 session surface / append-only 日志中。
-- **可保留要点（`offload`）**：不确定是否还需要某个 block 时，不删整块，只把正文换成一个严格更短的占位行；要点由模型自己填，插件不引入第二个 summarizer。原文仍在 append-only 日志里，`omit` 的不可逆性因此不再适用于每一次清理。
-
-## 2. 工具契约
+## 工具契约
 
 ```text
-cleanup({ "blockIds": [2, 3, 4] })
-cleanup({ "ranges": ["3-16"], "skipRoles": ["user"] })
-cleanup({ "offload": [{ "blockId": 2, "note": "旧测试套件在 X 上失败，已修" }] })
-cleanup({ "offload": [{ "blockId": 2, "note": "..." }], "blockIds": [4] })
-cleanup({ "list": "3-16" })
+cleanup({ blockIds: [2, 3, 4] })
+cleanup({ ranges: ["3-16"], skipRoles: ["user"] })
+cleanup({ offload: [{ blockId: 2, note: "旧测试套件在 X 上失败，已修" }] })
+cleanup({ offload: [{ blockId: 2, note: "..." }], blockIds: [4] })
+cleanup({ list: "3-16" })
 ```
 
 | 参数 | 语义 |
 | --- | --- |
-| `blockIds` | 显式单块 ID。未知、重复、过期或协议损坏的 ID 会整体拒绝，不部分应用。 |
-| `ranges` | 包含式区间，例如 `"3-16"` 或 `"42"`。越界会夹取；覆盖 block 1 时保留 block 1。 |
-| `skipRoles` | 在请求的区间内保留指定角色。`["user"]` 可以删掉一个 turn 的 tool 噪声但保留人类消息。 |
-| `list` | 只读展开：返回该区间的逐块行（role + 短 preview），不做删除，也不写 mirror。 |
-| `offload` | 逐块软卸载：保留 ID / role / 顶层 marker 与块顺序，正文换成一行 `[offloaded: <note>]`。可与 `blockIds` / `ranges` 在同一次调用里混用。 |
+| `blockIds` | 显式单块 ID。未知、重复、过期或协议损坏的 ID 整体拒绝。 |
+| `ranges` | 包含式区间，如 `"3-16"` 或 `"42"`。越界夹取；覆盖 block 1 时保留 block 1。 |
+| `skipRoles` | 在区间内保留指定角色。`["user"]` 可删掉一个 turn 的 tool 噪声而保留人类消息。 |
+| `list` | 只读展开：返回区间内逐块行（role + 短 preview），不删除、不写 mirror。 |
+| `offload` | 逐块软卸载：保留 ID/role/顺序，正文换成 `[offloaded: <note>]`；可与删除参数混用。 |
 
 规则：
 
-- ID 是当前 mirror / index 中从 `1` 开始的可读编辑序号；不要改 ID，也不要重排 block。
-- `list` 不能和 `blockIds` / `ranges` / `skipRoles` / `offload` 同时出现，避免“边看边删”。
-- `offload` 的 note 必须单行、非空、≤240 字符，且替换后的估算 token 必须**严格小于**原正文；否则整体拒绝（占位不能成为绕过 shrink-only 的增肥路径）。note 也不能携带保留字（`oh-my-clm … source=/owner=/agent=/trusted=/provenance=`）或 preview 截断标记。
-- `offload` 只允许 `assistant` / `toolResult` 块：block 1 是 load-bearing 锚点，user-authored 正文只能省略、不能被模型写的 note 取代。未知、重复或与 `blockIds` / `ranges` 冲突的 offload ID 整体拒绝。
-- offload 一个带 tool call 的 assistant 块会丢掉 tool call 结构，因此沿用 mirror 改写规则：配对 tool result 一起 `omit`，并计入 `pairedRemovalIds`；offload 一个 tool result 只是内容改写，owner assistant 保留。
-- 单次 `list` 结果约有 6 KB 字符预算；被截断时末尾会给出继续读取的区间（`... 65 more block(s); call cleanup({ list: "114-178" }) to continue.`），不会静默返回部分视图。
-- 显式 ID 1 会被拒绝；range 覆盖 1 时保留 block 1。共享的 `loadBearingRecord()` 守卫让 mirror 编辑路径也无法删除 block 1；compaction 后 protected 前缀释放时同样成立。
-- 配对级联删除通过 `pairedRemovalIds` / `paired` 单独报告，不会混进调用者请求的 ID。
-- 用户消息只能保留或省略，不能被 cleanup 改写；cleanup 既能删除（`blockIds` / `ranges`），也能就地缩短 assistant / toolResult 正文（`offload`）。
-- Pi 侧一个 step（一次 assistant 响应及其 tool call）最多调用一次 cleanup，并且要在该 step 任何 mirror 编辑之前。Pi 的 `turn_end` 在每个 step 结束时触发（见 Pi `docs/json.md`），每次提交都会刷新 mirror 基线，所以跨 step 的多次 cleanup 是正常且安全的；同一 step 内先改 body 再 cleanup 则会整体拒绝——文件一旦在提交前被改过，它的 snapshot 就落后于 live projection，cleanup 不静默重渲染也不删除任何 block，并在 reason 里点明顺序。
-- 删除最后一个可编辑 block 时，mirror 保留 `<!-- CLM_EMPTY -->`；`offload` 不删除 span，所以不触发 `CLM_EMPTY`。
-- 删除与 offload 使用与解析相同的顶层 span（`context-format.ts` 的 `rewriteMirrorBlocks`）：body 里引用（或手写）的 `[[CLM_ENTRY ...]]`、`[[/CLM_ENTRY ...]]` 不会被当成可删块，所以“某个 block 的正文里贴了 marker”不会再把删除变成切错范围的静默损坏；替换后的 note 也按 body 规则转义，不会变成新的顶层块。
-- 真的损坏（缺 closing marker、重复顶层 ID、目标 span 不存在）会作为 `rejected` 返回并给出具体 ID；`removeMirrorBlocks()` 失败时返回结果对象而不是抛异常，因此不会出现“规划通过、写盘到一半失败”的半状态。
+- ID 是当前 mirror/index 的编辑序号；不改 ID、不重排 block。
+- `list` 不能与 `blockIds` / `ranges` / `skipRoles` / `offload` 同时出现。
+- `offload` 的 note 必须单行、非空、≤240 字符，替换后的估算 token 必须严格小于原正文；note 不能携带保留来源声明（`oh-my-clm … source=/owner=/agent=/trusted=/provenance=`）或 preview 截断 marker。
+- `offload` 只允许 `assistant` / `toolResult`。block 1 是 load-bearing 锚点；user-authored 正文只能省略，不能被 note 取代。
+- offload 带 tool call 的 assistant 会丢掉 tool call 结构，因此配对 tool result 一起 omit；offload tool result 只是内容改写，owner assistant 保留。
+- 显式 ID 1 拒绝；range 覆盖 1 时保留 1。共享的 `loadBearingRecord()` 守卫让 mirror 编辑路径同样无法删除 block 1。
+- 配对级联删除单独报告为 `pairedRemovalIds` / `paired`，不混入调用者请求的 ID。
+- 删除最后一个可编辑 block 时保留 `<!-- CLM_EMPTY -->`；`offload` 不删除 span，因此不触发 `CLM_EMPTY`。
+- 删除与 offload 使用与解析相同的顶层 span 扫描；body 中引用或手写的 `[[CLM_ENTRY ...]]` 不会被当成可删块。
+- 损坏（缺 closing marker、重复顶层 ID、目标 span 不存在）返回 `rejected` 与具体 ID；写盘失败返回结果对象，不产生半状态。
+- Pi 侧一个 step 最多调用一次 cleanup，且必须在该 step 任何 mirror 编辑之前。同一 step 先改 body 再 cleanup 会整体拒绝，reason 会点明顺序。
+- 单次 `list` 结果约 6 KB 字符预算；截断时末尾给出继续读取的区间，不静默返回部分视图。
 
-## 3. block index
+## block index
 
-DSH 会通过 `systemPrompt.context()` 把 `<oh-my-clm-block-index>` 放进模型可见的 runtime context。索引和 `cleanup` 使用同一组 1-based ID，因此模型可以直接从聊天上下文里得到删除地址。
+DSH 通过 `systemPrompt.context()` 把 `<oh-my-clm-block-index>` 放进 runtime context。索引与 cleanup 使用同一组 1-based ID。
 
 ### digest（默认）
 
-每个已完成 turn 一行：包含式 ID 区间、块数、估算 token 成本和该 turn 的第一条 user 消息。正在进行的 turn 只给稳定的起始锚点 `IDs N..`，不列出——它还在增长，工具对也可能尚未结算，本来就不是安全的删除目标。
+每个已完成 turn 一行：包含式 ID 区间、块数、估算 token 成本、该 turn 的第一条 user 消息。正在进行的 turn 只给起始锚点 `IDs N..`，不列出。
 
 ```text
 <oh-my-clm-block-index>
@@ -64,108 +54,49 @@ IDs 5.. (current turn, not listed): One more turn.
 </oh-my-clm-block-index>
 ```
 
-因此摘要文本在一个 turn 内字节不变，DSH 的快照去重会命中，索引只在 turn 边界追加一次。`CLM_INDEX_LINES`（默认 40）限制列出的 turn 数；被折叠的 turn 再按估算 token 排序，最多取三个写成一行 `... largest omitted turns: 21-24 (4.1k tok), 31-33 (2.9k tok).`。
+文本在一个 turn 内逐字节不变，DSH 只在 turn 边界追加一条快照。`index.maxLines` 限制列出的 turn 数；被折叠的 turn 按估算 token 排序，最多取三个写成 `... largest omitted turns: A-B (x tok), ...`。
 
 ### blocks
 
-`CLM_INDEX_MODE=blocks` 切回逐个 block 的列表。它附带 role 和单行短 preview，默认 preview 64 字符，列前 12 个 block（开头任务的“别动”锚点）加**最近 40 个**；中间的连续区间用一行 `... N editable block(s) omitted (IDs A-B).` 标出。
+`index.mode: "blocks"` 改为逐 block 列表，附 role 和单行 preview（`index.previewChars`，默认 64 字符）。列前 `index.headBlocks` 个 block（默认 12，开头“别动”锚点）加最近 `index.tailBlocks` 个（默认 40）；中间连续区间用 `... N editable block(s) omitted (IDs A-B).` 标出。
 
-```text
-<oh-my-clm-block-index>
-Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them, cleanup({ list: "A-B" }) to read a range's rows.
-1. assistant: I inspected the repository and found a small TypeScript project.
-2. toolResult: A very large command output that is no longer useful.
-…（1–12 行是开头的“别动”锚点，中间省略）
-... 148 editable block(s) omitted (IDs 13-160).
-161. toolResult: the failing test run from an earlier turn
-…
-200. user: Keep the important repository fact.
-</oh-my-clm-block-index>
-```
+### 刷新
 
-预算偏向最近内容，因为清理目标是那里刚产出、模型还记得的 stale tool 噪声；中点附近的 block 既不记得、也不是删除对象。`CLM_INDEX_MIDDLE` 已改名为 `CLM_INDEX_TAIL`，旧名作为回退别名保留。
+索引的静态协议放在 system prompt，随 prompt 缓存；runtime context 只携带动态行。同一 turn 内最多每 `index.refreshSteps`（默认 4）步重渲染一次，按“打开中的 turn + 已关闭 step 数”计数；`1` 恢复每步刷新。追加 block 不重编号，删除会重编号，因此 cleanup 或 mirror edit 生效后立即清空缓存并重渲染；compaction 也保守失效。
 
-### 刷新与失效
+DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程切换索引形状并清空缓存，从下一步生效；`auto` 回到配置文件的 `index.mode`（默认 `digest`）。这是进程级覆盖，影响当前进程所有 session。
 
-索引的静态协议（tag 含义、cleanup 使用纪律、block 1 与 protected block 规则）放在系统提示词里，随 system prompt 一起缓存；runtime-context 只携带动态行。`blocks` 模式下同一个 turn 内索引最多每 `CLM_INDEX_REFRESH_STEPS`（默认 4）步重渲染一次；节流按“打开中的 turn + 已关闭 step 数”计数，因为 DSH 在 `agent/pre-step` 渲染索引时下一步的 `step/start` 还没写入（旧 turn/step 键因此从未命中，见 E-027）。
+## 结果模式
 
-追加新 block 不会重编号，所以缓存索引里列出的 ID 始终有效；删除会重编号，`cleanup` 或 mirror edit 生效后会立即清空缓存并重渲染，compaction 事件也会保守失效。`CLM_INDEX_REFRESH_STEPS=1` 恢复每步刷新。
-
-DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程里切换索引形状并清空缓存，从下一步开始生效；`auto` 撤销进程级覆盖，回到 `CLM_INDEX_MODE`（默认 `digest`）。这是进程级覆盖，会影响当前进程中的所有 session。
-
-## 4. 结果模式
-
-`CLM_CLEANUP_RESULT` 只在 DSH host bridge 中读取；Pi 侧固定为 `compact` 语义（`cleanupToolResult` 默认 `compact`）。
+`cleanup.resultMode` 只在 DSH host bridge 中读取；Pi 侧固定 `compact` 语义。
 
 | 值 | 行为 |
 | --- | --- |
-| `compact`（默认） | 成功时只返回一行确认；被拒绝时仍返回 `cleanup rejected; <reason>`；刷新后的 block index 会在下一次索引刷新后出现。 |
-| `full` | 在结果后附带刷新后的索引（拒绝时同样附带）。 |
-| `none` | 只抑制**成功**确认；`rejected` 始终返回可行动的 reason，`cleanup({ list: "A-B" })` 的只读 listing 在任何模式下都返回行内容。 |
+| `compact`（默认） | 成功只返回一行确认；拒绝仍返回 `cleanup rejected; <reason>`；刷新后的 index 在下一次刷新出现。 |
+| `full` | 结果后附带刷新后的索引（拒绝时也附带）。 |
+| `none` | 只抑制成功确认；`rejected` 始终返回可行动 reason，`list` 始终返回行内容。 |
 
-结果模式只影响模型可见的结果，不改变工具调用记录本身。
+结果模式只影响模型可见结果，不改变工具调用记录。
 
-## 5. 动作报告
+动作报告示例：`cleanup applied; removed 2 block(s): 2-3.`；软卸载为 `cleanup applied; offloaded 1 block(s): 2.`；混用时分别列出，配对删除单列 `Paired (not requested): 3.`。
 
-`cleanup applied; removed 2 block(s): 2-3.` 是纯删除；`cleanup applied; offloaded 1 block(s): 2.` 是软卸载；混用时按动作分别列出：`cleanup applied; removed 1 block(s): 4; offloaded 1 block(s): 2.`。配对删除仍单独报告为 `Paired (not requested): 3.`。`offloadedBlockIds` 只在非空时出现在结构化结果里，避免给每次删除都加一个空字段。
+## 配置
 
-## 6. 宿主差异
+以下配置项只在 DSH host bridge 中读取；Pi 侧没有 block index。写进 `~/.config/oh-my-clm/config.json` 或项目级 `.oh-my-clm.json`。
 
-### Pi
-
-`cleanup` 通过 Pi `registerTool` 注册，参数校验和删除计划使用共享的 `parseCleanupArgs` / `planCleanup`。工具执行时写入 mirror，真正的持久化仍由随后的 `turn_end` 生成 branch-local `context_edit`。如果工具调用后 projection 比文件多一条，扩展会在磁盘内容仍等于上次渲染文本时重新同步 mirror；磁盘上存在未提交的模型编辑时则保持 stale 拒绝，避免冲掉尚未应用的修改——此时拒绝原因直接提示"cleanup 要在该 step 任何 mirror 编辑之前，且一个 step 只能一次"，而不是笼统的 snapshot stale。
-
-### DSH
-
-`cleanup` 直接基于当前 `Session` 的 canonical records 按 ID 执行，不读取 mirror 文件；删除通过 `Session.append()` 的 surface replacement 落入当前 active surface，并在工具返回前写完新的 canonical mirror。参数校验同样在 `execute` 内完成。细节见 [dsh-surface-bridge.md](./dsh-surface-bridge.md)。
-
-## 7. 配置
-
-以下变量只在 DSH host bridge 中读取；Pi 侧没有 block index，cleanup 结果固定为 `compact` 语义（`cleanupToolResult` 默认 `compact`）。
-
-| 变量 | 默认值 | 作用 |
+| 配置项 | 默认 | 作用 |
 | --- | --- | --- |
-| `CLM_INDEX_MODE` | `digest` | 索引形状：`digest` 或 `blocks`。 |
-| `CLM_INDEX_PREVIEW` | `64` | `blocks` 模式每行 preview 字符数。 |
-| `CLM_INDEX_HEAD` | `12` | 列表开头保留的 block 数（“别动”锚点）。 |
-| `CLM_INDEX_TAIL` | `40` | 列表尾部窗口宽度；旧名 `CLM_INDEX_MIDDLE` 作为回退别名。 |
-| `CLM_INDEX_LINES` | `40` | digest 模式最多列出的 turn 数。 |
-| `CLM_INDEX_REFRESH_STEPS` | `4` | 同一个 turn 内最多每几步重渲染一次；`1` 表示每步刷新。 |
-| `CLM_TRIGGER_PCT` | `0`（关闭） | 用量达到窗口百分比时触发候选（未标定，默认关）。 |
-| `CLM_TRIGGER_TURNS` | `0`（关闭） | 已完成 turn 数达到该值时触发。 |
-| `CLM_TRIGGER_TOOL_RATIO` | `0`（关闭） | toolResult 占可编辑 token 的百分比达到该值时触发。 |
-| `CLM_TRIGGER_SINCE` | `0`（关闭） | 距上次成功清理的 turn 数达到该值时触发。 |
-| `CLM_TRIGGER_CANDIDATES` | `3` | 一次触发最多候选区间数。 |
-| `CLM_TRIGGER_MIN_TOKENS` | `0` | 小于该估算 token 的 turn 不作为候选。 |
-| `CLM_CONTEXT_WINDOW` | 无 | 宿主不提供窗口时的兜底；未知时用量行写 `window unknown`。 |
-| `CLM_CACHE_DISCOUNT` | `2` | 缓存命中价占全价的百分比（`2` = 1/50），即成本公式里的 `r`；默认取自 Pi 的 deepseek-flash 价目表，按端点设置。 |
-| `CLM_CACHE_PAYBACK_TURNS` | `10` | 断点的一次性成本摊到几轮（公式里的 `N`）；`1` 表示只算眼前这一轮。 |
-| `CLM_CLEANUP_RESULT` | `compact` | DSH 结果模式：`compact` / `full` / `none`。 |
+| `index.mode` | `digest` | 索引形状：`digest` / `blocks`。 |
+| `index.previewChars` | `64` | `blocks` 模式每行 preview 字符数。 |
+| `index.headBlocks` | `12` | 列表开头保留的 block 数。 |
+| `index.tailBlocks` | `40` | 列表尾部窗口宽度。 |
+| `index.maxLines` | `40` | `digest` 模式最多列出的 turn 数。 |
+| `index.refreshSteps` | `4` | 同一 turn 内最多每几步重渲染一次。 |
+| `cleanup.resultMode` | `compact` | `compact` / `full` / `none`。 |
 
-用 `node scripts/measure-session-index.mjs --project .` 可以从真实 session 日志核对索引快照数、字节数、步间隔和 cleanup 调用形态；它同时给出 `blocks` 与 `digest` 的对比，以及 digest 的预测重渲染次数。
+清理触发阈值与缓存计价见根 [README](../../README.md#配置)。
 
-## 8. 实现与测试
+## 宿主差异
 
-| 位置 | 职责 |
-| --- | --- |
-| `src/features/live-context/context-cleanup.ts` | 双宿主共用的参数解析、ID/区间校验、block 1 保护、配对删除、完整 span 删除与 `offload` 计划。 |
-| `src/features/live-context/context-format.ts` | 共享 records、block ID、索引渲染（`renderBlockDigest` 等）和 `rewriteMirrorBlocks`（删除 + 正文替换同一条顶层 span 扫描）。 |
-| `src/features/live-context/context-trigger.ts` | 触发判定、用量行与候选装配（纯函数，两个宿主可共用）。 |
-| `extensions/clm.ts` | Pi 工具注册、mirror 写入和 `turn_end` 持久化。 |
-| `dsh/index.ts` | DSH 工具注册、索引 runtime context 和 active-surface cleanup。 |
-| `test/features/live-context/context-cleanup.test.ts` | ID 校验、block 1 保留、截断 preview、完整 span 删除、配对失败和 `offload`（§5.4 / 用例 13）测试。 |
-| `test/features/live-context/context-format.test.ts` | 索引渲染、协议、截断和 gate 测试。 |
-
-## 9. 验证
-
-关键不变量：
-
-1. cleanup 按 ID 在一次工具调用内完成 host-side mutation；
-2. preview 截断和 `old_string` 不会影响删除；
-3. block 1（cleanup 与 mirror 编辑两条路径）、协议头、`CLM_SNAPSHOT` 保留；
-4. assistant tool call 与 tool result 级联处理，不留下孤立 message；
-5. 未知、重复、过期 ID 和 role 变化整体拒绝；
-6. `list` 只读，不写 mirror，不能与删除参数同用；
-7. 结果模式不改变工具调用记录，也不吞掉 listing 内容；
-8. Pi 侧 mirror 已带本 step 改动时，cleanup 以可行动的 `rejected` 结束，既不静默重渲染，也不删除任何 block；
-9. `offload` 保持块结构与 `CLM_SNAPSHOT`，正文严格变短且含 `[offloaded: …]`，与 `omit` 混用后总 token 严格下降；配对级联与 block 1 守卫与删除路径一致。
+- **Pi**：通过 `registerTool` 注册；参数校验与删除计划用共享 `parseCleanupArgs` / `planCleanup`。工具执行时写 mirror，持久化仍由随后的 `turn_end` 生成 branch-local `context_edit`。若磁盘内容仍等于上次渲染文本，工具后会重新同步；存在未提交编辑时保持 stale 拒绝。
+- **DSH**：直接基于当前 `Session` 的 canonical records 按 ID 执行，不读 mirror；删除通过 `Session.append()` 的 surface replacement 落入 active surface，并在工具返回前写完新的 canonical mirror。细节见 [dsh-surface-bridge.md](./dsh-surface-bridge.md)。

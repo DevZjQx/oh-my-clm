@@ -619,8 +619,8 @@ export function cleanupToolResult(plan, blockIndex, copy = "compact") {
     return result;
 }
 /**
- * Parse the `CLM_CLEANUP_RESULT` environment value. Unknown values fall back
- * to `compact` so a typo never silently restores the verbose result.
+ * Parse the configured `cleanup.resultMode`. Unknown values fall back to
+ * `compact` so a typo never silently restores the verbose result.
  */
 export function parseCleanupResultCopy(value) {
     return value === "full" || value === "none" ? value : "compact";

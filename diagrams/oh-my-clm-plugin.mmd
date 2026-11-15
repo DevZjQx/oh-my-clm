@@ -1,0 +1,21 @@
+graph LR
+  PI["Pi runtime"] --> PIX["extensions/clm.ts<br/>Pi extension"]
+  DSH["DSH / Cordis runtime"] --> DSHX["dsh/index.ts<br/>host entry"]
+
+  PIX --> FMT["context-format<br/>mirror · block index · tokens"]
+  DSHX --> FMT
+  PIX --> CLN["context-cleanup<br/>cleanup / offload tool"]
+  CLN --> FMT
+  TRG["context-trigger<br/>usage line + candidates"] --> FMT
+  FMT --> LIB["src/lib<br/>clm-paths · clm-files"]
+  DSHX --> BRG["dsh-bridge<br/>Session.append replacement"]
+  BRG --> LIB
+
+  DSHX --> CAN["auto-clear<br/>peek / retire selector"]
+  CAN --> CANLOG["CANARY.jsonl<br/>one line per dead block"]
+  CAN --> PROJ["clear-projection<br/>pure message projection"]
+  PROJ --> SEAM["sessions service<br/>registerMessage<br/>Projection"]
+  DSHX --> REC["plugin-record<br/>ignorable writer"]
+  REC --> PRE["plugin:oh-my-clm/clear<br/>no seam → no clearing"]
+
+  LIB --> MIRROR["/tmp/clm-session/<br/>LIVE_CTX_MAIN.md"]

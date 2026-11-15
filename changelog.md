@@ -2,6 +2,26 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/features/live-context-mirror.md`](./docs/features/live-context-mirror.md)。
 
+## 未发布
+
+新增 DSH 侧**自动清理**通道，默认关闭：turn 边界把"被同一目标后续调用取代"的 tool-result 块换成一行重取指针。并把全部 `CLM_*` 环境变量迁移到 JSON 配置文件。`npm test` 183/183、host harness 130/130、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
+
+- **环境变量全部移除，改为配置文件。** 配置按会话工作目录解析：用户级 `$XDG_CONFIG_HOME/oh-my-clm/config.json`（未设或非绝对路径时退到 `~/.config/oh-my-clm/config.json`），项目级 `<cwd>/.oh-my-clm.json` 逐 key 覆盖。`src/lib/clm-config.ts` 负责读取、合并、类型校验与 warning；非法值只回退对应 key，不会让 mirror/cleanup 整体失效。原先 25 个 `CLM_*` 变量映射为分组字段，例如 `CLM_CONTEXT_BUDGET` → `context.budgetTokens`、`CLM_INDEX_MODE` → `index.mode`、`CLM_TRIGGER_PCT` → `cleanup.trigger.usagePercent`、`CLM_AUTO_CLEAR` → `autoClear.enabled`。每次调用重新读文件，因此 `/clm status` 与运行中的 A/B 不再需要重启宿主；`/clm mode` 仍是进程级临时覆盖。DSH 的 `appendPluginRecord` seam 改为按会话配置 (`host.pluginRecordModule`) 异步解析：解析期间跳过本轮，无 seam 时锁存 `stopped (unrecordable)` 并 warn 一次。`XDG_CONFIG_HOME` 只决定用户级文件的位置（标准 XDG 语义，非插件开关）；测试与 harness 把它指向临时目录，因此套件不再受机器上已有的用户配置影响（此前一份 `~/.config/oh-my-clm/config.json` 就能让 `npm test` 失败）。新增 `test/lib/clm-config.test.ts`（默认值、逐 key 覆盖、非法值回退、坏 JSON、未知 key、用户级文件被项目级按 key 覆盖、XDG 绝对/相对路径）。
+
+- **为什么不是 `llm/stream` 交付副本。** 宿主的 agent loop 把请求冻结（`deepFreeze(message)` + `Object.freeze(options)`），`llm/stream` 的 `next()` 不接受参数，`agent/request` 也明写 "cannot mutate messages"。插件改不了投递副本，只能走宿主留的合法面：日志事件 + `ctx.sessions.registerMessageProjection()`。
+- **投影而不是 surface replacement。** 清理追加一条 log-only 记录 `plugin:oh-my-clm/clear`（无 `surfaceOp`），纯函数投影把目标 `tool/result` 的 `content` 换成 `[cleared 3.4k tok · read src/x.ts:120-260 · re-read if needed]`，保留 `id`/`role`/`toolCallId`/`isError`。会话日志、surface、人类 transcript 都不动；回放靠日志重算，不靠替换事件自洽。
+- **记录必须是 `ignorable`，否则等于毁掉会话。** 一开始用 `session.append()` 写记录：宿主的持久化读路径（`dsh-session-persistence/validateStoredEvents`）对不认识且未标 `ignorable` 的事件类型直接抛 `SessionFormatUnsupportedError`，重启后该会话**打不开**；而 `append()` 没有设置该标记的入口。现在改用宿主的 `appendPluginRecord(session, type, data)`（`@deepseek-ai/dsh-session` ≥ 0.2.2-rc.1，提交 `ignorable: true`，不新增 surface 节点）。已在真实宿主（0.2.2-rc.1）上直接验证：`appendPluginRecord` 接受 `plugin:oh-my-clm/clear`、`pluginRecordOf` 可读回、`ignorable === true`、严格读路径不再拒绝；同一类型走 `append()` 则 `ignorable === undefined`、严格读路径拒绝。插件不静态 import 宿主包（profile 安装不解析宿主的依赖），改为加载时动态解析：解析不到宿主 seam 时**绝不退回 `append()`**，只 warn 一次并把该会话锁存为 `stopped (unrecordable)`，`/clm` 明写原因。
+- **选择器口径。** 只认 `read`/`grep`/`glob` 被同一目标的后续调用取代；`read` 要求新行区间覆盖旧区间。PTC 下一个 `run_code` 块装多个子调用，因此按**块**判定：块内可重取输出 ≥95% 死亡才算死块。
+- **跳过不等于丢弃。** `peekBatch()` 只读、只有真正写入成功的那一批才 `retire()`。闸门不够、占用过高、投影未就绪时候选留在池子里，下一个边界连同新死的块一起重算——原实现先消费后判定，导致"每轮只死一块、单块不足闸门"的会话永远不触发，且文档承诺的"跳过本轮"实际是永久丢弃。
+- **原样重放的边界不消费候选。** 种子化曾对历史 `turn/end` 也走一次决策，于是真实 resume 形态（日志以 `turn/end` 结尾）在加载后的第一个边界写出**空**账本——候选被静默吃掉。现在种子化只重放 tool 流量，历史边界跳过；历史里的 `plugin:oh-my-clm/clear` 记录会 retire 对应目标并把已清 token 计入预算，resume 不会把同一块清第二遍。
+- **投影对"目标不适用"降级。** 目标已被宿主 compaction 移出 surface、或同一块已被先前记录清过时**跳过**（回放收敛）；只有记录本身坏了（非对象/版本未知/空 targets）或目标适用却畸形（label/tokens/重复）才抛。为一条读不到的指针拒绝加载整个会话，比丢一个占位符昂贵得多。
+- **闸门与限额。** 一批 ≥1200 token 或 ≥2 个死块才执行（每次清理都断一次前缀，小步清理更贵）；占用 ≥60% 停手交给宿主 compaction；单会话累计上限 40000 token。超出剩余预算的批次按 seq 从旧到新切片，只有首批允许超一个候选（单个超大块）；旧逻辑会整批拒绝并在清任何东西之前锁存 `stopped (budget)`——离线重放里最大的一批就是 73,646 token。
+- **熔断。** 被清目标在 3 个 tool result 内被重取、累计 ≥2 次且占已清目标一半以上 → 本会话停手，`/clm` 显示 `stopped (breaker)`。重读本身不算误判（占位符就是请模型按需重读），看的是比例；熔断窗口只保留最近 3 个 tool result 内的记录，账本不随会话长度增长。
+- **账本。** `autoClear.canary: true` 时每个 turn 决策写一行 `CANARY.jsonl`（`seq`/`tokens`/`ageBlocks`/`gate`），落在 `/tmp/clm-<session>/`，不写会话日志、不新增 manifest 权限；按 blockId 去重，重复跳过不刷屏。
+- **离线标定。** `npm run canary:replay` 让同一个选择器跑已存会话（现在是 peek/retire 语义，即真实清理行为）：12 个最大的真实会话（1.33M tool-result token）里 8 个有候选、14 个边界出批次、11 个过闸门、合计 124,669 token、最大单批 73,646；4 个会话 0 候选。这条数字决定了闸门取 1200 而不是 8k。脚本随包发布（`files` 含 `scripts/canary-replay.mjs`），需 PATH 上有 `zstd`，缺失时报错带安装提示。
+- **回归。** 选择器单测 20 条（含 peek 不消费、retire、按 seq retire、预算切片）、投影单测 10 条（含 compaction 陈旧目标、已清目标收敛、陈旧与存活目标同批、陈旧目标畸形不致命）、harness 新增第 12/13 节：被跳过的批次在下一个边界累积生效、陈旧目标不致致命、无 seam 宿主不写事件且 `/clm` 报 `stopped (unrecordable)`、加载时 warn 一次。
+- **自动清理只落 DSH，Pi 只做配置迁移。** 自动清理通道一行都没进 Pi：两边的提交时机与 seam 不同（Pi 是 `turn_end` + mirror 改写，DSH 是 log-only 记录 + 消息投影）。`extensions/clm.ts` 本版唯一改动是把 `CLM_*` 环境变量换成 `loadClmConfig(ctx.cwd)`，行为不变——它读的正是同一组字段（`context.budgetTokens`、`context.maxBlockChars`、`cleanup.cacheDiscountPercent` 等），`session_start` 多报一条配置 warning。
+
 ## 0.1.18（当前版本）
 
 在真实 Pi + `deepseek-flash` 会话上完成首次标定（§5.6），据此修正两处**方向性错误**（`r` 高估 5 倍、Pi 的触发基准在 1M 窗口上不可达），并修掉空消息被误判成 cleanup 删除、导致 Pi 反复弹出 shrink 警告的问题。`npm test` 145/145、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
@@ -41,7 +61,7 @@
 
 ## 0.1.14
 
-推动模型主动清理上下文（[`docs/plan.md`](./docs/plan.md) §5.2–§5.4）：用量可见、候选可确认、删错可留要点。三项都先写红灯用例再改生产代码，`npm test` 134/134、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过；触发阈值全部默认关闭，尚未在真实 DeepSeek-V4.1-Flash 会话上标定（见下文 §5.2）。P1-3「编辑 diff/审计/最小回滚、审批/签名」仍未实现，§5.5（触发器的审计抽查流）、§5.6（撤除试验与诚实定位）仍在排期。
+推动模型主动清理上下文（原计划文档 §5.2–§5.4；该文档已移除，结论见下方条目与 git 记录）：用量可见、候选可确认、删错可留要点。三项都先写红灯用例再改生产代码，`npm test` 134/134、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过；触发阈值全部默认关闭，尚未在真实 DeepSeek-V4.1-Flash 会话上标定（见下文 §5.2）。P1-3「编辑 diff/审计/最小回滚、审批/签名」仍未实现，§5.5（触发器的审计抽查流）、§5.6（撤除试验与诚实定位）仍在排期。
 
 - **推送前复核修正（2026-11-09）。** ① Pi nudge 的百分比与用量行改为以实际生效的目标（`CLM_CONTEXT_BUDGET`，未设时取宿主窗口）为分母：原先触发判定用预算、文案却除以宿主窗口，`CLM_CONTEXT_BUDGET=32000` + 200k 窗口会输出“Suggested cleanup (usage 15% ≥ 75%)”。② 候选改为“区间 + 保留规则”：turn 以 user 块开头，因此候选固定携带 `skipRoles: ["user"]`，且 `tokens` / `frees ~N tok` 只统计该规则真正释放的 assistant / toolResult 部分，纯 user turn 得 0 分不入候选；列表末尾的承诺改为“block 1, user messages, and the current turn stay.”。③ 单块候选在调用与详情行统一写成 `"5"`，不再是 `5-5`；`turnsOld` 注释与实现对齐（最新已完成的 turn 为 1）。④ 修正 `cleanup-tool.md` 里“cleanup 只做删除”的残留表述；README / feature 文档的候选示例同步带上 `skipRoles`。`npm test` 134/134（新增 budget < window 一致性与“候选不删 user 消息”两条回归）。
 
@@ -55,7 +75,7 @@
 
 ## 0.1.13
 
-依据 [`docs/plan.md`](./docs/plan.md) 的第 1 节复现与 §3 回归用例整改，并包含一次推送前复核的补充修复；`npm test` 114/114、`npm run check`、`npm run typecheck` 全通过。需明确：`docs/plan.md` §1 的 P1-2「宿主 usage 校准 + 上限双检」在 0.1.13 中尚未实现（已在 0.1.14 补齐，见上），P1-3「编辑 diff/审计/最小回滚、审批/签名」仍未实现，不因回归用例转绿而结案；§2 的 I-3~I-9 同样仍是待排期项。
+依据原计划文档第 1 节的复现与 §3 回归用例整改，并包含一次推送前复核的补充修复；`npm test` 114/114、`npm run check`、`npm run typecheck` 全通过。需明确：当时计划文档 §1 的 P1-2「宿主 usage 校准 + 上限双检」在 0.1.13 中尚未实现（已在 0.1.14 补齐，见上），P1-3「编辑 diff/审计/最小回滚、审批/签名」仍未实现，不因回归用例转绿而结案；§2 的 I-3~I-9 同样仍是待排期项。
 
 ### 修复
 

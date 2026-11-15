@@ -18,3 +18,10 @@ export function sessionDirectory(sessionId: string): string {
 export function sessionMirrorPath(sessionId: string): string {
 	return path.join(sessionDirectory(sessionId), CLM_MIRROR_FILENAME);
 }
+
+/** Canary log file inside the same private per-session directory as the mirror. */
+export const CLM_CANARY_FILENAME = "CANARY.jsonl";
+
+export function sessionCanaryPath(sessionId: string): string {
+	return path.join(sessionDirectory(sessionId), CLM_CANARY_FILENAME);
+}
