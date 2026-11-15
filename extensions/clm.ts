@@ -63,8 +63,10 @@ interface Config {
 	maxMirrorChars: number;
 	/** `r` in `r·L + (1−r)·B`, as a fraction: the cached-read price ratio. */
 	cacheDiscount: number;
-	/** Turns the one-time prefix-break cost is amortised over. */
+	/** Future requests (steps) the one-time prefix-break cost is amortised over. */
 	paybackTurns: number;
+	/** Explicit request horizon overriding `paybackTurns`; 0 = not set. */
+	paybackSteps: number;
 	/** Steps since the last applied cleanup that trigger a nudge. 0 disables. */
 	triggerSince: number;
 	/** toolResult share (0..1) of editable tokens that triggers a nudge. 0 disables. */
@@ -96,8 +98,12 @@ function config(ctx: ExtensionContext): Config {
 		// vs cacheRead $0.006/M. Lower is the fail-safe direction.
 		cacheDiscount: loaded.config.cleanup.cacheDiscountPercent / 100,
 		paybackTurns: loaded.config.cleanup.paybackTurns,
-		// Host-independent triggers. Both default off.
-		triggerSince: loaded.config.cleanup.trigger.turnsSinceCleanup,
+		paybackSteps: loaded.config.cleanup.paybackSteps,
+		// Host-independent triggers. Both default off. Pi counts requests (one per
+		// step), so the step clock is the one it can actually observe; the turn
+		// clock stays available for configs shared with a turn-aware host.
+		triggerSince: loaded.config.cleanup.trigger.stepsSinceCleanup
+			|| loaded.config.cleanup.trigger.turnsSinceCleanup,
 		triggerToolShare: loaded.config.cleanup.trigger.toolResultSharePercent / 100,
 	};
 }
@@ -493,15 +499,20 @@ function contextBudgetNudge(
 		usageTokens: tokens,
 		...(budget > 0 ? { contextWindow: budget } : hostWindow > 0 ? { contextWindow: hostWindow } : {}),
 		exactUsage: hostUsage !== undefined,
-		completedTurns: state.completedSteps,
-		...(state.lastCleanupStep !== undefined ? { lastCleanupTurn: state.lastCleanupStep } : {}),
-		currentTurn: state.completedSteps + 1,
+		// Pi commits one request per step, so it reports the step clock and leaves
+		// the turn clock to a host that actually counts turns. Passing steps as
+		// "turns" used to make a `completedTurns` threshold silently 17x stricter.
+		completedTurns: 0,
+		completedSteps: state.completedSteps,
+		...(state.lastCleanupStep !== undefined ? { lastCleanupStep: state.lastCleanupStep } : {}),
+		currentStep: state.completedSteps + 1,
 	}, {
 		...(budget > 0 ? { usagePercent: CONTEXT_NUDGE_FRACTION * 100 } : {}),
-		turnsSinceCleanup: settings.triggerSince,
+		stepsSinceCleanup: settings.triggerSince,
 		toolResultShare: settings.triggerToolShare,
 		cacheDiscount: settings.cacheDiscount,
 		paybackTurns: settings.paybackTurns,
+		paybackSteps: settings.paybackSteps,
 	});
 	let payload: CleanupTriggerPlan | undefined = plan.triggered ? plan : undefined;
 	if (!payload) {
@@ -510,6 +521,7 @@ function contextBudgetNudge(
 		const assembled = assembleCleanupCandidates(records, {
 			cacheDiscount: settings.cacheDiscount,
 			paybackTurns: settings.paybackTurns,
+			paybackSteps: settings.paybackSteps,
 		});
 		const best = assembled.candidates[0];
 		if (best) {
@@ -540,7 +552,7 @@ function contextBudgetNudge(
 		...(budget > 0 ? { contextWindow: budget } : hostWindow > 0 ? { contextWindow: hostWindow } : {}),
 		exact: hostUsage !== undefined,
 		editableBlocks: editable.length,
-		...(state.lastCleanupStep !== undefined ? { lastCleanupTurn: state.lastCleanupStep } : {}),
+		...(state.lastCleanupStep !== undefined ? { lastCleanupStep: state.lastCleanupStep } : {}),
 		turnWord: "step",
 	});
 	const candidates = renderCleanupCandidates(payload);

@@ -4,7 +4,7 @@ Pi extension + DSH/Cordis plugin。DSH 侧默认关闭一条**自动清理**通�
 
 ## 自动清理（DSH，默认关闭）
 
-`autoClear.enabled: true` 时每个 `turn/end` 结算一次：只清被同一目标后续调用取代的块，闸门 1200 token 或 2 块，占用 ≥60% 停手交给宿主 compaction，重读率过高会熔断。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
+`autoClear.enabled: true` 时每个 `turn/end` 结算一次：只清被同一目标后续调用取代的块，闸门 1200 token 或 2 块，占用 ≥60% 停手交给宿主 compaction，重读率过高会熔断。结算点留在 turn 边界是因为一次断点要摊到整批块上（实测 4.4 块/批 vs 按步 2.3 块/批，同样的内容多付 31% 重算）；`autoClear.midTurnSuffixTokens` 可单独放开“尾部极短且一个请求内回本”的单块例外，而计时器（`completedSteps` / `stepsSinceCleanup` / `stepsOld`）按步数计。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
 
 ## 手动通道：mirror 与 cleanup
 
@@ -105,7 +105,7 @@ cleanup({ list: "3-16" })
   "cleanup": {
     "cacheDiscountPercent": 2,
     "paybackTurns": 10,
-    "trigger": { "usagePercent": 70 }
+    "trigger": { "usagePercent": 70, "stepsSinceCleanup": 40 }
   },
   "autoClear": { "enabled": false, "canary": false }
 }
@@ -126,11 +126,14 @@ cleanup({ list: "3-16" })
 | `index.refreshSteps` | `4` | 同一 turn 内最多每几步重渲染一次；`1` 为每步刷新。 |
 | `cleanup.resultMode` | `compact` | DSH 结果模式：`compact` / `full` / `none`。 |
 | `cleanup.cacheDiscountPercent` | `2` | 缓存命中价占全价的百分比（`2` = 1/50），即候选成本公式中的 `r`。 |
-| `cleanup.paybackTurns` | `10` | 断点成本摊到几轮，即公式中的 `N`。 |
+| `cleanup.paybackTurns` | `10` | 断点成本摊到**多少次后续请求**（一次请求 = 一步），即公式中的 `N`。按轮理解会高估成本：一个 turn 实测 11–39 步。 |
+| `cleanup.paybackSteps` | `0` | 显式请求数（horizon），覆盖 `paybackTurns`；`0` = 不设。 |
 | `cleanup.trigger.usagePercent` | `0` | 用量达到窗口百分比时触发候选；`0` 关闭。 |
-| `cleanup.trigger.completedTurns` | `0` | 已完成 turn 数达到该值时触发。 |
+| `cleanup.trigger.completedTurns` | `0` | 已完成 turn 数达到该值时触发。turn 太粗（实测 11–39 步），优先用 `completedSteps`。 |
+| `cleanup.trigger.completedSteps` | `0` | 已完成 step（请求）数达到该值时触发。 |
 | `cleanup.trigger.toolResultSharePercent` | `0` | toolResult 占可编辑 token 的百分比达到该值时触发。 |
 | `cleanup.trigger.turnsSinceCleanup` | `0` | 距上次成功清理的 turn 数达到该值时触发。 |
+| `cleanup.trigger.stepsSinceCleanup` | `0` | 距上次成功清理的 step 数达到该值时触发。 |
 | `cleanup.trigger.maxCandidates` | `3` | 一次触发最多给出的候选区间数。 |
 | `cleanup.trigger.minSavingsTokens` | `0` | 小于该估算 token 的 turn 不作为候选。 |
 | `autoClear.enabled` | `false` | 真正清理：把被取代的 tool result 换成重取指针。 |
@@ -139,11 +142,14 @@ cleanup({ list: "3-16" })
 | `autoClear.minBlocks` | `2` | 或者至少这么多个死块。 |
 | `autoClear.stopPercent` | `60` | 占用达到窗口百分比即停手，交给宿主 compaction。 |
 | `autoClear.maxTokens` | `40000` | 单会话累计清理上限。 |
+| `autoClear.midTurnSuffixTokens` | `0` | 允许在 turn 内清理：死块之后待重算的尾部 ≤ 该 token 数，且该次断点在下一请求内回本。`0` 关闭。 |
 | `host.pluginRecordModule` | `@deepseek-ai/dsh-session` | 提供 `appendPluginRecord` seam 的宿主模块；高级/测试用。 |
 
 自动清理的记录必须是宿主可忽略的 plugin record，所以它需要宿主提供 `appendPluginRecord`（`@deepseek-ai/dsh-session` ≥ 0.2.2-rc.1）。解析不到该 seam 时插件不会退回 `session.append()`（那会让含记录的会话在重启后被宿主拒绝恢复），而是保持关闭：会话创建时 warn 一次，`/clm` 显示 `stopped (unrecordable)`。`autoClear.canary` 只写 `/tmp/clm-<session>/CANARY.jsonl`，不需要该 seam。
 
-所有触发阈值默认关闭（`0`）。命中后只在该 turn 边界装配一次用量行和候选；候选只取已完成的 turn，按断点后的净收益排序，并固定带 `skipRoles: ["user"]`。Pi 侧另认 `cleanup.trigger.turnsSinceCleanup` 与 `cleanup.trigger.toolResultSharePercent`，预算 nudge 与 DSH 共用同一套用量行/候选格式。
+所有触发阈值默认关闭（`0`）。命中后只在该 turn 边界装配一次用量行和候选；候选只取已完成的 turn，按断点后的净收益排序，并固定带 `skipRoles: ["user"]`。Pi 侧另认 `cleanup.trigger.stepsSinceCleanup`（回退 `turnsSinceCleanup`）与 `cleanup.trigger.toolResultSharePercent`，预算 nudge 与 DSH 共用同一套用量行/候选格式。
+
+**计数单位**：陈旧度信号（`completedSteps` / `stepsSinceCleanup` / 候选的 `stepsOld` / 摊销 `N`）按 step 计，因为一个 turn 实测 11–39 步；批次结算、闸门、预算和候选区间仍按 turn，因为一次断点必须摊到多个块上。实测依据见 [自动清理](./docs/features/auto-clear.md#结算点为什么批次价格按-turn-算)。
 
 ## DSH 适配
 

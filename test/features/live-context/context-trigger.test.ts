@@ -76,11 +76,11 @@ test("cleanup candidates never suggest deleting a user message", () => {
 	const single = renderCleanupCandidates({
 		triggered: true,
 		signals: ["1 completed turn ≥ 1"],
-		candidates: [{ start: 5, end: 5, tokens: 12, suffixTokens: 0, netTokens: 12, turnsOld: 1 }],
+		candidates: [{ start: 5, end: 5, tokens: 12, suffixTokens: 0, netTokens: 12, turnsOld: 1, stepsOld: 1 }],
 		savingsTokens: 12,
 	});
 	assert.match(single, /ranges: \["5"\]/);
-	assert.match(single, /Candidates: 5 \(~12 tok freed, 1 turn old, 0 tok after the break, net ~12\)/);
+	assert.match(single, /Candidates: 5 \(~12 tok freed, 1 step old, 0 tok after the break, net ~12\)/);
 	assert.doesNotMatch(single, /5-5/);
 });
 
@@ -223,5 +223,98 @@ test("usage line marks the estimate and an unknown window instead of guessing", 
 	assert.equal(
 		formatUsageLine({ tokens: 640, exact: false, editableBlocks: 1 }),
 		"Usage: ~640 tokens (window unknown) · 1 editable block · no cleanup yet",
+	);
+});
+
+/**
+ * Replayed DSH sessions average 17.5 steps per turn (p50 11, p90 39, max 150), so
+ * a turn threshold names a range rather than a point. The step clock is the one
+ * the adapters can measure per request; the turn clock stays for configs shared
+ * with a host that counts turns.
+ */
+test("the step clock fires independently of the turn clock", () => {
+	const plan = planCleanupTrigger(records(), {
+		completedTurns: 2,
+		completedSteps: 61,
+		lastCleanupStep: 9,
+		currentStep: 62,
+	}, { completedSteps: 40, stepsSinceCleanup: 50 });
+	assert.equal(plan.triggered, true);
+	assert.deepEqual(plan.signals, ["61 completed steps ≥ 40", "53 steps since cleanup ≥ 50"]);
+
+	const quiet = planCleanupTrigger(records(), {
+		completedTurns: 2,
+		completedSteps: 12,
+		lastCleanupStep: 10,
+		currentStep: 13,
+	}, { completedSteps: 40, stepsSinceCleanup: 50 });
+	assert.equal(quiet.triggered, false, "a step threshold below the count must stay silent");
+	assert.deepEqual(quiet.signals, []);
+});
+
+test("candidate age is counted in steps and ranks ahead of the turn count", () => {
+	// Both completed turns are 1 turn old; only the step count separates them.
+	const aged = [
+		record("0", "user", "protected", { protected: true }),
+		record("1", "assistant", "anchor block"),
+		record("2", "user", "the older request"),
+		record("3", "toolResult", "A".repeat(8_000), { toolCallId: "call-a" }),
+		record("4", "user", "the newer request"),
+		record("5", "toolResult", "B".repeat(8_000), { toolCallId: "call-b" }),
+		record("6", "user", "open turn"),
+	];
+	const plan = planCleanupTrigger(aged, { completedTurns: 2 }, {
+		completedTurns: 1,
+		maxCandidates: 2,
+		// r = 1: the break is free, so the tie-break decides the order.
+		cacheDiscount: 1,
+	});
+	assert.equal(plan.triggered, true);
+	// Same weight, so the finer clock decides — and it keeps the turn tie-break's
+	// direction: the older, more settled turn wins.
+	assert.deepEqual(plan.candidates.map((candidate) => [candidate.start, candidate.stepsOld]), [[2, 1], [4, 0]]);
+	assert.match(renderCleanupCandidates(plan), /2-3 \(~\d+ tok freed, 1 step old/);
+	assert.match(renderCleanupCandidates(plan), /4-5 \(~\d+ tok freed, 0 steps old/);
+});
+
+test("the amortisation horizon is a count of requests, and paybackSteps overrides it", () => {
+	// A 20k body under a 20k tail: at r = 0.1 the break costs 18k and each request
+	// saves 2k, so 9 requests pay it back. 10 (the default) barely clears; 5 does not.
+	const args = [
+		record("0", "user", "protected", { protected: true }),
+		record("1", "assistant", "anchor block"),
+		record("2", "user", "an old request"),
+		record("3", "toolResult", "A".repeat(20_000), { toolCallId: "call-a" }),
+		record("4", "user", `${"T".repeat(20_000)} open turn`),
+	];
+	const defaultHorizon = planCleanupTrigger(args, { completedTurns: 1 }, { completedTurns: 1, cacheDiscount: 0.1 });
+	const shortHorizon = planCleanupTrigger(args, { completedTurns: 1 }, {
+		completedTurns: 1,
+		cacheDiscount: 0.1,
+		paybackSteps: 5,
+	});
+	assert.equal(defaultHorizon.candidates.length, 1, "the default 10 requests just pays the break back");
+	assert.deepEqual(shortHorizon.candidates, [], "five requests do not pay it back");
+});
+
+test("the usage line shows the step beside the turn when both are known", () => {
+	assert.equal(
+		formatUsageLine({ tokens: 6_400, contextWindow: 8_000, exact: true, editableBlocks: 6, lastCleanupTurn: 4 }),
+		"Usage: 6.4k/8k tokens (80%) · 6 editable blocks · last cleanup at turn 4",
+	);
+	assert.equal(
+		formatUsageLine({
+			tokens: 6_400,
+			contextWindow: 8_000,
+			exact: true,
+			editableBlocks: 6,
+			lastCleanupTurn: 4,
+			lastCleanupStep: 53,
+		}),
+		"Usage: 6.4k/8k tokens (80%) · 6 editable blocks · last cleanup at turn 4 (step 53)",
+	);
+	assert.equal(
+		formatUsageLine({ tokens: 640, exact: false, editableBlocks: 1, lastCleanupStep: 7, turnWord: "step" }),
+		"Usage: ~640 tokens (window unknown) · 1 editable block · last cleanup at step 7",
 	);
 });

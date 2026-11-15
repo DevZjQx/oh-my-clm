@@ -25,12 +25,22 @@ export type ClmCleanupResultMode = "compact" | "full" | "none";
 export interface ClmTriggerConfig {
 	/** Usage percentage at which a cleanup candidate is offered; 0 disables. */
 	usagePercent: number;
-	/** Completed turns at which a candidate is offered; 0 disables. */
+	/**
+	 * Completed turns at which a candidate is offered; 0 disables.
+	 *
+	 * A turn is the coarsest clock the host has: replayed DSH sessions average
+	 * 17.5 steps per turn (p50 11, p90 39, max 150), so a turn threshold is a
+	 * range, not a point. Prefer {@link completedSteps}.
+	 */
 	completedTurns: number;
+	/** Completed steps (requests) at which a candidate is offered; 0 disables. */
+	completedSteps: number;
 	/** toolResult share of editable tokens, as a percentage; 0 disables. */
 	toolResultSharePercent: number;
 	/** Turns since the last applied cleanup; 0 disables. */
 	turnsSinceCleanup: number;
+	/** Steps (requests) since the last applied cleanup; 0 disables. */
+	stepsSinceCleanup: number;
 	/** Maximum candidate ranges offered in one payload. */
 	maxCandidates: number;
 	/** Turns below this estimated size are not candidates. */
@@ -42,6 +52,13 @@ export interface ClmCleanupConfig {
 	resultMode: ClmCleanupResultMode;
 	/** Cached-read price as a percentage of an uncached read (`2` = 1/50). */
 	cacheDiscountPercent: number;
+	/**
+	 * Amortisation horizon of the one-time prefix-break cost, counted in future
+	 * requests (steps). `0` keeps {@link paybackTurns} as that many requests —
+	 * the conservative reading, because one turn is 11–39 requests and no
+	 * session promises to run that long.
+	 */
+	paybackSteps: number;
 	/** Turns the one-time prefix-break cost is amortised over. */
 	paybackTurns: number;
 	trigger: ClmTriggerConfig;
@@ -58,6 +75,18 @@ export interface ClmAutoClearConfig {
 	stopPercent: number;
 	/** Cumulative tokens one session may clear. */
 	maxTokens: number;
+	/**
+	 * Free a candidate before the turn boundary when at most this many
+	 * model-visible tokens sit after it; `0` disables mid-turn passes.
+	 *
+	 * A clear breaks the prefix cache at the cleared block, so the one-time cost
+	 * is the tail behind it. The budget alone never triggers a pass: each
+	 * candidate must also pay for that break within one more request
+	 * (`earlyClearPays`). On the default `cacheDiscountPercent: 2` no replayed
+	 * in-turn dead block qualifies, so leave this at `0` unless a measured
+	 * endpoint with weak cache discount (r ≳ 0.1) asks for it.
+	 */
+	midTurnSuffixTokens: number;
 }
 
 export interface ClmIndexConfig {
@@ -113,12 +142,15 @@ export const DEFAULT_CLM_CONFIG: ClmConfig = {
 	cleanup: {
 		resultMode: "compact",
 		cacheDiscountPercent: 2,
+		paybackSteps: 0,
 		paybackTurns: 10,
 		trigger: {
 			usagePercent: 0,
 			completedTurns: 0,
+			completedSteps: 0,
 			toolResultSharePercent: 0,
 			turnsSinceCleanup: 0,
+			stepsSinceCleanup: 0,
 			maxCandidates: 3,
 			minSavingsTokens: 0,
 		},
@@ -130,6 +162,7 @@ export const DEFAULT_CLM_CONFIG: ClmConfig = {
 		minBlocks: 2,
 		stopPercent: 60,
 		maxTokens: 40_000,
+		midTurnSuffixTokens: 0,
 	},
 	host: {
 		pluginRecordModule: "@deepseek-ai/dsh-session",
@@ -332,13 +365,16 @@ export function parseClmConfig(
 	if (cleanup) {
 		config.cleanup.resultMode = readEnum(cleanup, "resultMode", ["compact", "full", "none"] as const, config.cleanup.resultMode, source, "cleanup.resultMode", warnings);
 		config.cleanup.cacheDiscountPercent = readNumber(cleanup, "cacheDiscountPercent", config.cleanup.cacheDiscountPercent, source, "cleanup.cacheDiscountPercent", warnings, { min: 0, max: 100 });
+		config.cleanup.paybackSteps = readNumber(cleanup, "paybackSteps", config.cleanup.paybackSteps, source, "cleanup.paybackSteps", warnings, { min: 0, integer: true });
 		config.cleanup.paybackTurns = readNumber(cleanup, "paybackTurns", config.cleanup.paybackTurns, source, "cleanup.paybackTurns", warnings, { min: 1 });
 		const trigger = group(cleanup, "trigger", source, warnings);
 		if (trigger) {
 			config.cleanup.trigger.usagePercent = readNumber(trigger, "usagePercent", config.cleanup.trigger.usagePercent, source, "cleanup.trigger.usagePercent", warnings, { min: 0, max: 100 });
 			config.cleanup.trigger.completedTurns = readNumber(trigger, "completedTurns", config.cleanup.trigger.completedTurns, source, "cleanup.trigger.completedTurns", warnings, { min: 0 });
+			config.cleanup.trigger.completedSteps = readNumber(trigger, "completedSteps", config.cleanup.trigger.completedSteps, source, "cleanup.trigger.completedSteps", warnings, { min: 0, integer: true });
 			config.cleanup.trigger.toolResultSharePercent = readNumber(trigger, "toolResultSharePercent", config.cleanup.trigger.toolResultSharePercent, source, "cleanup.trigger.toolResultSharePercent", warnings, { min: 0, max: 100 });
 			config.cleanup.trigger.turnsSinceCleanup = readNumber(trigger, "turnsSinceCleanup", config.cleanup.trigger.turnsSinceCleanup, source, "cleanup.trigger.turnsSinceCleanup", warnings, { min: 0 });
+			config.cleanup.trigger.stepsSinceCleanup = readNumber(trigger, "stepsSinceCleanup", config.cleanup.trigger.stepsSinceCleanup, source, "cleanup.trigger.stepsSinceCleanup", warnings, { min: 0, integer: true });
 			config.cleanup.trigger.maxCandidates = readNumber(trigger, "maxCandidates", config.cleanup.trigger.maxCandidates, source, "cleanup.trigger.maxCandidates", warnings, { min: 1, integer: true });
 			config.cleanup.trigger.minSavingsTokens = readNumber(trigger, "minSavingsTokens", config.cleanup.trigger.minSavingsTokens, source, "cleanup.trigger.minSavingsTokens", warnings, { min: 0 });
 		}
@@ -352,6 +388,7 @@ export function parseClmConfig(
 		config.autoClear.minBlocks = readNumber(autoClear, "minBlocks", config.autoClear.minBlocks, source, "autoClear.minBlocks", warnings, { min: 1, integer: true });
 		config.autoClear.stopPercent = readNumber(autoClear, "stopPercent", config.autoClear.stopPercent, source, "autoClear.stopPercent", warnings, { min: 0, max: 100 });
 		config.autoClear.maxTokens = readNumber(autoClear, "maxTokens", config.autoClear.maxTokens, source, "autoClear.maxTokens", warnings, { min: 1 });
+		config.autoClear.midTurnSuffixTokens = readNumber(autoClear, "midTurnSuffixTokens", config.autoClear.midTurnSuffixTokens, source, "autoClear.midTurnSuffixTokens", warnings, { min: 0, integer: true });
 	}
 
 	const host = group(document, "host", source, warnings);

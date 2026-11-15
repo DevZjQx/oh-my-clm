@@ -164,18 +164,94 @@ function currentTurnNumber(session) {
     const epoch = dshBlockIndexEpoch(session);
     return epoch.turn ?? epoch.closedTurns + 1;
 }
+/**
+ * Step (request) a cleanup applied right now is reported under. Same monotonicity
+ * argument as {@link currentTurnNumber}: between steps the upcoming step is
+ * `closedSteps + 1`, so "steps since cleanup" never resets.
+ */
+function currentStepNumber(session) {
+    const epoch = dshBlockIndexEpoch(session);
+    return epoch.closedSteps + 1;
+}
+/**
+ * Estimated model-visible tokens that sit *after* one surface node.
+ *
+ * This is the one-time cost of clearing that node outside a turn boundary: the
+ * prefix stays cached up to it, and everything behind it is re-read at full
+ * price on the next request. Zero means the node is the tail, so clearing it
+ * breaks nothing — the only mid-turn clear that needs no assumption about how
+ * long the turn will run.
+ *
+ * The estimate follows the projection: runtime-context snapshots are skipped, so
+ * a snapshot's own tokens are not counted as a tail the model cannot read.
+ */
+export function dshSurfaceTokensAfter(session, seq) {
+    return dshSurfaceTokensAfterEach(session, [seq]).get(seq) ?? 0;
+}
+/**
+ * {@link dshSurfaceTokensAfter} for several targets in one pass.
+ *
+ * A mid-turn check prices every candidate in the pool, so the surface is walked
+ * once and the per-node costs are turned into suffix sums; querying each target
+ * separately would re-estimate the whole tail for each one.
+ */
+export function dshSurfaceTokensAfterEach(session, seqs) {
+    const tails = new Map();
+    const nodes = session.surface?.nodes;
+    if (!Array.isArray(nodes)) {
+        for (const seq of seqs)
+            tails.set(seq, 0);
+        return tails;
+    }
+    const events = new Map(session.snapshotEvents().map((event) => [event.seq, event]));
+    const ordered = [];
+    for (const node of nodes) {
+        const event = events.get(node);
+        if (!event || !isSurfaceMessageEvent(event.type))
+            continue;
+        const message = messageForEvent(event);
+        if (!message)
+            continue;
+        const source = message.source;
+        if (isRecord(source) && source.kind === "runtime-context")
+            continue;
+        ordered.push({ node, tokens: estimateMessageTokens(message) });
+    }
+    // Suffix sums from the end: `after[i]` is everything strictly after entry i.
+    const after = new Array(ordered.length + 1).fill(0);
+    for (let index = ordered.length - 1; index >= 0; index -= 1) {
+        after[index] = (after[index + 1] ?? 0) + (ordered[index]?.tokens ?? 0);
+    }
+    for (const seq of seqs) {
+        // First entry whose node is greater than the target; nodes ascend in surface order.
+        let low = 0;
+        let high = ordered.length;
+        while (low < high) {
+            const mid = (low + high) >> 1;
+            if ((ordered[mid]?.node ?? 0) <= seq)
+                low = mid + 1;
+            else
+                high = mid;
+        }
+        tails.set(seq, after[low] ?? 0);
+    }
+    return tails;
+}
 /** Render the trigger options deterministically for the per-turn cache key. */
 function triggerSignature(options) {
     const trigger = options.trigger ?? {};
     return JSON.stringify([
         trigger.usagePercent ?? 0,
         trigger.completedTurns ?? 0,
+        trigger.completedSteps ?? 0,
         trigger.toolResultShare ?? 0,
         trigger.turnsSinceCleanup ?? 0,
+        trigger.stepsSinceCleanup ?? 0,
         trigger.maxCandidates ?? 0,
         trigger.minSavingsTokens ?? 0,
         trigger.cacheDiscount ?? 0,
         trigger.paybackTurns ?? 0,
+        trigger.paybackSteps ?? 0,
     ]);
 }
 /**
@@ -184,8 +260,11 @@ function triggerSignature(options) {
  * The payload is cached per (completed turns, trigger config): within a turn it
  * is byte-identical even as the host reports more usage, so DSH's runtime
  * context dedupe still appends one snapshot per turn rather than one per step.
- * Any applied edit clears the cache because removal renumbers the IDs; a
- * compaction is cleared by the host adapter.
+ * The step clocks are therefore sampled at the boundary — that is a sampling
+ * cadence, not a unit: a step threshold still compares real steps, while a turn
+ * threshold compares a number that is 11–39 steps wide (measured). Any applied
+ * edit clears the cache because removal renumbers the IDs; a compaction is
+ * cleared by the host adapter.
  */
 export function dshTriggerView(session, options, state, cleared) {
     const epoch = dshBlockIndexEpoch(session);
@@ -212,14 +291,18 @@ export function dshTriggerView(session, options, state, cleared) {
         exact: hostUsage !== undefined,
         editableBlocks: records.filter((record) => !record.protected).length,
         ...(state?.lastCleanupTurn !== undefined ? { lastCleanupTurn: state.lastCleanupTurn } : {}),
+        ...(state?.lastCleanupStep !== undefined ? { lastCleanupStep: state.lastCleanupStep } : {}),
     });
     const plan = planCleanupTrigger(records, {
         usageTokens,
         ...(contextWindow !== undefined ? { contextWindow } : {}),
         exactUsage: hostUsage !== undefined,
         completedTurns: epoch.closedTurns,
+        completedSteps: epoch.closedSteps,
         ...(state?.lastCleanupTurn !== undefined ? { lastCleanupTurn: state.lastCleanupTurn } : {}),
+        ...(state?.lastCleanupStep !== undefined ? { lastCleanupStep: state.lastCleanupStep } : {}),
         currentTurn: epoch.turn ?? epoch.closedTurns + 1,
+        currentStep: epoch.closedSteps + 1,
     }, options.trigger ?? {});
     const candidateText = renderCleanupCandidates(plan);
     if (state)
@@ -601,6 +684,7 @@ export function executeDshCleanup(session, targets, options, io, state) {
             state.blockIndex = undefined;
             state.trigger = undefined;
             state.lastCleanupTurn = currentTurnNumber(session);
+            state.lastCleanupStep = currentStepNumber(session);
         }
         const nextRecords = buildDshMirrorRecords(session, options);
         if (io) {
@@ -676,6 +760,7 @@ export function reconcileDshMirror(state, session, io, options) {
             state.blockIndex = undefined;
             state.trigger = undefined;
             state.lastCleanupTurn = currentTurnNumber(session);
+            state.lastCleanupStep = currentStepNumber(session);
         }
     }
     const rendered = renderMirror(records);

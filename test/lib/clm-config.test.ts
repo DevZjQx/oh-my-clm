@@ -134,3 +134,39 @@ test("unknown keys are ignored for forward compatibility", () => {
 	assert.equal(parsed.config.context.budgetTokens, 1_000);
 	assert.deepEqual(parsed.warnings, []);
 });
+
+test("step clocks and the request horizon are their own keys, defaulting off", () => {
+	assert.equal(DEFAULT_CLM_CONFIG.cleanup.trigger.completedSteps, 0);
+	assert.equal(DEFAULT_CLM_CONFIG.cleanup.trigger.stepsSinceCleanup, 0);
+	assert.equal(DEFAULT_CLM_CONFIG.cleanup.paybackSteps, 0);
+	assert.equal(DEFAULT_CLM_CONFIG.autoClear.midTurnSuffixTokens, 0);
+
+	const parsed = parseClmConfig({
+		cleanup: {
+			paybackSteps: 40,
+			trigger: { completedSteps: 60, stepsSinceCleanup: 25, completedTurns: 2, turnsSinceCleanup: 1 },
+		},
+		autoClear: { midTurnSuffixTokens: 512 },
+	}, DEFAULT_CLM_CONFIG, "steps.json");
+	assert.deepEqual(parsed.warnings, []);
+	assert.equal(parsed.config.cleanup.paybackSteps, 40);
+	assert.equal(parsed.config.cleanup.trigger.completedSteps, 60);
+	assert.equal(parsed.config.cleanup.trigger.stepsSinceCleanup, 25);
+	// The turn clocks keep working: a config shared with a turn-aware host is not
+	// silently rewritten into the step unit.
+	assert.equal(parsed.config.cleanup.trigger.completedTurns, 2);
+	assert.equal(parsed.config.cleanup.trigger.turnsSinceCleanup, 1);
+	assert.equal(parsed.config.autoClear.midTurnSuffixTokens, 512);
+
+	const bad = parseClmConfig({
+		cleanup: { paybackSteps: 1.5, trigger: { completedSteps: -1 } },
+		autoClear: { midTurnSuffixTokens: "some" },
+	}, DEFAULT_CLM_CONFIG, "bad-steps.json");
+	const steps = bad.config as typeof bad.config;
+	assert.equal(steps.cleanup.paybackSteps, 0, "a fractional request horizon is a typo, not a value");
+	assert.equal(steps.cleanup.trigger.completedSteps, 0);
+	assert.equal(steps.autoClear.midTurnSuffixTokens, 0);
+	assert.ok(bad.warnings.some((warning) => warning.includes("cleanup.paybackSteps")));
+	assert.ok(bad.warnings.some((warning) => warning.includes("cleanup.trigger.completedSteps")));
+	assert.ok(bad.warnings.some((warning) => warning.includes("autoClear.midTurnSuffixTokens")));
+});

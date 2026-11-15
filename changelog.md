@@ -4,7 +4,7 @@
 
 ## 未发布
 
-新增 DSH 侧**自动清理**通道，默认关闭：turn 边界把"被同一目标后续调用取代"的 tool-result 块换成一行重取指针。并把全部 `CLM_*` 环境变量迁移到 JSON 配置文件。`npm test` 183/183、host harness 130/130、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
+新增 DSH 侧**自动清理**通道，默认关闭：turn 边界把"被同一目标后续调用取代"的 tool-result 块换成一行重取指针。并把全部 `CLM_*` 环境变量迁移到 JSON 配置文件。`npm test` 192/192、host harness 140/140、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
 
 - **环境变量全部移除，改为配置文件。** 配置按会话工作目录解析：用户级 `$XDG_CONFIG_HOME/oh-my-clm/config.json`（未设或非绝对路径时退到 `~/.config/oh-my-clm/config.json`），项目级 `<cwd>/.oh-my-clm.json` 逐 key 覆盖。`src/lib/clm-config.ts` 负责读取、合并、类型校验与 warning；非法值只回退对应 key，不会让 mirror/cleanup 整体失效。原先 25 个 `CLM_*` 变量映射为分组字段，例如 `CLM_CONTEXT_BUDGET` → `context.budgetTokens`、`CLM_INDEX_MODE` → `index.mode`、`CLM_TRIGGER_PCT` → `cleanup.trigger.usagePercent`、`CLM_AUTO_CLEAR` → `autoClear.enabled`。每次调用重新读文件，因此 `/clm status` 与运行中的 A/B 不再需要重启宿主；`/clm mode` 仍是进程级临时覆盖。DSH 的 `appendPluginRecord` seam 改为按会话配置 (`host.pluginRecordModule`) 异步解析：解析期间跳过本轮，无 seam 时锁存 `stopped (unrecordable)` 并 warn 一次。`XDG_CONFIG_HOME` 只决定用户级文件的位置（标准 XDG 语义，非插件开关）；测试与 harness 把它指向临时目录，因此套件不再受机器上已有的用户配置影响（此前一份 `~/.config/oh-my-clm/config.json` 就能让 `npm test` 失败）。新增 `test/lib/clm-config.test.ts`（默认值、逐 key 覆盖、非法值回退、坏 JSON、未知 key、用户级文件被项目级按 key 覆盖、XDG 绝对/相对路径）。
 
@@ -21,6 +21,12 @@
 - **离线标定。** `npm run canary:replay` 让同一个选择器跑已存会话（现在是 peek/retire 语义，即真实清理行为）：12 个最大的真实会话（1.33M tool-result token）里 8 个有候选、14 个边界出批次、11 个过闸门、合计 124,669 token、最大单批 73,646；4 个会话 0 候选。这条数字决定了闸门取 1200 而不是 8k。脚本随包发布（`files` 含 `scripts/canary-replay.mjs`），需 PATH 上有 `zstd`，缺失时报错带安装提示。
 - **回归。** 选择器单测 20 条（含 peek 不消费、retire、按 seq retire、预算切片）、投影单测 10 条（含 compaction 陈旧目标、已清目标收敛、陈旧与存活目标同批、陈旧目标畸形不致命）、harness 新增第 12/13 节：被跳过的批次在下一个边界累积生效、陈旧目标不致致命、无 seam 宿主不写事件且 `/clm` 报 `stopped (unrecordable)`、加载时 warn 一次。
 - **自动清理只落 DSH，Pi 只做配置迁移。** 自动清理通道一行都没进 Pi：两边的提交时机与 seam 不同（Pi 是 `turn_end` + mirror 改写，DSH 是 log-only 记录 + 消息投影）。`extensions/clm.ts` 本版唯一改动是把 `CLM_*` 环境变量换成 `loadClmConfig(ctx.cwd)`，行为不变——它读的正是同一组字段（`context.budgetTokens`、`context.maxBlockChars`、`cleanup.cacheDiscountPercent` 等），`session_start` 多报一条配置 warning。
+
+- **在 273 个真实 DSH 会话上标定了“按步还是按轮”（2026-11-16）。** 579 turn / 10,142 step：一个 turn 平均 **17.5 步**（p50 11、p90 39、max 150），step 与 tool result 之比 1.00。按同一选择器离线重放：同 turn 内死亡 719 个死块（1.22M token，占全部死亡 token 的 81%），它们平均还要在 turn 里挂 7 步（p90 24）；但把结算点从 `turn/end` 挪到 `step/end`，批次从 116 次涨到 218 次（+88%），同样的内容多付 **31%** 的断点尾长（6.88M → 9.05M），逐块按 `remaining × r × D − (1−r) × suffix` 算，`r = 0.02` 时 **0/719** 提前清划算（`r = 0.1` 才 18 个）。结论落成两半：**计时器按步，执行点按轮**。
+- **新增按步计数的计时器。** `cleanup.trigger.completedSteps`、`cleanup.trigger.stepsSinceCleanup`（与保留的 `completedTurns` / `turnsSinceCleanup` 并存）、候选的 `stepsOld`（按 turn 之后的 tool result 计数，实测 1.00/步）以及用量行 `last cleanup at turn 4 (step 53)`。候选排序的最终 tie-break 从 `turnsOld` 换成 `stepsOld`，方向不变（更老更稳的先清）。Pi 侧此前把 `completedSteps` 塞进 `completedTurns`，于是 `completedTurns` 阈值实际被放大 17 倍才命中；现在各归各位，Pi 报 step 时钟、DSH 报两者。
+- **摊销口径改成“请求数”。** `paybackTurns` 的 `N` 除以的是后续请求次数（租按请求收，断点只付一次），按轮理解会把成本高估一个 steps-per-turn；新增 `cleanup.paybackSteps` 显式覆盖。默认值仍取保守的 10 个请求，不替用户假设长 run。
+- **新增 `autoClear.midTurnSuffixTokens`（默认 0 关闭）。** 唯一允许在 turn 内清理的形态：死块之后待重算的尾部 ≤ 该值，且 `earlyClearPays()` 要求这次断点在下一个请求内回本；每个 turn 最多一次，闸门绕过、`stop`/预算/投影/熔断照旧，canary 账本多写 `step`。默认关闭的理由写在文档里：默认 `r = 0.02` 下没有真实死块能过回本测试。
+- **回归。** 新增 9 条单测（step 时钟独立触发、`stepsOld` 排序与渲染、`paybackSteps` 覆盖、用量行 step 戳、`earlyClearPays` 边界含 `r = 1`/`r = NaN`、四个新配置 key 的默认值与非法值回退、`dshSurfaceTokensAfter` 的尾部度量且跳过 runtime-context 快照）；harness 新增第 13 节：turn 内的死块在尾部够短时被清、第二个候选被“每 turn 一次”的配额挡住并留给 `turn/end`、canary 记下 `step`。
 
 ## 0.1.18（当前版本）
 

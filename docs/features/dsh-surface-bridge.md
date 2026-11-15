@@ -57,7 +57,8 @@ node scripts/build-dsh-plugin.mjs --output ./out/oh-my-clm.tgz
 | `index.*` | 见 cleanup 文档 | block index 形状、尺寸与刷新节流。 |
 | `cleanup.trigger.*` | 全部 `0` | 清理触发阈值；默认关闭。 |
 | `cleanup.cacheDiscountPercent` | `2` | 缓存命中价百分比（`2` = 1/50）。 |
-| `cleanup.paybackTurns` | `10` | 断点成本摊到几轮。 |
+| `cleanup.paybackTurns` / `paybackSteps` | `10` / `0` | 断点成本摊到多少次后续请求（一步一次请求）；`paybackSteps > 0` 时覆盖。 |
+| `autoClear.midTurnSuffixTokens` | `0` | 允许单块在 turn 内清理的尾部上限；`0` 关闭。 |
 
 这些配置只影响 preview、shrink-only gate 的近似估算、索引或模型可见结果，不改变 DSH 的 context window。触发阈值、缓存计价与完整配置表见根 [README](../../README.md#配置)；索引开关见 [cleanup-tool.md](./cleanup-tool.md#配置)。
 
@@ -66,6 +67,7 @@ node scripts/build-dsh-plugin.mjs --output ./out/oh-my-clm.tgz
 - 真实 DSH profile 中的持久化、`session/flush`、restart recovery 与 fork/surface 语义；
 - sandboxed bash 是否共享宿主 `/tmp`；
 - 模型是否会在真实长任务中主动使用 turn-level `cleanup`；
+- `autoClear.midTurnSuffixTokens` 在 `step/end` 写清理记录：与已验证的 `turn/end` 写入走同一个 `appendPluginRecord`，但开启该开关（默认 `0`）前值得先在真实 profile 上跑一次；
 - 自定义 `source.kind` 在真实 profile 上的接受度。发版前需复核。
 - `cleanup.resultMode` 的 `full` / `none` 依赖 `execute` 返回的那个对象实例被原样交给 `render`：copy 模式放在按引用取值的 `WeakMap` 里（不能放进 value，否则过不了 `additionalProperties: false` 的输出 schema）。若某个宿主在校验后传给 `render` 的是副本，这两个模式会静默退回 `compact`；目前只在 mock harness 与单测（同一引用）上验证过。
 

@@ -850,7 +850,68 @@ section("12. clearing both sides of a skipped pass");
 	cleanup(session.id);
 }
 
-section("13. a host without the ignorable-record seam");
+section("13. mid-turn clearing is rationed and cost-gated");
+{
+	// A turn boundary shares one prefix break across a whole batch; a mid-turn
+	// pass pays its own. The switch therefore only fires when the tail behind the
+	// block is small and the break pays for itself within one more request, and
+	// only once per turn. `cacheDiscountPercent: 100` removes the break cost so the
+	// wiring is observable at all (at the 2% default no replayed block qualifies).
+	setHarnessSection("cleanup", { cacheDiscountPercent: 100 });
+	setHarnessAutoClear({ enabled: true, canary: true, midTurnSuffixTokens: 512 });
+	const session = sessionWithHistory("t-auto-clear-midturn");
+	const { host } = await boot(plugin, { sessionId: session.id, session });
+	const feed = async (type, data) => {
+		const appended = session.append(type, data);
+		await host.emit("session/event", session, { type, seq: appended.seq, data: appended.data });
+		return appended;
+	};
+	const records = () => session.events.filter((event) => event.type === "plugin:oh-my-clm/clear");
+	const big = "match ".repeat(900);
+	const small = "match ".repeat(4);
+	// Step 3 reads, step 4 re-reads the same target: the first block dies at the
+	// end of step 4, while the turn still has steps to run.
+	await feed("tool/call", { turn: 1, step: 3, callId: "call_mid_1", name: "grep", arguments: JSON.stringify({ pattern: "mid" }) });
+	await feed("tool/result", { turn: 1, step: 3, message: toolResultMessage("call_mid_1", big) });
+	await feed("tool/call", { turn: 1, step: 4, callId: "call_mid_2", name: "grep", arguments: JSON.stringify({ pattern: "mid" }) });
+	const replacement = await feed("tool/result", { turn: 1, step: 4, message: toolResultMessage("call_mid_2", small) });
+	check("nothing is cleared while the block is still live", records().length === 0, String(records().length));
+	await feed("step/end", { turn: 1, step: 4 });
+	const midTurn = records();
+	check("a cheap block is cleared inside the turn", midTurn.length === 1, String(midTurn.length));
+	check("the mid-turn record targets the superseded result", midTurn[0]?.data?.targets?.[0]?.label?.startsWith("grep "), JSON.stringify(midTurn[0]?.data?.targets ?? null));
+	check("the mid-turn record adds no surface node", midTurn[0] !== undefined && session.surfaceSeq.includes(midTurn[0].seq) === false);
+	check("the mid-turn record also carries an ignorable flag", midTurn.every((event) => event.ignorable === true), JSON.stringify(midTurn.map((event) => event.ignorable ?? null)));
+	check("the replacement read stays live behind the pointer", replacement !== undefined && records().length === 1);
+	const canaryFile = path.join("/tmp", `clm-${encodeURIComponent(session.id)}`, "CANARY.jsonl");
+	const midTurnLines = (readIfExists(canaryFile) ?? "").trim().split("\n").filter(Boolean);
+	let midTurnRecord = {};
+	try {
+		midTurnRecord = JSON.parse(midTurnLines.at(-1) ?? "{}");
+	} catch (error) {
+		midTurnRecord = { parseError: String(error) };
+	}
+	check("the canary ledger stamps the step a mid-turn pass ran in", midTurnRecord.step === 4 && midTurnRecord.turn === 1, JSON.stringify({ turn: midTurnRecord.turn, step: midTurnRecord.step }));
+
+	// A second dead block in the same turn waits for the boundary: one break per
+	// turn is the whole point of rationing the exception.
+	await feed("tool/call", { turn: 1, step: 5, callId: "call_mid_3", name: "grep", arguments: JSON.stringify({ pattern: "other" }) });
+	await feed("tool/result", { turn: 1, step: 5, message: toolResultMessage("call_mid_3", big) });
+	await feed("tool/call", { turn: 1, step: 6, callId: "call_mid_4", name: "grep", arguments: JSON.stringify({ pattern: "other" }) });
+	await feed("tool/result", { turn: 1, step: 6, message: toolResultMessage("call_mid_4", small) });
+	await feed("step/end", { turn: 1, step: 6 });
+	check("the second in-turn candidate is not cleared mid-turn", records().length === 1, String(records().length));
+	await feed("turn/end", { turn: 1 });
+	const afterBoundary = records();
+	check("the turn boundary clears what the ration held back", afterBoundary.length === 2, String(afterBoundary.length));
+	check("the boundary pass targets the later block", afterBoundary.at(-1)?.data?.targets?.[0]?.label?.startsWith("grep "), JSON.stringify(afterBoundary.at(-1)?.data?.targets ?? null));
+	host.disposeAll();
+	setHarnessAutoClear({ enabled: false, canary: false, midTurnSuffixTokens: 0 });
+	setHarnessSection("cleanup", { cacheDiscountPercent: 2 });
+	cleanup(session.id);
+}
+
+section("14. a host without the ignorable-record seam");
 {
 	// No seam means no durable record, so clearing must stay off rather than
 	// write an event this host's own persistence reader would refuse.

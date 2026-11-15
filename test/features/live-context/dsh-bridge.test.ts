@@ -12,6 +12,7 @@ import { sessionMirrorPath } from "../../../src/lib/clm-paths.ts";
 import {
 	buildDshMirrorRecords,
 	dshBlockIndexText,
+	dshSurfaceTokensAfter,
 	executeDshCleanup,
 	reconcileDshMirror,
 	renderDshBlockIndex,
@@ -812,7 +813,7 @@ test("plan §5.2 (case 11): usage line and cleanup candidates follow host usage 
 			triggered,
 			/Suggested cleanup \(usage 80% ≥ 70%\): cleanup\(\{ ranges: \["3-5"\], skipRoles: \["user"\] \}\) frees ~\d+ tok\./,
 		);
-		assert.match(triggered, /3-5 \(~\d+ tok freed, 1 turn old, \d+ tok after the break, net ~\d+\); block 1, user messages, and the current turn stay\./);
+		assert.match(triggered, /3-5 \(~\d+ tok freed, \d+ steps? old, \d+ tok after the break, net ~\d+\); block 1, user messages, and the current turn stay\./);
 		// The suggested call must keep the human's request inside its own range:
 		// a bare range would delete the user block that starts the turn.
 		const userBlock = buildDshMirrorRecords(session, bridgeOptions(String(session.id)))
@@ -1429,4 +1430,33 @@ test("plan §5.4 (case 13, DSH): offload replaces content instead of omitting th
 	assert.match(mirror, /\[\[CLM_ENTRY id=2 role=toolResult\]\]\n\[offloaded: README read\.\]\n\[\[\/CLM_ENTRY id=2\]\]/);
 	assert.match(mirror, /CLM_ENTRY id=1 role=assistant/);
 	assert.match(formatCleanupToolResult(result), /^cleanup applied; offloaded 1 block\(s\): 2\.$/);
+});
+
+/**
+ * A mid-turn clear re-prefills the tail behind the block, so the cost is what the
+ * *next* request has to read after that point — the replacement output and
+ * whatever else landed, not the body being removed.
+ */
+test("the surface tail behind a block is measured for a mid-turn clear", () => {
+	const session = dshSession("/workspace/tail", "dsh-tail");
+	const nodes = session.surface.nodes;
+	const last = nodes[nodes.length - 1];
+	assert.ok(last !== undefined);
+	assert.equal(dshSurfaceTokensAfter(session, last), 0, "nothing sits behind the tail");
+	const first = nodes[0];
+	assert.ok(first !== undefined);
+	assert.ok(
+		dshSurfaceTokensAfter(session, first) > dshSurfaceTokensAfter(session, nodes[1] ?? last),
+		"the tail shrinks as the block moves towards the end",
+	);
+
+	// A runtime-context snapshot is model-invisible to this plugin, so its tokens
+	// are not a tail anyone has to re-prefill.
+	(session.append as (type: string, data: unknown, options: unknown) => unknown)("user/message", {
+		id: "runtime-context-tail",
+		role: "user",
+		source: { kind: "runtime-context", form: "snapshot", sections: [{ name: "oh-my-clm:block-index", text: "x" }] },
+		content: [{ type: "text", text: `Snapshot that is ${"not a tail ".repeat(500)}` }],
+	}, { surfaceOp: { op: "append" } });
+	assert.equal(dshSurfaceTokensAfter(session, last), 0);
 });

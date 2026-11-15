@@ -5,6 +5,7 @@ import {
 	SupersessionTracker,
 	batchPassesGate,
 	describeCall,
+	earlyClearPays,
 	fitBatch,
 	parseToolArguments,
 	readWindowOf,
@@ -232,4 +233,25 @@ test("an oversized single block runs only as the first pass", () => {
 
 test("an empty batch never reaches the budget slicer", () => {
 	assert.equal(fitBatch({ candidates: [], tokens: 0 }, 40_000), undefined);
+});
+
+/**
+ * The turn boundary is free to wait for, so an early clear must pay for its own
+ * prefix break within one more request. Replayed sessions make that a rarely true
+ * statement: the replacement read lands behind the dead body, so the tail the
+ * clear has to re-prefill stays about the size of what it removes.
+ */
+test("an early clear is only worth it when one more request pays for its break", () => {
+	const body = 4_000;
+	// r = 0.02: the break costs 0.98 x the tail, the rent saves 0.02 x the body.
+	assert.equal(earlyClearPays(body, 0, 0.02), true, "a tail of nothing is free to break");
+	assert.equal(earlyClearPays(body, 100, 0.02), false, "100 tokens of tail already cost more than the rent");
+	assert.equal(earlyClearPays(body, body, 0.02), false, "the replacement read is about as large as the body");
+	// Weakly cached endpoints flip the verdict, which is why r stays configurable.
+	assert.equal(earlyClearPays(body, body, 1), true, "with no cache the break is free and the body is pure win");
+	assert.equal(earlyClearPays(body, 10, 0.5), true);
+	assert.equal(earlyClearPays(0, 0, 0.02), false, "an empty body frees nothing");
+	// A nonsense ratio is clamped to "no discount", not to a division by zero.
+	assert.equal(earlyClearPays(body, 0, Number.NaN), false);
+	assert.equal(earlyClearPays(body, 0, 5), true);
 });

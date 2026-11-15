@@ -87,7 +87,7 @@ assistant block 含 tool call 时，改写或删除它会级联省略配对的 t
 { "context": { "budgetTokens": 32000 } }
 ```
 
-`context.budgetTokens`：近似目标 token。用量达到约 `0.75 × max(1, budget − 2048)` 时，在同一次请求追加临时 `system` nudge；nudge 不写入 session，也不产生额外 turn。nudge 只在存在可支付的候选、或 `cleanup.trigger.turnsSinceCleanup` / `cleanup.trigger.toolResultSharePercent` 命中时出现；连续两轮无进展、达到轮数上限或压力消失后停止。
+`context.budgetTokens`：近似目标 token。用量达到约 `0.75 × max(1, budget − 2048)` 时，在同一次请求追加临时 `system` nudge；nudge 不写入 session，也不产生额外 turn。nudge 只在存在可支付的候选、或 `cleanup.trigger.stepsSinceCleanup`（回退 `turnsSinceCleanup`）/ `cleanup.trigger.toolResultSharePercent` 命中时出现；连续两轮无进展、达到轮数上限或压力消失后停止。
 
 Pi 侧 mirror 上限来自配置：`context.maxBlockChars`（默认 `12000` 字符/block）与 `context.maxMirrorChars`（默认 `96000` 字符）。截断只影响 preview，canonical source 完整；但改写截断块会被拒绝。
 

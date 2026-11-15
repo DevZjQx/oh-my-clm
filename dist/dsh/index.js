@@ -2,11 +2,11 @@ import * as fs from "node:fs";
 import { CLM_MIRROR_FILENAME, CLM_TEMP_ROOT, sessionCanaryPath, sessionMirrorPath, } from "../src/lib/clm-paths.js";
 import { loadClmConfig } from "../src/lib/clm-config.js";
 import { appendPrivateLine, writePrivateText } from "../src/lib/clm-files.js";
-import { REFETCH_TOOL_NAMES, SupersessionTracker, batchPassesGate, fitBatch, parseToolArguments, targetKeyOf, } from "../src/features/live-context/auto-clear.js";
+import { REFETCH_TOOL_NAMES, SupersessionTracker, batchPassesGate, earlyClearPays, fitBatch, parseToolArguments, targetKeyOf, } from "../src/features/live-context/auto-clear.js";
 import { CLEAR_EVENT_TYPE, CLEAR_VERSION, CLEAR_LABEL_MAX_CHARS, clearProjection, } from "../src/features/live-context/clear-projection.js";
 import { dshPromptText } from "../src/features/live-context/context-prompt.js";
 import { resolvePluginRecordWriter, } from "../src/features/live-context/plugin-record.js";
-import { buildDshMirrorRecords, dshBlockIndexText, dshOpenTurnStep, dshTriggerView, executeDshCleanup, reconcileDshMirror, } from "../src/features/live-context/dsh-bridge.js";
+import { buildDshMirrorRecords, dshBlockIndexText, dshOpenTurnStep, dshSurfaceTokensAfterEach, dshTriggerView, executeDshCleanup, reconcileDshMirror, } from "../src/features/live-context/dsh-bridge.js";
 import { estimateMirrorTokens, estimateTokens, hostUsageOf, renderMirror, } from "../src/features/live-context/context-format.js";
 import { formatCleanupToolResult, parseCleanupArgs, parseCleanupResultCopy, } from "../src/features/live-context/context-cleanup.js";
 export const name = "oh-my-clm";
@@ -29,14 +29,17 @@ function triggerOptions(config) {
     return {
         usagePercent: trigger.usagePercent,
         completedTurns: trigger.completedTurns,
+        completedSteps: trigger.completedSteps,
         toolResultShare: trigger.toolResultSharePercent / 100,
         turnsSinceCleanup: trigger.turnsSinceCleanup,
+        stepsSinceCleanup: trigger.stepsSinceCleanup,
         maxCandidates: trigger.maxCandidates,
         minSavingsTokens: trigger.minSavingsTokens,
         // `r` in `r·L + (1−r)·B` as a fraction. Per-endpoint, so it is a config
         // value rather than a hardcoded constant.
         cacheDiscount: config.cleanup.cacheDiscountPercent / 100,
         paybackTurns: config.cleanup.paybackTurns,
+        paybackSteps: config.cleanup.paybackSteps,
     };
 }
 /** Tool results a cleared target may come back within and still count as a miss. */
@@ -96,7 +99,7 @@ function isRefetchTool(name) {
  * facts needed to judge the decision (size, call age, gate outcome). The log
  * lives beside the mirror in the session's private temporary directory.
  */
-function feedCanary(ctx, session, event, state) {
+function feedCanary(ctx, session, event, state, allowPass = true) {
     const seq = event.seq;
     if (typeof seq !== "number")
         return;
@@ -140,21 +143,100 @@ function feedCanary(ctx, session, event, state) {
         }
         return;
     }
+    if (event.type === "step/end") {
+        // Seeding a resumed session replays history: a pass there would decide
+        // again on a boundary that already happened in a previous run.
+        if (!allowPass)
+            return;
+        maybeMidTurnPass(ctx, session, state, canaryValue(data, "turn"), canaryValue(data, "step"));
+        return;
+    }
     if (event.type !== "turn/end")
         return;
-    // A boundary is the only place a pass runs, and `peekBatch` is read-only: a
-    // pass the gate, the occupancy floor, or a missing projection skips leaves
-    // its candidates for the next boundary instead of consuming them.
+    if (!allowPass)
+        return;
+    // A boundary is the only place a *batch* pass runs, and `peekBatch` is
+    // read-only: a pass the gate, the occupancy floor, or a missing projection
+    // skips leaves its candidates for the next boundary instead of consuming them.
     const batch = state.tracker.peekBatch();
     if (batch.candidates.length === 0)
         return;
-    const gate = batchPassesGate(batch, state.gate);
-    if (canaryEnabled(state.config))
-        writeCanaryRecord(ctx, session, canaryValue(data, "turn"), batch, gate, state.reported);
+    runPass(ctx, session, state, { turn: canaryValue(data, "turn") }, batch, batchPassesGate(batch, state.gate));
+}
+/**
+ * Clear a block before the turn boundary, but only when waiting is provably
+ * worse than the prefix break it causes.
+ *
+ * The turn boundary is the right settlement point for a *batch*: one break is
+ * shared by every block in it, and replayed sessions give 4.4 blocks per pass
+ * there versus 2.3 for a step boundary, which is +31% prefix re-prefill for the
+ * same freed content. A single block is the exception: when the tail behind it is
+ * cheaper than the rent the remaining steps keep paying, clearing it now beats
+ * carrying it to the boundary.
+ *
+ * Two tests gate it, and neither guesses how long the turn will run:
+ * `autoClear.midTurnSuffixTokens` bounds the tail that would have to be
+ * re-prefilled, and `earlyClearPays` requires the rent saved by one more request
+ * to pay for it. The second test is the strict one: on a 273-session replay at
+ * `r = 0.02`, no in-turn dead block passes (the replacement read lands behind the
+ * dead body, so the tail stays comparable to its size). One pass per turn keeps
+ * a long turn from turning into one break per step.
+ */
+function maybeMidTurnPass(ctx, session, state, turn, step) {
     if (!autoClearEnabled(state.config))
         return;
-    if (admitClear(session, state, gate) !== undefined)
+    const suffixBudget = state.config.autoClear.midTurnSuffixTokens;
+    if (!(suffixBudget > 0))
         return;
+    if (state.auto.stop !== undefined)
+        return;
+    const turnNumber = typeof turn === "number" && Number.isSafeInteger(turn) ? turn : undefined;
+    const stepNumber = typeof step === "number" && Number.isSafeInteger(step) ? step : undefined;
+    if (turnNumber === undefined || stepNumber === undefined)
+        return;
+    if (state.midTurnTurn === turnNumber)
+        return;
+    const batch = state.tracker.peekBatch();
+    if (batch.candidates.length === 0)
+        return;
+    const discount = state.config.cleanup.cacheDiscountPercent / 100;
+    const tails = dshSurfaceTokensAfterEach(session, batch.candidates.map((candidate) => candidate.seq).filter((seq) => Number.isSafeInteger(seq) && seq >= 0));
+    const cheap = batch.candidates.filter((candidate) => {
+        if (!Number.isSafeInteger(candidate.seq) || candidate.seq < 0)
+            return false;
+        // What the next request must re-prefill is the tail *minus* the body this
+        // clear removes; a re-read of the same target sits in that tail, so it is
+        // the size difference that counts, not the raw tail.
+        const suffix = Math.max(0, (tails.get(candidate.seq) ?? 0) - Math.max(0, candidate.tokens));
+        if (suffix > suffixBudget)
+            return false;
+        return earlyClearPays(candidate.tokens, suffix, discount);
+    });
+    if (cheap.length === 0)
+        return;
+    const freed = cheap.reduce((total, candidate) => total + Math.max(0, candidate.tokens), 0);
+    // The volume gate is deliberately bypassed: it exists to amortise one break
+    // over many blocks, and this break is already free (or priced above).
+    const applied = runPass(ctx, session, state, { turn: turnNumber, step: stepNumber }, { candidates: cheap, tokens: freed }, true);
+    // The ration is spent only by a pass that actually wrote its record: a skip for
+    // a transient reason (occupancy, projection not registered) must get another
+    // chance inside this same turn.
+    if (applied)
+        state.midTurnTurn = turnNumber;
+}
+/**
+ * One settlement: canary record, admissibility, budget slice, apply.
+ *
+ * Shared by the turn boundary and the mid-turn exception so both obey the same
+ * breaker, occupancy floor, seam checks and cumulative budget.
+ */
+function runPass(ctx, session, state, where, batch, gate) {
+    if (canaryEnabled(state.config))
+        writeCanaryRecord(ctx, session, where, batch, gate, state.reported);
+    if (!autoClearEnabled(state.config))
+        return false;
+    if (admitClear(session, state, gate) !== undefined)
+        return false;
     // The budget is a cumulative cap, not a whole-batch veto: a 73k batch
     // against a 40k cap used to latch `stopped (budget)` before clearing
     // anything. Slice instead, oldest-first; the first pass may overshoot by
@@ -162,17 +244,17 @@ function feedCanary(ctx, session, event, state) {
     const remaining = autoClearBudget(state.config) - state.auto.clearedTokens;
     if (remaining <= 0) {
         state.auto.stop = "budget";
-        return;
+        return false;
     }
     const fitted = fitBatch(batch, remaining, state.auto.clearedTokens === 0);
     if (fitted === undefined) {
         state.auto.stop = "budget";
-        return;
+        return false;
     }
-    applyClear(ctx, session, state, fitted);
+    return applyClear(ctx, session, state, fitted);
 }
 /** Append one canary line per newly dead block; a failed write must not disturb the session. */
-function writeCanaryRecord(ctx, session, turn, batch, gate, reported) {
+function writeCanaryRecord(ctx, session, where, batch, gate, reported) {
     // A skipped pass re-offers the same candidates at the next boundary. The
     // ledger keeps one line per block, so repeated skipping cannot bury the
     // session's decisions under duplicates.
@@ -181,7 +263,8 @@ function writeCanaryRecord(ctx, session, turn, batch, gate, reported) {
         return;
     const record = {
         at: Date.now(),
-        turn: turn ?? null,
+        turn: where.turn ?? null,
+        ...(where.step !== undefined ? { step: where.step } : {}),
         tokens: fresh.reduce((total, candidate) => total + candidate.tokens, 0),
         candidates: fresh,
         gate,
@@ -229,7 +312,7 @@ function admitClear(session, state, gate) {
 /** Append the durable decision that the registered projection interprets. */
 function applyClear(ctx, session, state, batch) {
     if (state.writer.state !== "ready")
-        return;
+        return false;
     const targets = [];
     const retired = [];
     let tokens = 0;
@@ -244,7 +327,7 @@ function applyClear(ctx, session, state, batch) {
         tokens += size;
     }
     if (targets.length === 0)
-        return;
+        return false;
     try {
         // An ignorable plugin record: no surfaceOp, so it adds no model-visible
         // node, and a reader that does not know the type skips it.
@@ -252,7 +335,7 @@ function applyClear(ctx, session, state, batch) {
     }
     catch (error) {
         ctx.logger?.warn?.(`oh-my-clm: clearing record rejected: ${error instanceof Error ? error.message : String(error)}`);
-        return;
+        return false;
     }
     // Only a committed decision retires a block; a rejected append leaves the
     // candidates available for the next boundary.
@@ -267,6 +350,7 @@ function applyClear(ctx, session, state, batch) {
     }
     pruneRecent(state);
     ctx.logger?.info?.(`oh-my-clm: cleared ${targets.length} block(s) (~${tokens} tokens); the model now reads a re-read pointer`);
+    return true;
 }
 /** Drop breaker evidence older than its window so the list cannot grow with the session. */
 function pruneRecent(state) {
@@ -358,7 +442,7 @@ function seedCanary(ctx, session, projection, config) {
             seedCleared(state, seeded.data);
             continue;
         }
-        feedCanary(ctx, session, seeded, state);
+        feedCanary(ctx, session, seeded, state, false);
     }
     return state;
 }
@@ -789,9 +873,14 @@ function autoClearStatusText(state) {
     if (state === undefined) {
         return "auto-clear: not armed (set autoClear.canary to record decisions; autoClear.enabled also clears)";
     }
+    // The mid-turn switch is a separate decision from the turn-boundary pass, and
+    // a status line that hid it would make a silent `0` look like a broken gate.
+    const midTurn = state.config.autoClear.midTurnSuffixTokens > 0
+        ? `mid-turn ≤${state.config.autoClear.midTurnSuffixTokens} tok tail`
+        : "mid-turn off";
     if (!state.config.autoClear.enabled) {
         const stop = state.auto.stop === undefined ? "open" : `stopped (${state.auto.stop})`;
-        return `auto-clear: canary only · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.misselects} re-read(s)`;
+        return `auto-clear: canary only · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.misselects} re-read(s)`;
     }
     const armed = state.writer.state === "missing"
         ? "off: this host exposes no ignorable plugin-record seam"
@@ -799,7 +888,7 @@ function autoClearStatusText(state) {
             ? "starting: resolving the host record seam"
             : state.projection.ready ? "armed" : "armed, no projection";
     const stop = state.auto.stop === undefined ? "open" : `stopped (${state.auto.stop})`;
-    return `auto-clear: ${armed} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.misselects} re-read(s)`;
+    return `auto-clear: ${armed} · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.misselects} re-read(s)`;
 }
 function createDshClmCommand(onModeChange, autoStatus) {
     return {

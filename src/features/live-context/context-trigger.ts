@@ -22,10 +22,14 @@ export interface CleanupTriggerOptions extends CleanupCandidateOptions {
 	usagePercent?: number;
 	/** Fires when this many turns have completed. 0 disables. */
 	completedTurns?: number;
+	/** Fires when this many steps (requests) have completed. 0 disables. */
+	completedSteps?: number;
 	/** Fires when toolResult blocks hold at least this share (0..1) of editable tokens. 0 disables. */
 	toolResultShare?: number;
 	/** Fires when this many turns have elapsed since the last applied cleanup. 0 disables. */
 	turnsSinceCleanup?: number;
+	/** Fires when this many steps (requests) have elapsed since the last applied cleanup. 0 disables. */
+	stepsSinceCleanup?: number;
 }
 
 export interface CleanupTriggerContext {
@@ -36,10 +40,16 @@ export interface CleanupTriggerContext {
 	exactUsage?: boolean;
 	/** Turns that already ended; the open turn is not counted. */
 	completedTurns: number;
+	/** Steps (requests) that already ended; the step in progress is not counted. */
+	completedSteps?: number;
 	/** Turn in which the last cleanup or mirror edit was applied, if any. */
 	lastCleanupTurn?: number;
+	/** Step in which the last cleanup or mirror edit was applied, if any. */
+	lastCleanupStep?: number;
 	/** Turn that is about to run; defaults to `completedTurns + 1`. */
 	currentTurn?: number;
+	/** Step that is about to run; defaults to `completedSteps + 1`. */
+	currentStep?: number;
 }
 
 export interface CleanupCandidate {
@@ -59,9 +69,9 @@ export interface CleanupCandidate {
 	 */
 	suffixTokens: number;
 	/**
-	 * `r·tokens − (1−r)·suffixTokens / paybackTurns`: what the range saves per
-	 * turn, with the one-time break amortised over the remaining run. Negative
-	 * candidates are never suggested.
+	 * `r·tokens − (1−r)·suffixTokens / paybackSteps`: what the range saves per
+	 * request, with the one-time break amortised over the remaining run.
+	 * Negative candidates are never suggested.
 	 */
 	netTokens: number;
 	/**
@@ -69,6 +79,13 @@ export interface CleanupCandidate {
 	 * the recency weight never zeroes out a recent turn's savings. Final tie-break.
 	 */
 	turnsOld: number;
+	/**
+	 * Steps elapsed since this turn settled, counted as tool results after it: a
+	 * tool result lands once per step (10,121 results over 10,142 steps in the
+	 * replayed corpus), so this is the fine-grained age a turn cannot express.
+	 * Ranks ahead of {@link turnsOld} and is what the model reads.
+	 */
+	stepsOld: number;
 }
 
 export interface CleanupTriggerPlan {
@@ -112,6 +129,8 @@ export interface UsageLineInput {
 	exact: boolean;
 	editableBlocks: number;
 	lastCleanupTurn?: number;
+	/** Step of the last applied cleanup; shown beside the turn when both are known. */
+	lastCleanupStep?: number;
 	/** Pi counts steps, DSH counts turns; the wording must not lie. Defaults to `turn`. */
 	turnWord?: "turn" | "step";
 }
@@ -128,11 +147,27 @@ export function formatUsageLine(input: UsageLineInput): string {
 		? `${tokens}/${formatTokenCount(input.contextWindow as number)} tokens`
 		: `${tokens} tokens (window unknown)`;
 	const percent = hasWindow ? ` (${formatPercent((input.tokens / (input.contextWindow as number)) * 100)})` : "";
-	const cleanup = input.lastCleanupTurn === undefined
-		? "no cleanup yet"
-		: `last cleanup at ${input.turnWord ?? "turn"} ${input.lastCleanupTurn}`;
+	const cleanup = cleanupStamp(input);
 	const blocks = `${input.editableBlocks} editable block${input.editableBlocks === 1 ? "" : "s"}`;
 	return `Usage: ${where}${percent} · ${blocks} · ${cleanup}`;
+}
+
+/**
+ * "last cleanup at …" in the finest unit the caller actually knows.
+ *
+ * A turn is 11–39 steps wide, so "last cleanup at turn 4" says nothing about
+ * whether the last pass was one step or eighty steps ago; the step half is what
+ * makes the stamp actionable.
+ */
+function cleanupStamp(input: UsageLineInput): string {
+	const word = input.turnWord ?? "turn";
+	if (word === "step") {
+		if (input.lastCleanupStep === undefined) return "no cleanup yet";
+		return `last cleanup at step ${input.lastCleanupStep}`;
+	}
+	if (input.lastCleanupTurn === undefined) return "no cleanup yet";
+	if (input.lastCleanupStep === undefined) return `last cleanup at ${word} ${input.lastCleanupTurn}`;
+	return `last cleanup at turn ${input.lastCleanupTurn} (step ${input.lastCleanupStep})`;
 }
 
 function enabled(value: number | undefined): number {
@@ -152,11 +187,19 @@ export interface CleanupCandidateOptions {
 	 */
 	cacheDiscount?: number;
 	/**
-	 * Turns the one-time break cost is amortised over: `N` in
-	 * `N ≈ (1−r)·S / (r·ΔL)`. A break is only worth it if the run outlives its
-	 * payback, so a shorter horizon demands a cheaper break. Defaults to 10.
+	 * Future requests (steps) the one-time break cost is amortised over: `N` in
+	 * `N ≈ (1−r)·B / (r·L)`. The rent a cleanup saves is paid once per *request*,
+	 * so a count of turns would need the observed steps per turn to mean
+	 * anything; `paybackTurns` is therefore read as that many requests unless
+	 * {@link paybackSteps} says otherwise. Defaults to 10.
 	 */
 	paybackTurns?: number;
+	/**
+	 * Explicit request horizon, overriding {@link paybackTurns}. Defaults to `0`
+	 * (= not set). A run measured in turns must be multiplied by its own steps
+	 * per turn before it can be used here.
+	 */
+	paybackSteps?: number;
 }
 
 /**
@@ -193,8 +236,13 @@ export function assembleCleanupCandidates(
 	const rawDiscount = options.cacheDiscount ?? DEFAULT_CACHE_DISCOUNT;
 	// `r` is a price ratio: outside [0, 1] it is not a discount, it is a typo.
 	const discount = Number.isFinite(rawDiscount) ? Math.min(1, Math.max(0, rawDiscount)) : DEFAULT_CACHE_DISCOUNT;
-	const rawPayback = options.paybackTurns ?? DEFAULT_PAYBACK_TURNS;
-	const paybackTurns = Number.isFinite(rawPayback) ? Math.max(1, Math.floor(rawPayback)) : DEFAULT_PAYBACK_TURNS;
+	const rawPayback = options.paybackSteps !== undefined && options.paybackSteps > 0
+		? options.paybackSteps
+		: (options.paybackTurns ?? DEFAULT_PAYBACK_TURNS);
+	// The horizon is a count of future *requests*: the break is paid once, the rent
+	// it saves accrues once per request. Falling back to a turn count reads it as
+	// that many requests, which is the conservative end of the assumption.
+	const paybackRequests = Number.isFinite(rawPayback) ? Math.max(1, Math.floor(rawPayback)) : DEFAULT_PAYBACK_TURNS;
 	const units = buildBlockDigestUnits(records);
 	const unitTokens = units.map((unit) => estimateMirrorTokens(unit.records));
 
@@ -216,6 +264,20 @@ export function assembleCleanupCandidates(
 		laterTokens += unitTokens[index] ?? 0;
 	}
 
+	// Age in steps: tool results after the unit. A tool result lands once per
+	// step, so this is the fine-grained age a turn count cannot express — inside
+	// one 40-step turn every turn-aged number is identical.
+	const totalResults = units.reduce(
+		(total, unit) => total + unit.records.filter((record) => record.role === "toolResult").length,
+		0,
+	);
+	const stepsOldAt: number[] = [];
+	let resultsSeen = 0;
+	for (const unit of units) {
+		resultsSeen += unit.records.filter((record) => record.role === "toolResult").length;
+		stepsOldAt.push(totalResults - resultsSeen);
+	}
+
 	const completed = units
 		.map((unit, index) => ({ unit, index }))
 		.filter(({ unit }) => !unit.open);
@@ -231,10 +293,11 @@ export function assembleCleanupCandidates(
 			// Counted from the end of the completed list, so the ranking is the
 			// same whether the open turn exists or not.
 			turnsOld: completed.length - position,
+			stepsOld: stepsOldAt[index] ?? 0,
 		}))
 		.map((candidate) => ({
 			...candidate,
-			netTokens: Math.round(discount * candidate.tokens - ((1 - discount) * candidate.suffixTokens) / paybackTurns),
+			netTokens: Math.round(discount * candidate.tokens - ((1 - discount) * candidate.suffixTokens) / paybackRequests),
 		}))
 		.filter((candidate) => candidate.start > 1)
 		.filter((candidate) => candidate.tokens > 0 && candidate.tokens >= minSavings)
@@ -246,6 +309,7 @@ export function assembleCleanupCandidates(
 		// big old turn only wins when its break is genuinely cheap (or `r ≈ 1`).
 		.sort((a, b) => b.netTokens - a.netTokens
 			|| b.tokens - a.tokens
+			|| b.stepsOld - a.stepsOld
 			|| b.turnsOld - a.turnsOld)
 		.slice(0, maxCandidates);
 	const savingsTokens = candidates.reduce((total, candidate) => total + candidate.tokens, 0);
@@ -280,6 +344,11 @@ export function planCleanupTrigger(
 		signals.push(`${context.completedTurns} completed turns ≥ ${turnThreshold}`);
 	}
 
+	const stepThreshold = enabled(options.completedSteps);
+	if (stepThreshold > 0 && context.completedSteps !== undefined && context.completedSteps >= stepThreshold) {
+		signals.push(`${context.completedSteps} completed steps ≥ ${stepThreshold}`);
+	}
+
 	const shareThreshold = enabled(options.toolResultShare);
 	if (shareThreshold > 0) {
 		const editable = records.filter((record) => !record.protected);
@@ -298,6 +367,16 @@ export function planCleanupTrigger(
 		const elapsed = Math.max(0, currentTurn - lastCleanupTurn);
 		if (elapsed >= sinceThreshold) {
 			signals.push(`${elapsed} turns since cleanup ≥ ${sinceThreshold}`);
+		}
+	}
+
+	const sinceStepThreshold = enabled(options.stepsSinceCleanup);
+	if (sinceStepThreshold > 0) {
+		const currentStep = context.currentStep ?? (context.completedSteps ?? 0) + 1;
+		const lastCleanupStep = context.lastCleanupStep ?? 0;
+		const elapsed = Math.max(0, currentStep - lastCleanupStep);
+		if (elapsed >= sinceStepThreshold) {
+			signals.push(`${elapsed} steps since cleanup ≥ ${sinceStepThreshold}`);
 		}
 	}
 
@@ -321,7 +400,7 @@ export function renderCleanupCandidates(plan: CleanupTriggerPlan): string {
 	const skipRoles = JSON.stringify([...CANDIDATE_SKIP_ROLES]);
 	const head = `Suggested cleanup (${plan.signals.join("; ")}): cleanup({ ranges: [${ranges.join(", ")}], skipRoles: ${skipRoles} }) frees ~${plan.savingsTokens} tok.`;
 	const detail = `Candidates: ${plan.candidates
-		.map((candidate) => `${candidateRange(candidate)} (~${candidate.tokens} tok freed, ${candidate.turnsOld} turn${candidate.turnsOld === 1 ? "" : "s"} old, ${candidate.suffixTokens} tok after the break, net ~${candidate.netTokens})`)
+		.map((candidate) => `${candidateRange(candidate)} (~${candidate.tokens} tok freed, ${candidate.stepsOld} step${candidate.stepsOld === 1 ? "" : "s"} old, ${candidate.suffixTokens} tok after the break, net ~${candidate.netTokens})`)
 		.join(", ")}; block 1, user messages, and the current turn stay.`;
 	return `${head}\n${detail}`;
 }
