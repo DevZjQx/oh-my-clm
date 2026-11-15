@@ -5,7 +5,6 @@ import {
 	SupersessionTracker,
 	batchPassesGate,
 	describeCall,
-	earlyClearPays,
 	fitBatch,
 	parseToolArguments,
 	readWindowOf,
@@ -154,7 +153,7 @@ test("output recorded after supersession still counts toward the dead share", ()
 	assert.equal(tracker.peekBatch().tokens, 5_000);
 });
 
-test("the gate needs either enough tokens or enough blocks", () => {
+test("the gate needs enough tokens, enough blocks, or enough rot to matter", () => {
 	const one = {
 		candidates: [{ blockId: "a", seq: 7, tokens: 300, calls: [], keys: [], label: "read /a.ts", ageBlocks: 2 }],
 		tokens: 300,
@@ -168,9 +167,26 @@ test("the gate needs either enough tokens or enough blocks", () => {
 	};
 	assert.equal(batchPassesGate(one), false);
 	assert.equal(batchPassesGate(two), true);
-	assert.equal(batchPassesGate(one, { minTokens: 200, minBlocks: 5 }), true);
+	assert.equal(batchPassesGate(one, { minTokens: 200, minBlocks: 5, minShare: 0 }), true);
 	assert.equal(batchPassesGate({ candidates: [], tokens: 0 }), false);
 	assert.equal(DEFAULT_BATCH_GATE.minTokens, 1_200);
+	assert.equal(DEFAULT_BATCH_GATE.minShare, 0.05);
+});
+
+test("dead share of the live prompt opens the gate without crossing the volume floor", () => {
+	// 800 dead tokens is below minTokens; the gate stays shut in a large prompt
+	// and opens once the same rot is 5% of what the model reads.
+	const batch = {
+		candidates: [{ blockId: "a", seq: 7, tokens: 800, calls: [], keys: [], label: "read /a.ts", ageBlocks: 2 }],
+		tokens: 800,
+	};
+	const gate = { minTokens: 1_200, minBlocks: 5, minShare: 0.05 };
+	assert.equal(batchPassesGate(batch, gate, 16_000), true);
+	assert.equal(batchPassesGate(batch, gate, 100_000), false);
+	// Unknown prompt size disables the share path instead of guessing.
+	assert.equal(batchPassesGate(batch, gate, 0), false);
+	// A zero share is how the money-shaped gate is restored, for anyone who wants it.
+	assert.equal(batchPassesGate(batch, { ...gate, minShare: 0 }, 16_000), false);
 });
 
 test("arguments arrive as raw JSON on tool/call and as objects on PTC sub-calls", () => {
@@ -235,23 +251,3 @@ test("an empty batch never reaches the budget slicer", () => {
 	assert.equal(fitBatch({ candidates: [], tokens: 0 }, 40_000), undefined);
 });
 
-/**
- * The turn boundary is free to wait for, so an early clear must pay for its own
- * prefix break within one more request. Replayed sessions make that a rarely true
- * statement: the replacement read lands behind the dead body, so the tail the
- * clear has to re-prefill stays about the size of what it removes.
- */
-test("an early clear is only worth it when one more request pays for its break", () => {
-	const body = 4_000;
-	// r = 0.02: the break costs 0.98 x the tail, the rent saves 0.02 x the body.
-	assert.equal(earlyClearPays(body, 0, 0.02), true, "a tail of nothing is free to break");
-	assert.equal(earlyClearPays(body, 100, 0.02), false, "100 tokens of tail already cost more than the rent");
-	assert.equal(earlyClearPays(body, body, 0.02), false, "the replacement read is about as large as the body");
-	// Weakly cached endpoints flip the verdict, which is why r stays configurable.
-	assert.equal(earlyClearPays(body, body, 1), true, "with no cache the break is free and the body is pure win");
-	assert.equal(earlyClearPays(body, 10, 0.5), true);
-	assert.equal(earlyClearPays(0, 0, 0.02), false, "an empty body frees nothing");
-	// A nonsense ratio is clamped to "no discount", not to a division by zero.
-	assert.equal(earlyClearPays(body, 0, Number.NaN), false);
-	assert.equal(earlyClearPays(body, 0, 5), true);
-});

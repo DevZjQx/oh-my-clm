@@ -229,7 +229,7 @@ class FakeSession {
 const text = (value) => [{ type: "text", text: value }];
 const userMessage = (value) => ({ id: `u${value.length}`, role: "user", content: text(value), source: { kind: "user" } });
 const assistantMessage = (parts) => ({ id: `a${parts.length}`, role: "assistant", content: parts, source: { kind: "model", provider: "mock", model: "mock" } });
-const toolResultMessage = (callId, value) => ({ id: `t${callId}`, role: "tool", content: text(value), toolCallId: callId, source: { kind: "tool", callId, name: "mock" } });
+const toolResultMessage = (callId, value, isError = false) => ({ id: `t${callId}`, role: "tool", content: text(value), toolCallId: callId, source: { kind: "tool", callId, name: "mock" }, ...(isError ? { isError: true } : {}) });
 
 function sessionWithHistory(id) {
 	const session = new FakeSession(id);
@@ -669,6 +669,13 @@ section("11. clearing canary");
 	check("canary blames the superseded block", record.candidates?.[0]?.blockId === "call_grep_1", JSON.stringify(record.candidates?.[0] ?? null));
 	check("canary opens the gate for one large dead block", record.gate === true, JSON.stringify(record.gate));
 	check("canary frees the whole block, not just the call output", record.tokens > 900, String(record.tokens));
+	check(
+		"the ledger carries what the session is doing, not just what it might save",
+		typeof record.quality?.contextTokens === "number"
+			&& record.quality.session?.results >= 2
+			&& record.quality.turn?.rereads === 0,
+		JSON.stringify(record.quality ?? null),
+	);
 	check("canary writes no session event", session.events.length === before + 5, String(session.events.length - before));
 	check("canary leaves the surface untouched", session.surfaceSeq.length === session.events.filter((event) => SURFACE_EVENT_TYPES.has(event.type)).length);
 	host.disposeAll();
@@ -689,6 +696,16 @@ section("11. clearing canary");
 	const firstResult = await clearFeed("tool/result", { turn: 1, step: 3, message: toolResultMessage("call_auto_1", bigOutput) });
 	await clearFeed("tool/call", { turn: 1, step: 4, callId: "call_auto_2", name: "grep", arguments: JSON.stringify({ pattern: "needle" }) });
 	await clearFeed("tool/result", { turn: 1, step: 4, message: toolResultMessage("call_auto_2", bigOutput) });
+	// A second independent dead block, so the boundary clears a batch and no live
+	// copy of either target is left behind for the quality probe below.
+	await clearFeed("tool/call", { turn: 1, step: 5, callId: "call_auto_3", name: "glob", arguments: JSON.stringify({ pattern: "**/*.ts" }) });
+	await clearFeed("tool/result", { turn: 1, step: 5, message: toolResultMessage("call_auto_3", bigOutput) });
+	await clearFeed("tool/call", { turn: 1, step: 6, callId: "call_auto_4", name: "glob", arguments: JSON.stringify({ pattern: "**/*.ts" }) });
+	await clearFeed("tool/result", { turn: 1, step: 6, message: toolResultMessage("call_auto_4", bigOutput) });
+	await clearFeed("tool/call", { turn: 1, step: 7, callId: "call_read_1", name: "read", arguments: JSON.stringify({ file_path: "/a.ts" }) });
+	await clearFeed("tool/result", { turn: 1, step: 7, message: toolResultMessage("call_read_1", bigOutput) });
+	await clearFeed("tool/call", { turn: 1, step: 8, callId: "call_read_2", name: "read", arguments: JSON.stringify({ file_path: "/a.ts" }) });
+	await clearFeed("tool/result", { turn: 1, step: 8, message: toolResultMessage("call_read_2", bigOutput) });
 	await clearFeed("turn/end", { turn: 1 });
 	const clearRecords = clearSession.events.filter((event) => event.type === "plugin:oh-my-clm/clear");
 	check("auto clearing appends one durable record", clearRecords.length === 1, String(clearRecords.length));
@@ -721,12 +738,57 @@ section("11. clearing canary");
 	check("the projection keeps the message identity", rewritten?.id === `tcall_auto_1` && rewritten?.toolCallId === "call_auto_1", JSON.stringify({ id: rewritten?.id }));
 	check("the durable event keeps the original body", firstResult.data.message.content[0].text.length === bigOutput.length);
 
-	// Two re-fetches of a cleared target inside the window trip the breaker.
-	for (const step of [5, 6]) {
-		await clearFeed("tool/call", { turn: 1, step, callId: `call_retry_${step}`, name: "grep", arguments: JSON.stringify({ pattern: "needle" }) });
+	// The ledger records the outcome side of a clear as well: blocks retired and
+	// the prompt size the decision was made against.
+	const clearCanary = path.join("/tmp", `clm-${encodeURIComponent(clearSession.id)}`, "CANARY.jsonl");
+	const clearLines = (readIfExists(clearCanary) ?? "").trim().split("\n").filter(Boolean);
+	let clearRecord;
+	try {
+		clearRecord = JSON.parse(clearLines.at(-1) ?? "{}");
+	} catch (error) {
+		clearRecord = { parseError: String(error) };
+	}
+	check(
+		"the ledger counts the blocks a pass retired",
+		clearRecord.quality?.session?.clearedBlocks === 3 && clearRecord.quality.session.clearedTokens > 2_700,
+		JSON.stringify(clearRecord.quality?.session ?? null),
+	);
+
+	// An error on a target this session cleared is the sharpest quality signal: the
+	// pointer sent the model back to something that no longer works. One re-read
+	// without a second call produces no new candidate, so this line exercises the
+	// "outcome without a proposal" path.
+	await clearFeed("tool/call", { turn: 2, step: 1, callId: "call_retry_a", name: "read", arguments: JSON.stringify({ file_path: "/a.ts", offset: 200, limit: 60 }) });
+	await clearFeed("tool/result", { turn: 2, step: 1, message: toolResultMessage("call_retry_a", "no such file", true) });
+	await clearFeed("turn/end", { turn: 2 });
+	const qualityLines = (readIfExists(clearCanary) ?? "").trim().split("\n").filter(Boolean);
+	let qualityRecord;
+	try {
+		qualityRecord = JSON.parse(qualityLines.at(-1) ?? "{}");
+	} catch (error) {
+		qualityRecord = { parseError: String(error) };
+	}
+	check(
+		"a boundary with no new candidates still logs post-clear outcomes",
+		qualityRecord.candidates?.length === 0 && qualityRecord.quality !== undefined,
+		JSON.stringify({ candidates: qualityRecord.candidates?.length, quality: qualityRecord.quality ?? null }),
+	);
+	check(
+		"the ledger counts re-reads and the error on a cleared target",
+		qualityRecord.quality?.turn?.rereads === 1
+			&& qualityRecord.quality?.turn?.errorRereads === 1
+			&& qualityRecord.quality?.session?.errors >= 1,
+		JSON.stringify(qualityRecord.quality ?? null),
+	);
+
+	// Two more re-fetches of the same cleared target trip the breaker. A subrange
+	// read does not supersede the live full read, so no new candidate is created.
+	for (const step of [2, 3]) {
+		await clearFeed("tool/call", { turn: 2, step, callId: `call_retry_${step}`, name: "read", arguments: JSON.stringify({ file_path: "/a.ts", offset: 200, limit: 60 }) });
 	}
 	const status = clearBoot.host.commands.get("clm").handler({ agent: clearBoot.agent, rawInput: "status" });
 	check("the breaker stops clearing after a re-read", String(status.text).includes("stopped (breaker)"), String(status.text).split("\n").at(-1));
+	check("the status line reports error re-reads", /error re-read\(s\)/.test(String(status.text)), String(status.text).split("\n").at(-1));
 	clearBoot.host.disposeAll();
 	setHarnessAutoClear({ enabled: false });
 	cleanup(clearSession.id);

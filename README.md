@@ -4,7 +4,7 @@ Pi extension + DSH/Cordis plugin。DSH 侧默认关闭一条**自动清理**通�
 
 ## 自动清理（DSH，默认关闭）
 
-`autoClear.enabled: true` 时每个 `turn/end` 结算一次：只清被同一目标后续调用取代的块，闸门 1200 token 或 2 块，占用 ≥60% 停手交给宿主 compaction，重读率过高会熔断。结算点留在 turn 边界是因为一次断点要摊到整批块上（实测 4.4 块/批 vs 按步 2.3 块/批，同样的内容多付 31% 重算）；`autoClear.midTurnSuffixTokens` 可单独放开“尾部极短且一个请求内回本”的单块例外，而计时器（`completedSteps` / `stepsSinceCleanup` / `stepsOld`）按步数计。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
+`autoClear.enabled: true` 时每个 `turn/end` 结算一次：只清被同一目标后续调用取代的块，闸门 1200 token、2 块或死内容占当前 prompt 的 5%，占用 ≥60% 停手交给宿主 compaction，重读率过高会熔断。结算点留在 turn 边界是因为一次断点要摊到整批块上（实测 4.4 块/批 vs 按步 2.3 块/批，同样的内容多付 31% 重算）；`autoClear.midTurnSuffixTokens` 可单独放开“尾部极短且一个请求内回本”的单块例外，而计时器（`completedSteps` / `stepsSinceCleanup` / `stepsOld`）按步数计。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
 
 ## 手动通道：mirror 与 cleanup
 
@@ -140,12 +140,13 @@ cleanup({ list: "3-16" })
 | `autoClear.canary` | `false` | 只记录自动清理决策到 `CANARY.jsonl`，不改模型输入。 |
 | `autoClear.minTokens` | `1200` | 一批至少释放的 token；低于它不值得断一次前缀。 |
 | `autoClear.minBlocks` | `2` | 或者至少这么多个死块。 |
+| `autoClear.minSharePercent` | `5` | 或者死块占当前 prompt 的百分比达到该值；`0` = 只按量。这是抗 rot 判据，不是省钱判据。 |
 | `autoClear.stopPercent` | `60` | 占用达到窗口百分比即停手，交给宿主 compaction。 |
 | `autoClear.maxTokens` | `40000` | 单会话累计清理上限。 |
-| `autoClear.midTurnSuffixTokens` | `0` | 允许在 turn 内清理：死块之后待重算的尾部 ≤ 该 token 数，且该次断点在下一请求内回本。`0` 关闭。 |
+| `autoClear.midTurnSuffixTokens` | `0` | 允许在 turn 内清理：死块之后待重算的尾部 ≤ 该 token 数即可，不再要求回本。`0` 关闭。 |
 | `host.pluginRecordModule` | `@deepseek-ai/dsh-session` | 提供 `appendPluginRecord` seam 的宿主模块；高级/测试用。 |
 
-自动清理的记录必须是宿主可忽略的 plugin record，所以它需要宿主提供 `appendPluginRecord`（`@deepseek-ai/dsh-session` ≥ 0.2.2-rc.1）。解析不到该 seam 时插件不会退回 `session.append()`（那会让含记录的会话在重启后被宿主拒绝恢复），而是保持关闭：会话创建时 warn 一次，`/clm` 显示 `stopped (unrecordable)`。`autoClear.canary` 只写 `/tmp/clm-<session>/CANARY.jsonl`，不需要该 seam。
+自动清理的记录必须是宿主可忽略的 plugin record，所以它需要宿主提供 `appendPluginRecord`（`@deepseek-ai/dsh-session` ≥ 0.2.2-rc.1）。插件目录解析不到宿主包，所以解析器会再从宿主入口（`process.argv[1]`，即 `dsh/lib/bin.js`）和全局模块根兜底；解析出的模块必须是会话所用的同一份 `dsh-session`（否则私有字段写入会失败），导出 `Session` 时会在写入前比对原型。仍然解析不到时插件不会退回 `session.append()`（那会让含记录的会话在重启后被宿主拒绝恢复），而是保持关闭：会话创建时 warn 一次，`/clm` 显示 `stopped (unrecordable)`。`autoClear.canary` 只写 `/tmp/clm-<session>/CANARY.jsonl`，不需要该 seam。
 
 所有触发阈值默认关闭（`0`）。命中后只在该 turn 边界装配一次用量行和候选；候选只取已完成的 turn，按断点后的净收益排序，并固定带 `skipRoles: ["user"]`。Pi 侧另认 `cleanup.trigger.stepsSinceCleanup`（回退 `turnsSinceCleanup`）与 `cleanup.trigger.toolResultSharePercent`，预算 nudge 与 DSH 共用同一套用量行/候选格式。
 

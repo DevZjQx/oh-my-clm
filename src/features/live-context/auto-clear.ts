@@ -357,61 +357,43 @@ export class SupersessionTracker {
 /**
  * Whether one pass is worth running.
  *
- * Both floors exist for the same reason: every pass breaks the prefix cache from
- * the cleared position to the tail, so a pass that frees a few hundred tokens
- * costs more than it saves. They are deliberately small — a tail-rolling pass in
- * a real session yields one to three blocks, not tens.
+ * The clearing channel buys context quality, not tokens. Two different signals
+ * can open the gate:
+ *
+ * - **volume** (`minTokens` / `minBlocks`): a pass that frees a few hundred
+ *   tokens is not worth a prefix break on its own. This is the floor, not the
+ *   objective;
+ * - **rot share** (`minShare` of the live prompt): when dead output is a
+ *   meaningful fraction of what the model reads, leaving it buried is the
+ *   larger harm even when the absolute size is small. This is the
+ *   anti-context-rot signal, and it is why the gate is not priced in money.
+ *
+ * `contextTokens` is the prompt the host is about to send (provider-reported
+ * when available). `0` disables the share path.
  */
 export interface BatchGate {
 	readonly minTokens: number;
 	readonly minBlocks: number;
+	/** Dead share of the live prompt that opens the gate on its own; `0` disables. */
+	readonly minShare: number;
 }
 
 /**
  * Calibrated defaults for the clearing gate. The plugin's live path reads
- * `autoClear.minTokens` / `autoClear.minBlocks` from the config file; keep those
- * defaults in sync with this constant.
+ * `autoClear.minTokens` / `autoClear.minBlocks` / `autoClear.minSharePercent`
+ * from the config file; keep those defaults in sync with this constant.
  */
-export const DEFAULT_BATCH_GATE: BatchGate = { minTokens: 1_200, minBlocks: 2 };
+export const DEFAULT_BATCH_GATE: BatchGate = { minTokens: 1_200, minBlocks: 2, minShare: 0.05 };
 
-export function batchPassesGate(batch: CanaryBatch, gate: BatchGate = DEFAULT_BATCH_GATE): boolean {
-	if (batch.candidates.length === 0) return false;
-	return batch.tokens >= gate.minTokens || batch.candidates.length >= gate.minBlocks;
-}
-
-/**
- * Whether clearing one block *between* turn boundaries pays for itself.
- *
- * Waiting for the boundary is free but keeps paying rent: every remaining request
- * carries the dead body at the cache-read price. Clearing now stops the rent and
- * pays a one-time break, which is the tail behind the block re-read at full
- * price. So an early clear must beat waiting:
- *
- * ```
- * r · tokens  >  (1 − r) · suffixTokens
- * ```
- *
- * `suffixTokens` is what the next request must re-prefill once the body is gone:
- * the tail behind the block minus the removed tokens. A re-read that replaces the
- * body lands in that tail, so the two are usually comparable in size and the
- * break costs about one copy of the block at full price — which is why this
- * returns false for every one of the 719 in-turn dead blocks a 273-session replay
- * produced at `r = 0.02` (18 blocks, 47k tokens, at `r = 0.1`). The check is
- * deliberately one-sided: it never claims a saving it cannot price.
- */
-export function earlyClearPays(
-	tokens: number,
-	suffixTokens: number,
-	cacheDiscount: number,
+export function batchPassesGate(
+	batch: CanaryBatch,
+	gate: BatchGate = DEFAULT_BATCH_GATE,
+	contextTokens = 0,
 ): boolean {
-	const size = Math.max(0, tokens);
-	const suffix = Math.max(0, suffixTokens);
-	const rawDiscount = Number.isFinite(cacheDiscount) ? cacheDiscount : 0;
-	const discount = Math.min(1, Math.max(0, rawDiscount));
-	// With no discount (r = 1) the break is free and any dead body is a win.
-	if (discount >= 1) return size > 0;
-	if (size === 0) return false;
-	return discount * size > (1 - discount) * suffix;
+	if (batch.candidates.length === 0) return false;
+	if (batch.tokens >= gate.minTokens || batch.candidates.length >= gate.minBlocks) return true;
+	if (!(gate.minShare > 0) || !(contextTokens > 0)) return false;
+	return batch.tokens / contextTokens >= gate.minShare;
 }
 
 /**
@@ -460,4 +442,40 @@ export interface CanaryRecord {
 	readonly candidates: readonly ClearCandidate[];
 	/** True when the batch would have been executed. */
 	readonly gate: boolean;
+	/** What clearing did to the session, not what it might save. */
+	readonly quality?: CanaryQuality;
+}
+
+/**
+ * The outcome half of the canary ledger.
+ *
+ * Proposals alone cannot answer whether clearing helps: a clear that the model
+ * immediately undoes costs tool calls and attention. These counters are the
+ * mechanical trace of that:
+ *
+ * - `rereads` — a cleared target was fetched again (a pointer invite, or a miss);
+ * - `errors` — tool results that reported `isError`;
+ * - `errorRereads` — an error on a target this session cleared (a pointer that
+ *   sent the model back to something that no longer works);
+ * - `contextTokens` — the prompt size the host reported, so the dead share can
+ *   be read off the same line.
+ *
+ * `turn` is the slice since the previous boundary; `session` is cumulative.
+ */
+export interface CanaryQuality {
+	readonly contextTokens: number;
+	readonly turn: {
+		readonly rereads: number;
+		readonly errors: number;
+		readonly errorRereads: number;
+	};
+	readonly session: {
+		readonly results: number;
+		readonly clearedBlocks: number;
+		readonly clearedTokens: number;
+		readonly passes: number;
+		readonly rereads: number;
+		readonly errors: number;
+		readonly errorRereads: number;
+	};
 }

@@ -50,12 +50,20 @@ DSH 侧新增的一条通道：在 turn 边界把**已被同一目标取代**的
 
 写入走宿主的 `appendPluginRecord(session, type, data)`（`@deepseek-ai/dsh-session` ≥ 0.2.2-rc.1）。`ignorable: true` 是这个通道能存在的前提：宿主的持久化读路径（`dsh-session-persistence` 的 `validateStoredEvents`）对**不认识且未标 ignorable** 的事件类型直接抛 `SessionFormatUnsupportedError`，拒绝恢复整个会话。`Session.append()` 没有设置该标记的入口，所以用 `append()` 写插件事件 = 重启后用户的会话打不开——用用户的 transcript 换 token 不划算。
 
-插件**不静态 import** 宿主的 `dsh-session`：profile 安装只解析插件自己的依赖，静态 import 会让插件在它要发布的环境里加载失败。因此 `src/features/live-context/plugin-record.ts` 在会话创建时动态解析 `appendPluginRecord`：
+插件**不静态 import** 宿主的 `dsh-session`：profile 安装只解析插件自己的依赖，静态 import 会让插件在它要发布的环境里加载失败。因此 `src/features/live-context/plugin-record.ts` 在会话创建时动态解析 `appendPluginRecord`。
+
+**只在插件目录里 `import()` 是不够的。** 真实布局是插件在 `~/.dsh/profiles/<name>/node_modules/<plugin>`，宿主包在 DSH 安装目录（`.../node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-session`）。Node 按导入方所在路径解析裸 specifier，所以那个 import 会失败，开着 `autoClear.enabled` 的 profile 就锁在 `unrecordable`——0.1.18 在真实机器上正是这个状态（canary 有记录、没有一条 clear 记录）。现在按顺序尝试：
+
+1. specifier 本身（`file:` URL 或绝对路径直接可用）；
+2. 宿主入口（`process.argv[1]`，即 `.../@deepseek-ai/dsh/lib/bin.js`）的解析链——它所在的 `node_modules` 拥有会话所用的那份 `dsh-session`；
+3. 全局模块根（`~/.local/lib/node_modules`、`/usr/local/lib/node_modules` 等），给从 wrapper 启动、`argv` 里没有宿主入口的场景兜底。
+
+`appendPluginRecord` 关闭的是 `Session` 类的私有字段（`session.#appendRecord`），**必须是同一份模块副本**。解析出的模块导出 `Session` 时，写入前会比较它的 prototype 与当前 session 的原型；不一致就锁存 `unrecordable` 并 warn，而不是让第一次清理变成一次费解的 rejection。
 
 | 宿主 | 行为 |
 | --- | --- |
 | 有 `appendPluginRecord`（≥ 0.2.2-rc.1 且可解析） | 记录可写，清理可用 |
-| 没有（旧宿主 / 不可解析） | **绝不退回 `append()`**：会话创建时 warn 一次，本会话清理锁存为 `stopped (unrecordable)`，`/clm` 明写原因 |
+| 没有（旧宿主 / 不可解析 / 解析到另一份 `dsh-session`） | **绝不退回 `append()`**：会话创建时 warn 一次，本会话清理锁存为 `stopped (unrecordable)`，`/clm` 明写原因 |
 
 `host.pluginRecordModule` 可覆盖解析目标（默认 `@deepseek-ai/dsh-session`），harness 用它注入一个等价 writer 验证“记录确实是 ignorable 的、且没有新增 surface 节点”。这是配置里**唯一**把字符串变成代码执行的点：设了它并打开 `autoClear.enabled`，等于信任写这份配置的仓库，所以它定位为高级/测试开关；不设就是宿主自己的包，没有额外风险。
 
@@ -75,17 +83,20 @@ DSH 侧新增的一条通道：在 turn 边界把**已被同一目标取代**的
 
 ## 闸门与限额
 
-一个 turn 结束结算一次，必须同时满足：
+一个 turn 结束结算一次，满足其一即可执行：
 
 | 配置项 | 默认 | 含义 |
 | --- | --- | --- |
-| `autoClear.minTokens` | `1200` | 一批至少释放这么多 token |
+| `autoClear.minTokens` | `1200` | 一批至少释放这么多 token（**量**的下限，不是目标） |
 | `autoClear.minBlocks` | `2` | 或者至少这么多个死块 |
+| `autoClear.minSharePercent` | `5` | 或者死块占当前 prompt 的百分比达到该值（**腐烂浓度**信号） |
 | `autoClear.stopPercent` | `60` | 占用达到窗口百分比就停手，交给宿主 compaction |
 | `autoClear.maxTokens` | `40000` | 单会话累计清理上限 |
 | `autoClear.midTurnSuffixTokens` | `0` | 允许单块在 turn 内清理；见下节 |
 
 闸门很小，因为每次清理都会在清理位置断开前缀缓存：真实会话里一轮尾部滚动通常只有 1–3 块，8k 的闸门会让它永不触发（0.1.18 的失败形态）。
+
+**两条路径回答两个不同问题。** `minTokens` / `minBlocks` 回答“这次断点值不值”，是量的下限；`minSharePercent` 回答“死内容是不是已经占模型读到的东西的一大部分”，这是抗 rot 的判据。后者为 `0` 时闸门退回纯量口径。它用宿主上报的 prompt 尺寸做分母；宿主没有精确用量时不猜，只走量路径。
 
 **预算不是整批否决。** 一批 73,646 token 对 40,000 上限时，旧逻辑会在清任何东西之前锁存 `stopped (budget)`；现在按 seq 从旧到新切片，只清预算还付得起的那部分，剩余候选留到下一个边界。首个批次允许超一个候选（单个超大块），否则一个比预算还大的死块永远清不掉，只能等宿主 compaction。
 
@@ -108,12 +119,11 @@ DSH 侧新增的一条通道：在 turn 边界把**已被同一目标取代**的
 
 ### 唯一的例外：`autoClear.midTurnSuffixTokens`
 
-`> 0` 时，`step/end` 会检查池子里的死块，只有同时满足两条才在 turn 内清：
+`> 0` 时，`step/end` 会检查池子里的死块：该块之后待重算的尾部（减去被删正文）≤ `midTurnSuffixTokens` 才在 turn 内清。
 
-1. 该块之后待重算的尾部（减去被删正文）≤ `midTurnSuffixTokens`；
-2. `earlyClearPays()`：`r · tokens > (1−r) · suffix`，即这一次断点要在**下一个请求**内回本。
+每个 turn 最多一次（`midTurnTurn` 锁），闸门被绕过（它存在的意义是摊薄一次断点，而这种断点本来就不贵），`stop`/预算/投影就绪/熔断照旧生效；canary 账本在这种情况下多写一个 `step` 字段。
 
-每个 turn 最多一次（`midTurnTurn` 锁），闸门被绕过（它存在的意义是摊薄一次断点，而这种断点本来就不贵），`stop`/预算/投影就绪/熔断照旧生效；canary 账本在这种情况下多写一个 `step` 字段。默认 `0` 关闭：在 `r = 0.02` 的默认配置下没有真实死块能过第 2 条，这条开关只对缓存折扣很弱（`r ≳ 0.1`）或尾部确实极短的端点有意义。
+0.1.18 还要求 `earlyClearPays()`（这一次断点要在下一个请求内回本）。那是**省钱**判据：在 `r = 0.02` 下没有真实死块能过，等于默认永久关闭。定位改成抗 rot 之后，这个判据被移除——剩下的只有尾部预算：只要断点便宜，就让它尽早停止污染 prompt。默认仍为 `0`，因为 turn 内清理会多断一次前缀，等真实会话账本再说。
 
 ## 熔断
 
@@ -136,13 +146,25 @@ DSH 侧新增的一条通道：在 turn 边界把**已被同一目标取代**的
 {"at":1794770,"turn":3,"tokens":4697,"gate":true,
  "candidates":[{"blockId":"call_…","seq":41,"tokens":4697,
                 "calls":[{"name":"grep","seq":21}],"keys":["grep\u0000pattern=\"needle\""],
-                "label":"grep \"needle\"","ageBlocks":12}]}
+                "label":"grep \"needle\"","ageBlocks":12}],
+ "quality":{"contextTokens":319000,
+            "turn":{"rereads":1,"errors":0,"errorRereads":0},
+            "session":{"results":61,"clearedBlocks":4,"clearedTokens":3200,
+                       "passes":2,"rereads":2,"errors":5,"errorRereads":1}}}
 ```
 
 - `seq`：目标 `tool/result` 的会话序号，投影的寻址单位。
 - `turn` / `step`：决策发生在哪个 turn 边界；`step` 只在 turn 内（`midTurnSuffixTokens`）清理时出现。
 - `ageBlocks`：被取代的调用与取代它的调用之间落了多少个 tool result，即"断点离尾部多远"。
 - `gate`：这次是否够格执行。
+- `quality`：这次清理**实际发生了什么**，是「质量工具」唯一可被证伪的证据面：
+  - `rereads`：被清目标又被取回来（占位符邀请的一次重读，或一次误判）；
+  - `errors`：报错的 tool result 总数；
+  - `errorRereads`：报错的 tool result 命中的正是本会话清过的目标——指针把模型送回了已经不可用的位置，这是最刺眼的信号；
+  - `contextTokens`：宿主上报的 prompt 尺寸，同一行就能读出 dead share；
+  - `turn` 是自上次边界以来的增量，`session` 是累计。`clearedBlocks` / `clearedTokens` / `passes` 在**真正写入记录之后**才计入，所以这一行报告的是本次 pass 的结果，不是上一次的。
+
+账本在两种情况下都会写：有新死块，或者没有新死块但上一次清理产生了重读/报错（`qualityDirty`）。只记提案的账本永远无法回答"清理有没有帮上忙"。
 
 日志写在 `/tmp/clm-<session-id>/`（与 mirror 同目录、同样私有权限），随临时目录消失；不写改模型输入的事件之外的任何会话日志，也不需要新增 manifest 权限。
 

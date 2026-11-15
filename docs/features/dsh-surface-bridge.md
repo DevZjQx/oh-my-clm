@@ -57,7 +57,8 @@ node scripts/build-dsh-plugin.mjs --output ./out/oh-my-clm.tgz
 | `index.*` | 见 cleanup 文档 | block index 形状、尺寸与刷新节流。 |
 | `cleanup.trigger.*` | 全部 `0` | 清理触发阈值；默认关闭。 |
 | `cleanup.cacheDiscountPercent` | `2` | 缓存命中价百分比（`2` = 1/50）。 |
-| `cleanup.paybackTurns` / `paybackSteps` | `10` / `0` | 断点成本摊到多少次后续请求（一步一次请求）；`paybackSteps > 0` 时覆盖。 |
+| `cleanup.paybackTurns` / `paybackSteps` | `10` / `0` | 手动 cleanup 候选的断点成本摊到多少次后续请求（一步一次请求）；`paybackSteps > 0` 时覆盖。自动清理通道不使用该计价。 |
+| `autoClear.minSharePercent` | `5` | 死块占当前 prompt 的百分比闸门；`0` 时只按 token/块数。 |
 | `autoClear.midTurnSuffixTokens` | `0` | 允许单块在 turn 内清理的尾部上限；`0` 关闭。 |
 
 这些配置只影响 preview、shrink-only gate 的近似估算、索引或模型可见结果，不改变 DSH 的 context window。触发阈值、缓存计价与完整配置表见根 [README](../../README.md#配置)；索引开关见 [cleanup-tool.md](./cleanup-tool.md#配置)。

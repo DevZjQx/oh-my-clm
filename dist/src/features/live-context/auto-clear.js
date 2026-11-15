@@ -272,46 +272,18 @@ export class SupersessionTracker {
 }
 /**
  * Calibrated defaults for the clearing gate. The plugin's live path reads
- * `autoClear.minTokens` / `autoClear.minBlocks` from the config file; keep those
- * defaults in sync with this constant.
+ * `autoClear.minTokens` / `autoClear.minBlocks` / `autoClear.minSharePercent`
+ * from the config file; keep those defaults in sync with this constant.
  */
-export const DEFAULT_BATCH_GATE = { minTokens: 1_200, minBlocks: 2 };
-export function batchPassesGate(batch, gate = DEFAULT_BATCH_GATE) {
+export const DEFAULT_BATCH_GATE = { minTokens: 1_200, minBlocks: 2, minShare: 0.05 };
+export function batchPassesGate(batch, gate = DEFAULT_BATCH_GATE, contextTokens = 0) {
     if (batch.candidates.length === 0)
         return false;
-    return batch.tokens >= gate.minTokens || batch.candidates.length >= gate.minBlocks;
-}
-/**
- * Whether clearing one block *between* turn boundaries pays for itself.
- *
- * Waiting for the boundary is free but keeps paying rent: every remaining request
- * carries the dead body at the cache-read price. Clearing now stops the rent and
- * pays a one-time break, which is the tail behind the block re-read at full
- * price. So an early clear must beat waiting:
- *
- * ```
- * r · tokens  >  (1 − r) · suffixTokens
- * ```
- *
- * `suffixTokens` is what the next request must re-prefill once the body is gone:
- * the tail behind the block minus the removed tokens. A re-read that replaces the
- * body lands in that tail, so the two are usually comparable in size and the
- * break costs about one copy of the block at full price — which is why this
- * returns false for every one of the 719 in-turn dead blocks a 273-session replay
- * produced at `r = 0.02` (18 blocks, 47k tokens, at `r = 0.1`). The check is
- * deliberately one-sided: it never claims a saving it cannot price.
- */
-export function earlyClearPays(tokens, suffixTokens, cacheDiscount) {
-    const size = Math.max(0, tokens);
-    const suffix = Math.max(0, suffixTokens);
-    const rawDiscount = Number.isFinite(cacheDiscount) ? cacheDiscount : 0;
-    const discount = Math.min(1, Math.max(0, rawDiscount));
-    // With no discount (r = 1) the break is free and any dead body is a win.
-    if (discount >= 1)
-        return size > 0;
-    if (size === 0)
+    if (batch.tokens >= gate.minTokens || batch.candidates.length >= gate.minBlocks)
+        return true;
+    if (!(gate.minShare > 0) || !(contextTokens > 0))
         return false;
-    return discount * size > (1 - discount) * suffix;
+    return batch.tokens / contextTokens >= gate.minShare;
 }
 /**
  * Trim a batch to what the session budget can still pay for.

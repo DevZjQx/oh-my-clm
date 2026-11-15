@@ -71,6 +71,14 @@ export interface ClmAutoClearConfig {
 	canary: boolean;
 	minTokens: number;
 	minBlocks: number;
+	/**
+	 * Dead share of the live prompt (%) that opens the gate on its own.
+	 *
+	 * The volume floors answer "is this break worth it"; this answers the
+	 * anti-rot question "is the dead content a meaningful part of what the
+	 * model reads". `0` disables the share path.
+	 */
+	minSharePercent: number;
 	/** Occupancy percentage at which clearing hands off to host compaction. */
 	stopPercent: number;
 	/** Cumulative tokens one session may clear. */
@@ -79,12 +87,11 @@ export interface ClmAutoClearConfig {
 	 * Free a candidate before the turn boundary when at most this many
 	 * model-visible tokens sit after it; `0` disables mid-turn passes.
 	 *
-	 * A clear breaks the prefix cache at the cleared block, so the one-time cost
-	 * is the tail behind it. The budget alone never triggers a pass: each
-	 * candidate must also pay for that break within one more request
-	 * (`earlyClearPays`). On the default `cacheDiscountPercent: 2` no replayed
-	 * in-turn dead block qualifies, so leave this at `0` unless a measured
-	 * endpoint with weak cache discount (r ≳ 0.1) asks for it.
+	 * A clear breaks the prefix cache at the cleared block, so the only cost
+	 * that matters here is the tail behind it. 0.1.18 gated this by payback
+	 * (`earlyClearPays`); that was a money test, and on the anti-rot channel the
+	 * tail budget alone decides. Leave at `0` unless a measured session shows a
+	 * dead block whose tail is genuinely short.
 	 */
 	midTurnSuffixTokens: number;
 }
@@ -160,6 +167,7 @@ export const DEFAULT_CLM_CONFIG: ClmConfig = {
 		canary: false,
 		minTokens: 1_200,
 		minBlocks: 2,
+		minSharePercent: 5,
 		stopPercent: 60,
 		maxTokens: 40_000,
 		midTurnSuffixTokens: 0,
@@ -386,6 +394,7 @@ export function parseClmConfig(
 		config.autoClear.canary = readBoolean(autoClear, "canary", config.autoClear.canary, source, "autoClear.canary", warnings);
 		config.autoClear.minTokens = readNumber(autoClear, "minTokens", config.autoClear.minTokens, source, "autoClear.minTokens", warnings, { min: 0 });
 		config.autoClear.minBlocks = readNumber(autoClear, "minBlocks", config.autoClear.minBlocks, source, "autoClear.minBlocks", warnings, { min: 1, integer: true });
+		config.autoClear.minSharePercent = readNumber(autoClear, "minSharePercent", config.autoClear.minSharePercent, source, "autoClear.minSharePercent", warnings, { min: 0, max: 100 });
 		config.autoClear.stopPercent = readNumber(autoClear, "stopPercent", config.autoClear.stopPercent, source, "autoClear.stopPercent", warnings, { min: 0, max: 100 });
 		config.autoClear.maxTokens = readNumber(autoClear, "maxTokens", config.autoClear.maxTokens, source, "autoClear.maxTokens", warnings, { min: 1 });
 		config.autoClear.midTurnSuffixTokens = readNumber(autoClear, "midTurnSuffixTokens", config.autoClear.midTurnSuffixTokens, source, "autoClear.midTurnSuffixTokens", warnings, { min: 0, integer: true });
