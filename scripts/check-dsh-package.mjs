@@ -17,6 +17,27 @@ if (!Array.isArray(manifest.permissions) || manifest.permissions.some((permissio
 const entry = manifest.facets?.host?.entry;
 if (typeof entry !== "string" || entry.startsWith("/") || entry.includes("..")) throw new Error("invalid DSH host entry");
 if (!fs.existsSync(path.join(root, entry))) throw new Error(`DSH host entry is missing: ${entry}`);
+
+// Walk every relative import from the host entry. The DSH-only tarball is built
+// by copying a file list, and that list drifted once: the entry imported
+// auto-clear / clear-projection / plugin-record / context-prompt /
+// context-trigger / clm-config while the package shipped none of them. A static
+// closure check catches that before a tarball exists.
+const importPattern = /(?:from\s*|import\s*\(\s*)["'](\.{1,2}\/[^"']+)["']/g;
+const visited = new Set();
+function walkImports(file) {
+  if (visited.has(file)) return;
+  visited.add(file);
+  const source = fs.readFileSync(file, "utf8");
+  for (const match of source.matchAll(importPattern)) {
+    const target = path.resolve(path.dirname(file), match[1]);
+    if (!fs.existsSync(target)) {
+      throw new Error(`DSH host import is missing from the build: ${path.relative(root, target)} (imported by ${path.relative(root, file)})`);
+    }
+    if (target.endsWith(".js")) walkImports(target);
+  }
+}
+walkImports(path.join(root, entry));
 if (packageJson.dsh?.bundle?.patch !== "./cordis.patch.yml") throw new Error("package.json must expose the official DSH bundle patch");
 if (packageJson.devDependencies?.["@deepseek-ai/dsh-tools"] !== "0.2.0-rc.2") throw new Error("package.json must pin the DSH tool schema runtime for builds");
 if (packageJson.icon !== "./icon.svg") throw new Error("package.json must declare ./icon.svg as its display icon");
@@ -43,4 +64,4 @@ if (!fs.existsSync(path.join(root, "cordis.patch.yml"))) throw new Error("cordis
 for (const resource of ["icon.svg", "locale/en.json", "locale/zh.json"]) {
   if (!fs.existsSync(path.join(root, resource))) throw new Error(`DSH display resource is missing: ${resource}`);
 }
-console.log(`DSH package check passed: ${entry}`);
+console.log(`DSH package check passed: ${entry} (${visited.size} runtime files reachable)`);

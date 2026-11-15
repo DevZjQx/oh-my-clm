@@ -33,6 +33,28 @@ test("DSH community manifest and official bundle metadata point at the built hos
 // P1-6: a declared fs permission scope must describe
 // where the plugin actually writes. Artifacts live in the host temp root, so a
 // "workspace" scope is a decorative claim that implies isolation it cannot give.
+// The DSH-only tarball is staged from a file list. That list silently drifted
+// once (auto-clear, clear-projection, plugin-record, context-prompt,
+// context-trigger and clm-config were imported but not shipped), so the host
+// entry's relative imports must all exist in the built tree before packing.
+test("the DSH host entry's relative imports are all present in the build", () => {
+	const entry = path.join(root, json("dsh-plugin.json").facets.host.entry as string);
+	const importPattern = /(?:from\s*|import\s*\(\s*)["'](\.{1,2}\/[^"']+)["']/g;
+	const visited = new Set<string>();
+	const walk = (file: string): void => {
+		if (visited.has(file)) return;
+		visited.add(file);
+		const source = fs.readFileSync(file, "utf8");
+		for (const match of source.matchAll(importPattern)) {
+			const target = path.resolve(path.dirname(file), match[1] as string);
+			assert.equal(fs.existsSync(target), true, `${path.relative(root, target)} is imported but missing`);
+			if (target.endsWith(".js")) walk(target);
+		}
+	};
+	walk(entry);
+	assert.ok(visited.size >= 10, `only ${visited.size} runtime files reachable from the host entry`);
+});
+
 test("plan §3.7 (P1-6): manifest fs scopes match the real artifact root", () => {
 	const manifest = json("dsh-plugin.json");
 	const workspace = path.resolve(import.meta.dirname, "../..");

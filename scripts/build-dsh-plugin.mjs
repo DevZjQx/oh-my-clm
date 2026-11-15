@@ -17,18 +17,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const defaultOutput = path.join(root, "artifacts");
-const dshRuntimeFiles = [
-	"dist/dsh/index.js",
-	"dist/src/lib/clm-files.js",
-	"dist/src/lib/clm-paths.js",
-	"dist/src/features/live-context/context-cleanup.js",
-	"dist/src/features/live-context/context-format.js",
-	"dist/src/features/live-context/dsh-bridge.js",
-];
+// Stage the whole compiled tree instead of a hand-kept file list: the old list
+// was last updated before auto-clear, clear-projection, plugin-record,
+// context-prompt, context-trigger and clm-config existed, so the "DSH-only"
+// tarball shipped an entry that imported six files it did not contain. The
+// closure check in scripts/check-dsh-package.mjs now fails a missing import.
+const dshRuntimeRoot = "dist";
+const dshEntry = "dist/dsh/index.js";
 const packageFiles = ["README.md", "dsh-plugin.json", "cordis.patch.yml", "dist", "locale", "icon.svg"];
 const dshRuntimePeerDependencies = {
 	"@deepseek-ai/dsh-tools": "0.2.0-rc.2",
@@ -105,10 +104,11 @@ function assertBuildInputs(manifest, packageJson) {
 	if (entry !== "dist/dsh/index.js") {
 		throw new Error(`unexpected DSH host entry: ${String(entry)}`);
 	}
-	for (const relativePath of dshRuntimeFiles) {
-		if (!fs.existsSync(path.join(root, relativePath))) {
-			throw new Error(`built DSH runtime file is missing: ${relativePath}`);
-		}
+	if (!fs.existsSync(path.join(root, dshRuntimeRoot))) {
+		throw new Error(`built DSH runtime tree is missing: ${dshRuntimeRoot}`);
+	}
+	if (!fs.existsSync(path.join(root, dshEntry))) {
+		throw new Error(`built DSH host entry is missing: ${dshEntry}`);
 	}
 	for (const relativePath of ["README.md", "dsh-plugin.json", "cordis.patch.yml", "icon.svg", "locale/en.json", "locale/zh.json"]) {
 		if (!fs.existsSync(path.join(root, relativePath))) {
@@ -127,7 +127,7 @@ function createStagingPackage(stageRoot, packageJson) {
 		copyFile(relativePath, stageRoot);
 	}
 	fs.cpSync(path.join(root, "locale"), path.join(stageRoot, "locale"), { recursive: true });
-	for (const relativePath of dshRuntimeFiles) copyFile(relativePath, stageRoot);
+	fs.cpSync(path.join(root, dshRuntimeRoot), path.join(stageRoot, dshRuntimeRoot), { recursive: true });
 
 	const stagedPackageJson = { ...packageJson };
 	// These fields describe the combined Pi package or the development tree;
@@ -155,6 +155,11 @@ function createStagingPackage(stageRoot, packageJson) {
 	};
 	stagedPackageJson.files = packageFiles;
 	fs.writeFileSync(path.join(stageRoot, "package.json"), `${JSON.stringify(stagedPackageJson, null, 2)}\n`);
+	// Load the staged entry once, before packing: a relative import that resolves
+	// in the repository but not in the staged tree is exactly the packaging bug
+	// this build should never repeat.
+	const stagedEntry = pathToFileURL(path.join(stageRoot, dshEntry)).href;
+	run(process.execPath, ["--input-type=module", "-e", `await import(${JSON.stringify(stagedEntry)})`], stageRoot);
 }
 
 function main() {
