@@ -2,7 +2,14 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；实现细节见 git 提交记录与对应版本的源码注释。
 
-## 0.1.19（当前版本）
+## 0.1.20（当前版本）
+
+两处自动清理的统计口径修正：熔断的重读窗口按目标 key 记，`/clm status` 的 request 估算不再给已清正文计价。`npm test` 216/216、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
+
+- 熔断的重读窗口按目标 key 记：一批清掉同一目标的多个副本（一个文件的两份旧读取）只占一条。此前按被清块记，一次重取会自增多条并在第一次往返就拒收 key，把“重读 2 次”算成“重读 1 次 × 被清 N 次”，分子和分母单位不一致。`dsh-bridge.test.ts` 的 `one re-fetch of a target cleared twice counts as one re-read` 在旧代码上红。
+- `/clm status` 的 `estimated request` 扣除已清 target：旧值把被替换成一行的正文仍按原文计价，清得越多越偏离模型实际读到的内容；`canonical editable` 仍是 mirror（编辑面）的体积。`the request estimate deducts the bodies the model no longer reads` 在旧代码上红。
+
+## 0.1.19
 
 自动清理通道整批落地：JSON 配置、消息投影与 `appendPluginRecord` 记录缝、turn / step 两个老化时钟、canary 账本、单目标拒收与全局熔断。`npm test` 214/214、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
 
