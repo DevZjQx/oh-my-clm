@@ -68,7 +68,7 @@ assistant block 含 tool call 时，改写或删除它会级联省略配对的 t
 /clm status
 ```
 
-显示 mirror 路径与大小、editable/protected block 数、preview/canonical token 估算、Pi context usage、预算状态、shrink-only 策略和当前 branch 的 context edit 数。命令只读。没有 `/clm refresh`、`/clm export` 或 `/clm-compact`；手动压缩用 Pi 原生 `/compact`。
+显示 mirror 路径与大小、editable/protected block 数、preview/canonical token 估算、按模型可见正文估算的 request（已清 target 从中扣除）、Pi context usage、预算状态、shrink-only 策略和当前 branch 的 context edit 数。命令只读。没有 `/clm refresh`、`/clm export` 或 `/clm-compact`；手动压缩用 Pi 原生 `/compact`。
 
 ```json
 // <项目>/.oh-my-clm.json

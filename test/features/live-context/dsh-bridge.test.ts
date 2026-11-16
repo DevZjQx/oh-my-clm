@@ -1651,6 +1651,88 @@ test("a key that keeps coming back is refused without closing the channel", asyn
 });
 
 /**
+ * The numerator is targets, not cleared copies. One target can be dead in two
+ * blocks at once (two reads of one file), and the batch clears both; a single
+ * re-fetch of that target is still one re-read. Counting it per cleared block
+ * would inflate the rate and refuse the key after one round trip.
+ */
+test("one re-fetch of a target cleared twice counts as one re-read", async () => {
+	const host = await startAutoClearHost("dsh-reread-duplicates");
+	try {
+		appendRead(host.session, "call-a1", "First read of a.ts, superseded below.");
+		appendRead(host.session, "call-a2", "Second read of a.ts, also superseded.");
+		appendRead(host.session, "call-a3", "Third read of a.ts, the live copy.");
+		appendRead(host.session, "call-b1", "First read of b.ts, superseded below.", "src/b.ts");
+		appendRead(host.session, "call-b2", "Second read of b.ts, the live copy.", "src/b.ts");
+		host.session.record("turn/end", { turn: 1 });
+		await settle();
+
+		const records = host.clearRecords();
+		assert.equal(records.length, 1, "the first pass must clear");
+		const targets = records[0]?.targets as Array<{ keys?: readonly string[] }>;
+		const aKeys = targets.flatMap((entry) => entry.keys ?? []).filter((key) => key === "read\u0000src/a.ts");
+		assert.equal(aKeys.length, 2, "the batch must clear two dead copies of one target");
+
+		// One re-read per target: two dispatches for the three cleared blocks.
+		for (const [index, file] of ["src/a.ts", "src/b.ts"].entries()) {
+			host.session.record("tool/call", {
+				callId: `reread-${index}`,
+				name: "read",
+				arguments: JSON.stringify({ path: file }),
+			});
+		}
+
+		const status = await host.status();
+		assert.match(status, /2 re-read\(s\)/, "two targets, two re-reads");
+		assert.doesNotMatch(status, /refused after re-reads/, "one re-read is not a re-read twice");
+		assert.doesNotMatch(status, /stopped \(breaker\)/, "a sample below the minimum cannot latch the session");
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(host.session.id))), { recursive: true, force: true });
+	}
+});
+
+/**
+ * The mirror keeps every body; the request does not. A cleared target is a body
+ * the model reads as a one-line pointer, so the request estimate has to deduct it
+ * the way the block digest already does — otherwise `/clm status` prices content
+ * the model can no longer read.
+ */
+test("the request estimate deducts the bodies the model no longer reads", async () => {
+	const host = await startAutoClearHost("dsh-status-cleared");
+	const tokensIn = (text: string, pattern: RegExp): number => {
+		const match = pattern.exec(text);
+		assert.ok(match, `missing ${pattern} in:\n${text}`);
+		return Number(match[1]);
+	};
+	try {
+		appendRead(host.session, "call-a", "First read of the file, superseded below.");
+		appendRead(host.session, "call-b", "Second read of the same file.");
+
+		const before = await host.status();
+		const editableBefore = tokensIn(before, /canonical editable: ~(\d+) tokens/);
+		const requestBefore = tokensIn(before, /estimated request: ~(\d+) tokens/);
+		assert.equal(requestBefore, editableBefore, "with nothing cleared the estimate is the mirror");
+
+		host.session.record("turn/end", { turn: 1 });
+		await settle();
+		const cleared = (host.clearRecords()[0]?.targets as Array<{ tokens: number }>)
+			.reduce((total, entry) => total + entry.tokens, 0);
+		assert.ok(cleared > 0, "the pass must have cleared something");
+
+		const after = await host.status();
+		assert.equal(tokensIn(after, /canonical editable: ~(\d+) tokens/), editableBefore, "a log-only record does not change the editing surface");
+		assert.equal(
+			tokensIn(after, /estimated request: ~(\d+) tokens/),
+			editableBefore - cleared,
+			"the estimate must price only what the model reads",
+		);
+		assert.match(after, /cleared ~\d+/, "the line must name what it deducted");
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(host.session.id))), { recursive: true, force: true });
+	}
+});
+
+/**
  * A resumed session replays its log. The clear record must therefore carry the
  * selector's target keys: without them the re-read window is empty, and a target
  * the model already proved live is cleared a second time.

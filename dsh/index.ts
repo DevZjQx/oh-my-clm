@@ -864,7 +864,7 @@ function applyClear(ctx: DshContext, session: DshSessionLike, state: CanaryRunti
 	state.auto.clearedTotal += retired.length;
 	const now = state.tracker.resultsSeen;
 	for (const candidate of batch.candidates) {
-		for (const key of candidate.keys) state.auto.recent.push({ key, at: now });
+		for (const key of candidate.keys) rememberClearedKey(state, key, now);
 	}
 	pruneRecent(state);
 	ctx.logger?.info?.(
@@ -877,6 +877,24 @@ function applyClear(ctx: DshContext, session: DshSessionLike, state: CanaryRunti
 function pruneRecent(state: CanaryRuntime): void {
 	const now = state.tracker.resultsSeen;
 	state.auto.recent = state.auto.recent.filter((entry) => now - entry.at <= BREAKER_WINDOW_RESULTS);
+}
+
+/**
+ * Put one cleared target into the breaker window, keeping one entry per key.
+ *
+ * The window counts targets, and a batch can clear two dead copies of one target
+ * at once. One entry per cleared block would make a single re-fetch count once
+ * per copy — refusing the key after one round trip and inflating the rate that
+ * latches the session. The latest clear of a key owns its position.
+ */
+function rememberClearedKey(state: CanaryRuntime, key: string, at: number): void {
+	const index = state.auto.recent.findIndex((entry) => entry.key === key);
+	if (index < 0) {
+		state.auto.recent.push({ key, at });
+		return;
+	}
+	const existing = state.auto.recent[index];
+	if (existing !== undefined && existing.at < at) state.auto.recent[index] = { key, at };
 }
 
 /**
@@ -1027,9 +1045,7 @@ function seedCleared(state: CanaryRuntime, data: unknown): void {
 		const keys = canaryValue(target, "keys");
 		if (!Array.isArray(keys)) continue;
 		for (const key of keys) {
-			if (typeof key === "string" && key.length > 0) {
-				state.auto.recent.push({ key, at: state.tracker.resultsSeen });
-			}
+			if (typeof key === "string" && key.length > 0) rememberClearedKey(state, key, state.tracker.resultsSeen);
 		}
 	}
 	pruneRecent(state);
@@ -1440,6 +1456,17 @@ function dshStatusText(session: DshSessionLike, options: DshBridgeOptions): stri
 	const fixedTokens = options.fixedTokens ?? 0;
 	const canonicalTokens = estimateMirrorTokens(editable);
 	const previewTokens = estimateMirrorTokens(editable, (record) => record.renderText ?? record.text);
+	// The mirror is the editing surface and keeps every body; the request is not.
+	// A cleared target is a one-line pointer the model reads instead, so deduct it
+	// exactly as the usage line and the block digest do. Otherwise this estimate
+	// prices bodies the model can no longer read.
+	const cleared = clearedMarksOf(session);
+	const clearedTokens = editable.reduce(
+		(total, record) => total + (cleared.get(record.id)?.tokens ?? 0),
+		0,
+	);
+	const requestTokens = Math.max(0, fixedTokens + canonicalTokens - clearedTokens);
+	const clearedNote = clearedTokens > 0 ? ` - cleared ~${clearedTokens}` : "";
 	return [
 		"oh-my-clm status (DSH)",
 		`session: ${String(session.id)}`,
@@ -1449,7 +1476,7 @@ function dshStatusText(session: DshSessionLike, options: DshBridgeOptions): stri
 		`editable blocks: ${editable.length}`,
 		`protected blocks: ${records.length - editable.length}`,
 		`mirror preview: ~${previewTokens} tokens; canonical editable: ~${canonicalTokens} tokens`,
-		`estimated request: ~${fixedTokens + canonicalTokens} tokens (fixed request ~${fixedTokens} + editable mirror ~${canonicalTokens})`,
+		`estimated request: ~${requestTokens} tokens (fixed request ~${fixedTokens} + editable mirror ~${canonicalTokens}${clearedNote})`,
 		options.hostUsage
 			? `DSH projectedTokens: ${options.hostUsage.tokens}/${options.hostUsage.contextWindow} tokens (contextPressure occupancy; host-exact, the 3.5 chars/token estimate is used only for the edit delta)`
 			: "DSH projectedTokens: unavailable; the shrink gate falls back to the ~ estimate",
