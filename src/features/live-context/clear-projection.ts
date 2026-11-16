@@ -42,6 +42,15 @@ export interface ClearTarget {
 	readonly label: string;
 	/** Estimated tokens the body occupied, for the ledger and the placeholder. */
 	readonly tokens: number;
+	/**
+	 * Selector identity of the re-fetch targets this block held (`targetKeyOf`).
+	 *
+	 * Optional, and never read by the projection: the model-visible placeholder
+	 * must stay byte-identical whether a record carries it or not. It exists so a
+	 * replayed log can rebuild the re-read evidence the breaker needs — a resumed
+	 * session that loses those keys clears a target the model already proved live.
+	 */
+	readonly keys?: readonly string[];
 }
 
 /** Payload of {@link CLEAR_EVENT_TYPE}. */

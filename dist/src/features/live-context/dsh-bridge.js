@@ -237,6 +237,40 @@ export function dshSurfaceTokensAfterEach(session, seqs) {
     }
     return tails;
 }
+/**
+ * One-time cost of a batch: the model-visible tokens behind its earliest
+ * cleared block, minus the bodies the same batch also removes from that tail.
+ *
+ * A clear breaks the prefix cache at the cleared block, so everything after it
+ * is re-prefilled at full price on the next request while the prefix before it
+ * stays cached. Clearing several blocks in one pass pays that break once, which
+ * is why the batch is priced from its earliest target rather than per block.
+ *
+ * Pure form of {@link dshBatchSuffixTokens} for a caller that already priced the
+ * tails. `undefined` means the cost is unknown, never that it is free.
+ */
+export function batchSuffixTokens(candidates, tails) {
+    if (candidates.length === 0)
+        return undefined;
+    const earliest = Math.min(...candidates.map((candidate) => candidate.seq));
+    const behind = tails.get(earliest);
+    if (behind === undefined)
+        return undefined;
+    const removedBehind = candidates
+        .filter((candidate) => candidate.seq > earliest)
+        .reduce((total, candidate) => total + Math.max(0, candidate.tokens), 0);
+    return Math.max(0, behind - removedBehind);
+}
+/**
+ * {@link batchSuffixTokens} for a batch whose tails have not been priced yet.
+ * Returns `undefined` when no candidate has a targetable node.
+ */
+export function dshBatchSuffixTokens(session, candidates) {
+    const usable = candidates.filter((candidate) => Number.isSafeInteger(candidate.seq) && candidate.seq >= 0);
+    if (usable.length === 0)
+        return undefined;
+    return batchSuffixTokens(usable, dshSurfaceTokensAfterEach(session, usable.map((candidate) => candidate.seq)));
+}
 /** Render the trigger options deterministically for the per-turn cache key. */
 function triggerSignature(options) {
     const trigger = options.trigger ?? {};
@@ -649,6 +683,9 @@ function applyDshContextEdits(session, plan, records, options) {
 export function executeDshCleanup(session, targets, options, io, state) {
     const copy = options.cleanupResult ?? "compact";
     const records = buildDshMirrorRecords(session, options);
+    // The index is re-rendered in every step's runtime context, so a tool result
+    // carries it only on explicit opt-in.
+    const copiedIndex = () => copy === "full" ? renderDshBlockIndex(session, options) : undefined;
     const listTarget = Array.isArray(targets) ? undefined : targets.list;
     if (listTarget) {
         // Read-only drill-down: the rows of a range the index only named. It does
@@ -662,20 +699,18 @@ export function executeDshCleanup(session, targets, options, io, state) {
         hostUsage: options.hostUsage,
     });
     if (plan.status !== "applied") {
-        const index = copy === "full" ? renderDshBlockIndex(session, options) : undefined;
-        return cleanupToolResult(plan, index, copy);
+        return cleanupToolResult(plan, copiedIndex(), copy);
     }
     try {
         const mutation = applyDshContextEdits(session, plan, records, options);
         if (mutation.status !== "applied") {
-            const index = copy === "full" ? renderDshBlockIndex(session, options) : undefined;
             return cleanupToolResult({
                 status: "rejected",
                 requestedBlockIds: [...plan.requestedBlockIds],
                 removedBlockIds: [],
                 pairedRemovalIds: [],
                 reason: mutation.reason ?? "The DSH session rejected the cleanup mutation.",
-            }, index, copy);
+            }, copiedIndex(), copy);
         }
         // Removal renumbers the editable IDs, so the next render must not reuse
         // the cached index even when this call did not write the mirror. The
@@ -704,20 +739,16 @@ export function executeDshCleanup(session, targets, options, io, state) {
                 state.lastProcessedMirror = undefined;
             }
         }
-        // The refreshed index is re-rendered in every step's runtime context, so
-        // copy it into the tool result only on explicit opt-in.
-        const index = copy === "full" ? renderDshBlockIndex(session, options) : undefined;
-        return cleanupToolResult(plan, index, copy);
+        return cleanupToolResult(plan, copiedIndex(), copy);
     }
     catch (error) {
-        const index = copy === "full" ? renderDshBlockIndex(session, options) : undefined;
         return cleanupToolResult({
             status: "rejected",
             requestedBlockIds: [...plan.requestedBlockIds],
             removedBlockIds: [],
             pairedRemovalIds: [],
             reason: `DSH cleanup mutation failed: ${error instanceof Error ? error.message : String(error)}`,
-        }, index, copy);
+        }, copiedIndex(), copy);
     }
 }
 /**
@@ -772,17 +803,9 @@ export function reconcileDshMirror(state, session, io, options) {
         signature,
     };
     const projectionChanged = !previous || previous.signature !== signature || previous.filePath !== options.mirrorPath;
-    if (current === undefined || projectionChanged) {
-        io.writeText(options.mirrorPath, rendered);
-        state.lastProcessedMirror = undefined;
-    }
-    else if (candidatePlan && candidatePlan.status !== "noop") {
-        // Both successful native mutations and rejected candidates converge the
-        // external artifact back to the host-owned projection.
-        io.writeText(options.mirrorPath, rendered);
-        state.lastProcessedMirror = undefined;
-    }
-    else if (candidatePlan?.status === "noop") {
+    // A model edit (applied, rejected or noop) and any projection change converge
+    // the external artifact back to the host-owned projection.
+    if (current === undefined || projectionChanged || candidatePlan !== undefined) {
         io.writeText(options.mirrorPath, rendered);
         state.lastProcessedMirror = undefined;
     }

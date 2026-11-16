@@ -72,10 +72,18 @@ export interface ClmAutoClearConfig {
 	/**
 	 * Turn boundaries after which a block whose visible body is entirely
 	 * re-fetchable is treated as rot and cleared even if nothing fetched it
-	 * again. `0` leaves supersession as the only trigger. Keep the default in
-	 * sync with `DEFAULT_STALE_TURNS` in `auto-clear.ts`.
+	 * again. `0` leaves the other triggers. Keep the default in sync with
+	 * `DEFAULT_STALE_TURNS` in `auto-clear.ts`.
 	 */
 	staleTurns: number;
+	/**
+	 * Tool results after which the same block is rot.
+	 *
+	 * A turn is 11–39 steps wide, so the turn clock cannot age anything inside
+	 * one long turn; tool results land once per step and bound it. `0` disables
+	 * this clock. Keep the default in sync with `DEFAULT_STALE_STEPS`.
+	 */
+	staleSteps: number;
 	minTokens: number;
 	minBlocks: number;
 	/**
@@ -171,6 +179,7 @@ export const DEFAULT_CLM_CONFIG: ClmConfig = {
 		enabled: false,
 		canary: false,
 		staleTurns: 3,
+		staleSteps: 0,
 		minTokens: 1_200,
 		minBlocks: 2,
 		minSharePercent: 5,
@@ -418,6 +427,7 @@ export function parseClmConfig(
 		config.autoClear.enabled = readBoolean(autoClear, "enabled", config.autoClear.enabled, source, "autoClear.enabled", warnings);
 		config.autoClear.canary = readBoolean(autoClear, "canary", config.autoClear.canary, source, "autoClear.canary", warnings);
 		config.autoClear.staleTurns = readNumber(autoClear, "staleTurns", config.autoClear.staleTurns, source, "autoClear.staleTurns", warnings, { min: 0, integer: true });
+		config.autoClear.staleSteps = readNumber(autoClear, "staleSteps", config.autoClear.staleSteps, source, "autoClear.staleSteps", warnings, { min: 0, integer: true });
 		config.autoClear.minTokens = readNumber(autoClear, "minTokens", config.autoClear.minTokens, source, "autoClear.minTokens", warnings, { min: 0 });
 		config.autoClear.minBlocks = readNumber(autoClear, "minBlocks", config.autoClear.minBlocks, source, "autoClear.minBlocks", warnings, { min: 1, integer: true });
 		config.autoClear.minSharePercent = readNumber(autoClear, "minSharePercent", config.autoClear.minSharePercent, source, "autoClear.minSharePercent", warnings, { min: 0, max: 100 });

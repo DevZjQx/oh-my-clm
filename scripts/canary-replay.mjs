@@ -10,7 +10,7 @@
  *
  * Usage: node scripts/canary-replay.mjs <session.v4.jsonl.zstd> [...more]
  *        node scripts/canary-replay.mjs --all [--limit N] [--sessions-root DIR]
- *        [--stale-turns N]
+ *        [--stale-turns N] [--stale-steps N]
  *
  * Requires a completed `npm run build:dsh`, because it imports the compiled
  * selector rather than re-implementing it. Stored logs are zstd-compressed, so
@@ -32,7 +32,7 @@ if (!existsSync(selectorPath)) {
 	console.error("build the plugin first: npm run build:dsh");
 	process.exit(2);
 }
-const { DEFAULT_BATCH_GATE, DEFAULT_STALE_TURNS, SupersessionTracker, batchPassesGate, parseToolArguments } = await import(
+const { DEFAULT_BATCH_GATE, DEFAULT_STALE_STEPS, DEFAULT_STALE_TURNS, SupersessionTracker, batchPassesGate, parseToolArguments } = await import(
 	selectorPath.href
 );
 
@@ -88,7 +88,7 @@ function decide(tracker, turn, batches) {
 
 /** Feed one session's events through the selector exactly as the host bridge does. */
 function replay(file) {
-	const tracker = new SupersessionTracker({ staleTurns });
+	const tracker = new SupersessionTracker({ staleTurns, staleSteps });
 	const callSeqs = new Map();
 	const batches = [];
 	for (const event of readEvents(file)) {
@@ -154,11 +154,17 @@ if (!Number.isSafeInteger(staleTurns) || staleTurns < 0) {
 	console.error("--stale-turns needs a non-negative integer");
 	process.exit(2);
 }
+const staleStepsIndex = args.indexOf("--stale-steps");
+const staleSteps = staleStepsIndex >= 0 ? Number(args[staleStepsIndex + 1]) : DEFAULT_STALE_STEPS;
+if (!Number.isSafeInteger(staleSteps) || staleSteps < 0) {
+	console.error("--stale-steps needs a non-negative integer");
+	process.exit(2);
+}
 if (!sessionsRoot) {
 	console.error("--sessions-root needs a directory");
 	process.exit(2);
 }
-const valueOptions = new Set(["--limit", "--sessions-root", "--stale-turns"]);
+const valueOptions = new Set(["--limit", "--sessions-root", "--stale-turns", "--stale-steps"]);
 const positional = args.filter((arg, index) =>
 	!arg.startsWith("--") && !valueOptions.has(args[index - 1] ?? ""),
 );

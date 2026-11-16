@@ -16,9 +16,11 @@
  *   results that landed between the cleared call and its superseder, and
  *   nothing is cleared on position alone.
  * - **stale**: a block whose result landed at least `staleTurns` turn boundaries
- *   ago and whose whole body is re-fetchable. Supersession only ever names
- *   output the model just asked for again; the rot worth clearing is the large
- *   result nobody came back to, and no later call marks that dead.
+ *   and/or `staleSteps` tool results ago and whose whole body is re-fetchable.
+ *   Supersession only ever names output the model just asked for again; the rot
+ *   worth clearing is the large result nobody came back to, and no later call
+ *   marks that dead. A turn is 11–39 steps wide, so the turn clock alone cannot
+ *   age anything inside one long turn; the step clock is the one that can.
  *
  * A clear replaces the *whole* model-visible block, so both rules also require
  * that re-fetchable output is nearly all of it: a PTC program that printed live
@@ -29,6 +31,8 @@ export const REFETCH_TOOL_NAMES = ["read", "read_image", "grep", "glob", "web_fe
 export const DEFAULT_DEAD_SHARE = 0.95;
 /** Calibrated with the gate: a read from three turns ago is not the hot set. */
 export const DEFAULT_STALE_TURNS = 3;
+/** The step clock ships off: a turn count is the only calibrated age bound. */
+export const DEFAULT_STALE_STEPS = 0;
 function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -179,6 +183,7 @@ export class SupersessionTracker {
         this.options = {
             deadShare: options.deadShare ?? DEFAULT_DEAD_SHARE,
             staleTurns: options.staleTurns ?? DEFAULT_STALE_TURNS,
+            staleSteps: options.staleSteps ?? DEFAULT_STALE_STEPS,
         };
     }
     /** Register one `tool/result` landing; call ages are counted in results. */
@@ -240,6 +245,9 @@ export class SupersessionTracker {
             block.seq = seq;
         if (turn !== undefined && Number.isSafeInteger(turn))
             block.turn = turn;
+        // The step clock reads the landing index, which is stable once the block
+        // arrives: a later pass over the same block must not reset its age.
+        block.landedAt ??= this.resultsLanded;
     }
     /** Whether one block's visible body is almost entirely re-fetchable output. */
     isRefetchOnly(blockId) {
@@ -260,14 +268,24 @@ export class SupersessionTracker {
         // one; clearing it would delete live content, so require near-total death.
         return block.supersededTokens >= block.refetchTokens * this.options.deadShare;
     }
-    /** Whether a re-fetchable block has outlived its turn budget. */
+    /** Whether a re-fetchable block has outlived its turn or step budget. */
     isStale(blockId, turn) {
         const block = this.blocks.get(blockId);
-        if (block === undefined || !(this.options.staleTurns > 0))
+        if (block === undefined)
             return false;
-        if (turn === undefined || block.turn === undefined)
+        const ageTurns = turn !== undefined && block.turn !== undefined ? turn - block.turn : undefined;
+        if (this.options.staleTurns > 0 && ageTurns !== undefined && ageTurns >= this.options.staleTurns)
+            return true;
+        if (!(this.options.staleSteps > 0) || block.landedAt === undefined)
             return false;
-        return turn - block.turn >= this.options.staleTurns;
+        return this.resultsLanded - block.landedAt >= this.options.staleSteps;
+    }
+    /** Tool results since one block landed, when it has landed at all. */
+    ageStepsOf(blockId) {
+        const block = this.blocks.get(blockId);
+        if (block === undefined || block.landedAt === undefined)
+            return undefined;
+        return Math.max(0, this.resultsLanded - block.landedAt);
     }
     /**
      * Candidates a clearing pass would free right now, and their total.
@@ -294,6 +312,7 @@ export class SupersessionTracker {
             // re-fetchable call it replaces, because the pointer has to describe them.
             const named = [...this.records.values()].filter((record) => record.call.blockId === blockId && (!superseded || record.supersededBySeq !== undefined));
             const ageTurns = turn !== undefined && block.turn !== undefined ? Math.max(0, turn - block.turn) : undefined;
+            const ageSteps = this.ageStepsOf(blockId);
             candidates.push({
                 blockId,
                 seq: block.seq ?? -1,
@@ -304,6 +323,7 @@ export class SupersessionTracker {
                 ageBlocks: block.ageBlocks ?? 0,
                 reason: superseded ? "superseded" : "stale",
                 ...(ageTurns !== undefined ? { ageTurns } : {}),
+                ...(ageSteps !== undefined ? { ageSteps } : {}),
             });
         }
         return { candidates, tokens: candidates.reduce((total, candidate) => total + candidate.tokens, 0) };
@@ -338,6 +358,39 @@ export class SupersessionTracker {
         }
         return block;
     }
+}
+/**
+ * Re-reads after which one key is refused. Lower than the session-wide
+ * `BREAKER_MIN_REREADS` on purpose: the per-key answer is cheaper and should win
+ * before the global latch is a decision.
+ */
+export const BREAKER_KEY_REREADS = 2;
+export function createRereadPolicy() {
+    return { rereads: new Map(), refused: new Set() };
+}
+/**
+ * Record one re-read of a cleared target. Returns true when this re-read refused
+ * the key, so the caller can drop its evidence and keep the channel open.
+ */
+export function noteKeyReread(policy, key) {
+    if (policy.refused.has(key))
+        return true;
+    const count = (policy.rereads.get(key) ?? 0) + 1;
+    policy.rereads.set(key, count);
+    if (count < BREAKER_KEY_REREADS)
+        return false;
+    policy.refused.add(key);
+    return true;
+}
+/**
+ * Whether a candidate touches a refused key.
+ *
+ * A clear rewrites the whole block, so *any* refused key in it is enough to skip
+ * it: the placeholder would send the model back to a target it already proved is
+ * still live.
+ */
+export function candidateRefused(policy, candidate) {
+    return candidate.keys.some((key) => policy.refused.has(key));
 }
 /**
  * Calibrated defaults for the clearing gate. The plugin's live path reads

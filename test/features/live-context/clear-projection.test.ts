@@ -142,3 +142,23 @@ test("a malformed target that is already stale is skipped, not fatal", () => {
 	};
 	assert.equal(clearProjection.project(broken, context({ nodes: [3, 7, 9] })).size, 0);
 });
+
+/**
+ * Selector identity rides along so a resumed session can rebuild its re-read
+ * evidence; it must not change the model-visible result at all.
+ */
+test("target keys are replay metadata and never reach the model", () => {
+	const withKeys = {
+		...event,
+		data: {
+			v: CLEAR_VERSION,
+			targets: [{ seq: 7, label: "read /a.ts:1-3", tokens: 3_400, keys: ["read\u0000/a.ts"] }],
+		},
+	};
+	const plain = clearProjection.project(event, context());
+	const keyed = clearProjection.project(withKeys, context());
+	assert.deepEqual([...keyed.keys()], [...plain.keys()]);
+	assert.equal(JSON.stringify(keyed.get(7)), JSON.stringify(plain.get(7)));
+	assert.equal(JSON.stringify(keyed.get(7)).includes("read\u0000/a.ts"), false);
+	assert.equal(CLEAR_VERSION, 1, "an optional field must not need a version bump");
+});

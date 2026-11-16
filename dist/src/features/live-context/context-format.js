@@ -382,6 +382,25 @@ function blockPreview(text, maxChars) {
         return collapsed;
     return collapsed.slice(0, maxChars).trimEnd() + "…";
 }
+/** Preview width shared by the index, the listing and the digest. */
+function previewChars(maxPreviewChars) {
+    return Math.max(24, Math.floor(maxPreviewChars ?? DEFAULT_BLOCK_INDEX_PREVIEW_CHARS));
+}
+/** The line that accounts for a run of editable blocks the payload skipped. */
+function omittedBlocksLine(start, end) {
+    const count = end - start + 1;
+    const where = start === end ? `ID ${start}` : `IDs ${start}-${end}`;
+    return `... ${count} editable block(s) omitted (${where}).`;
+}
+/** Wrap the dynamic payload in the tag the host's static prose refers to. */
+function blockIndexDocument(header, lines) {
+    return [
+        "<oh-my-clm-block-index>",
+        header,
+        ...lines,
+        "</oh-my-clm-block-index>",
+    ].join("\n");
+}
 /**
  * Render the compact model-facing index of editable blocks.
  *
@@ -410,7 +429,7 @@ export function renderBlockIndex(records, options = {}) {
     if (editable.length === 0)
         return "";
     const displayIds = editableDisplayIds(records);
-    const maxPreviewChars = Math.max(24, Math.floor(options.maxPreviewChars ?? DEFAULT_BLOCK_INDEX_PREVIEW_CHARS));
+    const maxPreviewChars = previewChars(options.maxPreviewChars);
     const headCount = Math.max(0, Math.floor(options.headBlocks ?? DEFAULT_BLOCK_INDEX_HEAD));
     const tailCount = Math.max(0, Math.floor(options.tailBlocks ?? DEFAULT_BLOCK_INDEX_TAIL));
     const lineFor = (record) => {
@@ -421,11 +440,6 @@ export function renderBlockIndex(records, options = {}) {
         }
         return `${blockId}. ${record.role}: ${blockPreview(record.text, maxPreviewChars)}`;
     };
-    const omittedLine = (start, end) => {
-        const count = end - start + 1;
-        const where = start === end ? `ID ${start}` : `IDs ${start}-${end}`;
-        return `... ${count} editable block(s) omitted (${where}).`;
-    };
     const lines = [];
     const appendRun = (start, end) => {
         if (start > end)
@@ -435,7 +449,7 @@ export function renderBlockIndex(records, options = {}) {
     const appendOmittedRun = (start, end) => {
         if (start > end)
             return;
-        lines.push(omittedLine(start, end));
+        lines.push(omittedBlocksLine(start, end));
     };
     const headEnd = Math.min(editable.length, headCount);
     appendRun(1, headEnd);
@@ -450,12 +464,7 @@ export function renderBlockIndex(records, options = {}) {
     const header = options.autoClear
         ? "Editable blocks by cleanup ID; [cleared] blocks hold a re-read pointer, not the body. Ranges are inclusive; cleanup remains for manual removal."
         : "Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them, cleanup({ list: \"A-B\" }) to read a range's rows.";
-    return [
-        "<oh-my-clm-block-index>",
-        header,
-        ...lines,
-        "</oh-my-clm-block-index>",
-    ].join("\n");
+    return blockIndexDocument(header, lines);
 }
 /**
  * Pick the 1-based trailing window: the last `count` blocks, never overlapping
@@ -487,7 +496,7 @@ export function renderBlockList(records, range, options = {}) {
             reason: `IDs ${range.start}-${range.end} start past the end of the editable surface (last ID ${editable.length}).`,
         };
     }
-    const maxPreviewChars = Math.max(24, Math.floor(options.maxPreviewChars ?? DEFAULT_BLOCK_INDEX_PREVIEW_CHARS));
+    const maxPreviewChars = previewChars(options.maxPreviewChars);
     const maxChars = Math.max(240, Math.floor(options.maxChars ?? DEFAULT_BLOCK_LIST_CHARS));
     const header = `Read-only rows for IDs ${start}-${end}; nothing was removed.`;
     const footer = (next) => {
@@ -602,7 +611,7 @@ export function renderBlockDigest(records, options = {}) {
     const editable = records.filter((record) => !record.protected);
     if (editable.length === 0)
         return "";
-    const maxPreviewChars = Math.max(24, Math.floor(options.maxPreviewChars ?? DEFAULT_BLOCK_INDEX_PREVIEW_CHARS));
+    const maxPreviewChars = previewChars(options.maxPreviewChars);
     const maxLines = Math.max(1, Math.floor(options.maxLines ?? DEFAULT_DIGEST_MAX_LINES));
     const units = buildBlockDigestUnits(records);
     const open = units.find((unit) => unit.open);
@@ -631,11 +640,6 @@ export function renderBlockDigest(records, options = {}) {
         const noise = load - 1;
         const noiseNote = noise > 0 ? ` + ${noise} noise` : "";
         return `${where}. turn${count} (${tokens}${clearedNote}): user (${userTokens})${noiseNote}: ${preview}`;
-    };
-    const omittedLine = (start, end) => {
-        const count = end - start + 1;
-        const where = start === end ? `ID ${start}` : `IDs ${start}-${end}`;
-        return `... ${count} editable block(s) omitted (${where}).`;
     };
     const head = Math.min(visible.length, Math.max(0, Math.floor(maxLines / 2)));
     const tail = Math.max(0, maxLines - head);
@@ -667,7 +671,7 @@ export function renderBlockDigest(records, options = {}) {
     let previousEnd = 0;
     for (const unit of selected) {
         if (unit.start > previousEnd + 1) {
-            lines.push(omittedLine(previousEnd + 1, unit.start - 1));
+            lines.push(omittedBlocksLine(previousEnd + 1, unit.start - 1));
             emitHiddenLine();
         }
         lines.push(lineFor(unit));
@@ -675,7 +679,7 @@ export function renderBlockDigest(records, options = {}) {
     }
     const lastVisible = visible[visible.length - 1];
     if (lastVisible && lastVisible.end > previousEnd) {
-        lines.push(omittedLine(previousEnd + 1, lastVisible.end));
+        lines.push(omittedBlocksLine(previousEnd + 1, lastVisible.end));
         emitHiddenLine();
     }
     if (open) {
@@ -686,12 +690,7 @@ export function renderBlockDigest(records, options = {}) {
     const header = options.autoClear
         ? "Editable blocks by cleanup ID; one line per turn. [cleared] blocks hold a re-read pointer, not the body; cleanup remains for manual removal."
         : "Editable blocks by cleanup ID; ranges are inclusive. One line per turn; call cleanup({ ranges: [\"A-B\"] }) to omit a turn, cleanup({ list: \"A-B\" }) to read its rows.";
-    return [
-        "<oh-my-clm-block-index>",
-        header,
-        ...lines,
-        "</oh-my-clm-block-index>",
-    ].join("\n");
+    return blockIndexDocument(header, lines);
 }
 export function renderMirror(records, options = {}) {
     const header = [

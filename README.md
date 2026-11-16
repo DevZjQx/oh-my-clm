@@ -4,7 +4,7 @@ Pi extension + DSH/Cordis plugin。DSH 侧默认关闭一条**自动清理**通�
 
 ## 自动清理（DSH，默认关闭）
 
-`autoClear.enabled: true` 时每个 `turn/end` 结算一次：清被同一目标后续调用取代的块，以及正文**全部可重取**、且已过期 `staleTurns` 个 turn 的块；闸门为 1200 token、2 块或死内容占当前 prompt 的 5%，占用 ≥60% 停手交给宿主 compaction，重读率过高会熔断。计时器按 step 计，结算点留在 turn 边界，让一次断点摊到整批块上；`autoClear.midTurnSuffixTokens` 可单独放开尾部很短的 turn 内清理。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
+`autoClear.enabled: true` 时每个 `turn/end` 结算一次：清被同一目标后续调用取代的块，以及正文**全部可重取**、且已过期 `staleTurns` 个 turn 或 `staleSteps` 个 tool result 的块；闸门为 1200 token、2 块或死内容占当前 prompt 的 5%，占用 ≥60% 停手交给宿主 compaction；同一个目标被重读 2 次即拒收该 key，全局重读率过高才熔断。计时器按 step 计（老化另有 `staleSteps` 时钟），结算点留在 turn 边界，让一次断点摊到整批块上；`autoClear.midTurnSuffixTokens` 可单独放开尾部很短的 turn 内清理。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
 
 ## 手动通道：mirror 与 cleanup
 
@@ -127,7 +127,8 @@ mirror 只是编辑面：原始 session JSONL / DSH session log 是事实来源�
 | `cleanup.trigger.minSavingsTokens` | `0` | 小于该估算 token 的 turn 不作为候选。 |
 | `autoClear.enabled` | `false` | 真正清理：把被取代或已老化的可重取 tool result 换成重取指针。 |
 | `autoClear.canary` | `false` | 只记录自动清理决策到 `CANARY.jsonl`，不改模型输入。 |
-| `autoClear.staleTurns` | `3` | 一个正文全可重取的块过期多少 turn 后按 rot 清理，不再要求被取代；`0` 关闭年龄规则。 |
+| `autoClear.staleTurns` | `3` | 一个正文全可重取的块过期多少 turn 后按 rot 清理，不再要求被取代；`0` 关闭 turn 时钟。 |
+| `autoClear.staleSteps` | `0` | 同一个块过期多少个 tool result（约等于 step）后按 rot 清理。一个 turn 有 11–39 个 step，所以 turn 时钟管不到单个长 turn 内部；`0` 关闭该时钟。 |
 | `autoClear.minTokens` | `1200` | 一批至少释放的 token；低于它不值得断一次前缀。 |
 | `autoClear.minBlocks` | `2` | 或者至少这么多个候选块。 |
 | `autoClear.minSharePercent` | `5` | 或者候选块占当前 prompt 的百分比达到该值；`0` = 只按量。这是抗 rot 判据，不是省钱判据。 |

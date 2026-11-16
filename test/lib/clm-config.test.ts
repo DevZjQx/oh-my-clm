@@ -189,3 +189,17 @@ test("step clocks and the request horizon are their own keys, defaulting off", (
 	assert.ok(bad.warnings.some((warning) => warning.includes("cleanup.trigger.completedSteps")));
 	assert.ok(bad.warnings.some((warning) => warning.includes("autoClear.midTurnSuffixTokens")));
 });
+
+/**
+ * The step clock is a second aging trigger, not a replacement, so its default
+ * has to leave every existing config's decisions untouched.
+ */
+test("the stale rule has a step budget that ships off", () => {
+	assert.equal(DEFAULT_CLM_CONFIG.autoClear.staleSteps, 0);
+	const parsed = parseClmConfig({ autoClear: { staleSteps: 12 } }, DEFAULT_CLM_CONFIG, "steps.json");
+	assert.deepEqual(parsed.warnings, []);
+	assert.equal(parsed.config.autoClear.staleSteps, 12);
+	const bad = parseClmConfig({ autoClear: { staleSteps: -1 } }, DEFAULT_CLM_CONFIG, "bad-steps.json");
+	assert.equal(bad.config.autoClear.staleSteps, 0);
+	assert.ok(bad.warnings.some((warning) => warning.includes("autoClear.staleSteps")));
+});

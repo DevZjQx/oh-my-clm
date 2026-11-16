@@ -381,6 +381,27 @@ function rejectedCleanupResult(requestedBlockIds: readonly number[], reason: str
 	};
 }
 
+/**
+ * The declared output is the tool's model-visible contract, so `details` carries
+ * the full result while `structuredContent` carries only declared fields.
+ */
+function cleanupToolResponse(result: CleanupToolResult) {
+	return {
+		content: [{ type: "text" as const, text: formatCleanupToolResult(result) }],
+		details: result,
+		structuredContent: {
+			status: result.status,
+			requestedBlockIds: result.requestedBlockIds,
+			removedBlockIds: result.removedBlockIds,
+			pairedRemovalIds: result.pairedRemovalIds,
+			...(result.offloadedBlockIds === undefined ? {} : { offloadedBlockIds: result.offloadedBlockIds }),
+			reason: result.reason,
+			...(result.rows === undefined ? {} : { rows: result.rows }),
+		},
+		isError: result.status === "rejected",
+	};
+}
+
 function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolResult {
 	const state = sessionState(ctx);
 	const parsedArgs = parseCleanupArgs(params);
@@ -687,35 +708,9 @@ export default function (pi: ExtensionAPI) {
 		executionMode: "sequential",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) {
-				const result = rejectedCleanupResult([], "cleanup was cancelled before the mirror was changed.");
-				return {
-					content: [{ type: "text", text: formatCleanupToolResult(result) }],
-					details: result,
-					structuredContent: {
-						status: result.status,
-						requestedBlockIds: result.requestedBlockIds,
-						removedBlockIds: result.removedBlockIds,
-						pairedRemovalIds: result.pairedRemovalIds,
-						reason: result.reason,
-					},
-					isError: true,
-				};
+				return cleanupToolResponse(rejectedCleanupResult([], "cleanup was cancelled before the mirror was changed."));
 			}
-			const result = executePiCleanup(params, ctx);
-			return {
-				content: [{ type: "text", text: formatCleanupToolResult(result) }],
-				details: result,
-				structuredContent: {
-					status: result.status,
-					requestedBlockIds: result.requestedBlockIds,
-					removedBlockIds: result.removedBlockIds,
-					pairedRemovalIds: result.pairedRemovalIds,
-					...(result.offloadedBlockIds === undefined ? {} : { offloadedBlockIds: result.offloadedBlockIds }),
-					reason: result.reason,
-					...(result.rows === undefined ? {} : { rows: result.rows }),
-				},
-				isError: result.status === "rejected",
-			};
+			return cleanupToolResponse(executePiCleanup(params, ctx));
 		},
 	});
 

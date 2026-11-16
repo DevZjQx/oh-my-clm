@@ -2,11 +2,11 @@ import * as fs from "node:fs";
 import { CLM_MIRROR_FILENAME, CLM_TEMP_ROOT, sessionCanaryPath, sessionMirrorPath, } from "../src/lib/clm-paths.js";
 import { loadClmConfig } from "../src/lib/clm-config.js";
 import { appendPrivateLine, writePrivateText } from "../src/lib/clm-files.js";
-import { REFETCH_TOOL_NAMES, SupersessionTracker, batchPassesGate, parseToolArguments, targetKeyOf, } from "../src/features/live-context/auto-clear.js";
+import { BREAKER_KEY_REREADS, REFETCH_TOOL_NAMES, SupersessionTracker, batchPassesGate, candidateRefused, createRereadPolicy, noteKeyReread, parseToolArguments, targetKeyOf, } from "../src/features/live-context/auto-clear.js";
 import { CLEAR_EVENT_TYPE, CLEAR_VERSION, CLEAR_LABEL_MAX_CHARS, clearProjection, } from "../src/features/live-context/clear-projection.js";
 import { dshPromptText } from "../src/features/live-context/context-prompt.js";
 import { resolvePluginRecordWriter, } from "../src/features/live-context/plugin-record.js";
-import { buildDshMirrorRecords, dshBlockIndexText, dshOpenTurnStep, dshSurfaceTokensAfterEach, dshTriggerView, executeDshCleanup, reconcileDshMirror, } from "../src/features/live-context/dsh-bridge.js";
+import { batchSuffixTokens, buildDshMirrorRecords, dshBatchSuffixTokens, dshBlockIndexText, dshOpenTurnStep, dshSurfaceTokensAfterEach, dshTriggerView, executeDshCleanup, reconcileDshMirror, } from "../src/features/live-context/dsh-bridge.js";
 import { estimateMirrorTokens, estimateTokens, hostUsageOf, renderMirror, } from "../src/features/live-context/context-format.js";
 import { formatCleanupToolResult, parseCleanupArgs, parseCleanupResultCopy, } from "../src/features/live-context/context-cleanup.js";
 export const name = "oh-my-clm";
@@ -181,7 +181,7 @@ function feedCanary(ctx, session, event, state, allowPass = true) {
     }
     // Snapshot before scheduling: the turn counters belong to the turn that just
     // ended, and the host may append the next turn before the deferred pass runs.
-    const settlement = settlementOf(state, { turn }, batch, batchPassesGate(batch, state.gate, usage?.tokens ?? 0), usage);
+    const settlement = settlementOf(state, { turn }, batch, batchPassesGate(batch, state.gate, usage?.tokens ?? 0), usage, dshBatchSuffixTokens(session, batch.candidates));
     resetTurnQuality(state);
     scheduleSettlement(ctx, session, state, settlement);
 }
@@ -218,7 +218,7 @@ function maybeMidTurnPass(ctx, session, state, turn, step) {
         return;
     if (state.midTurnTurn === turnNumber)
         return;
-    const batch = state.tracker.peekBatch(turnNumber);
+    const batch = liveBatchOf(state, state.tracker.peekBatch(turnNumber));
     if (batch.candidates.length === 0)
         return;
     const tails = dshSurfaceTokensAfterEach(session, batch.candidates.map((candidate) => candidate.seq).filter((seq) => Number.isSafeInteger(seq) && seq >= 0));
@@ -239,7 +239,7 @@ function maybeMidTurnPass(ctx, session, state, turn, step) {
     // The volume gate is deliberately bypassed: it exists to amortise one break
     // over many blocks, and this break is already free (or priced above).
     const usage = hostUsageFor(session, state.config);
-    const settlement = settlementOf(state, { turn: turnNumber, step: stepNumber }, { candidates: cheap, tokens: freed }, true, usage);
+    const settlement = settlementOf(state, { turn: turnNumber, step: stepNumber }, { candidates: cheap, tokens: freed }, true, usage, batchSuffixTokens(cheap, tails));
     // The ration is spent only by a pass that actually wrote its record: a skip for
     // a transient reason (occupancy, projection not registered) must get another
     // chance inside this same turn. Reserve it now — a second `step/end` in the
@@ -252,12 +252,13 @@ function maybeMidTurnPass(ctx, session, state, turn, step) {
     });
 }
 /** Everything one settlement needs, read at the boundary it belongs to. */
-function settlementOf(state, where, batch, gate, usage) {
+function settlementOf(state, where, batch, gate, usage, suffixTokens) {
     return {
         where,
         batch,
         gate,
         usage,
+        ...(suffixTokens === undefined ? {} : { suffixTokens }),
         turn: {
             rereads: state.auto.turnRereads,
             errors: state.auto.turnErrors,
@@ -329,21 +330,32 @@ function runPass(ctx, session, state, settlement) {
         turn: where.turn,
         candidates: batch.candidates.length,
         tokens: batch.tokens,
-        outcome: applied
-            ? "cleared"
-            : blocked !== undefined
-                ? blocked
-                : enabled
-                    ? "rejected"
-                    : gate ? "canary" : "gate",
+        outcome: passOutcome(applied, blocked, enabled, gate),
     };
     if (canaryEnabled(state.config))
         writeCanaryRecord(ctx, session, state, { ...settlement, batch });
     return applied;
 }
-/** The part of a captured batch that is still unretired when its settlement runs. */
+/**
+ * Why this settlement cleared or skipped, in the order the checks ran: the pass
+ * either applied, was refused by one named check, was rejected by the host, or
+ * never ran because clearing is off (canary armed the gate, or it stayed shut).
+ */
+function passOutcome(applied, blocked, enabled, gate) {
+    if (applied)
+        return "cleared";
+    if (blocked !== undefined)
+        return blocked;
+    if (enabled)
+        return "rejected";
+    return gate ? "canary" : "gate";
+}
+/**
+ * The part of a captured batch a settlement may still act on: nothing a pass
+ * ahead of it retired, and nothing touching a key this session refused.
+ */
 function liveBatchOf(state, batch) {
-    const candidates = batch.candidates.filter((candidate) => !state.tracker.isRetired(candidate.blockId));
+    const candidates = batch.candidates.filter((candidate) => !state.tracker.isRetired(candidate.blockId) && !candidateRefused(state.auto.reread, candidate));
     if (candidates.length === batch.candidates.length)
         return batch;
     return { candidates, tokens: candidates.reduce((total, candidate) => total + Math.max(0, candidate.tokens), 0) };
@@ -373,6 +385,7 @@ function writeCanaryRecord(ctx, session, state, settlement) {
         turn: settlement.where.turn ?? null,
         ...(settlement.where.step !== undefined ? { step: settlement.where.step } : {}),
         tokens: fresh.reduce((total, candidate) => total + candidate.tokens, 0),
+        ...(settlement.suffixTokens === undefined ? {} : { suffixTokens: settlement.suffixTokens }),
         candidates: fresh,
         gate: settlement.gate,
         ...(state.auto.last !== undefined ? { outcome: state.auto.last.outcome } : {}),
@@ -502,7 +515,14 @@ function applyClear(ctx, session, state, batch) {
         if (candidate.label.length === 0 || candidate.label.length > CLEAR_LABEL_MAX_CHARS)
             continue;
         const size = Math.max(0, Math.round(candidate.tokens));
-        targets.push({ seq: candidate.seq, label: candidate.label, tokens: size });
+        targets.push({
+            seq: candidate.seq,
+            label: candidate.label,
+            tokens: size,
+            // Replay metadata: the projection ignores it, and a resumed session uses
+            // it to keep the breaker's re-read evidence.
+            ...(candidate.keys.length > 0 ? { keys: candidate.keys } : {}),
+        });
         retired.push(candidate.blockId);
         tokens += size;
     }
@@ -562,6 +582,15 @@ function noteRefetch(ctx, state, name, args) {
         state.auto.rereads += 1;
         state.auto.turnRereads += 1;
         state.auto.qualityDirty = true;
+        // One target that keeps coming back is a mispriced target, not a broken
+        // selector. Refuse that key, drop its evidence, and leave the channel open
+        // for every other block; the session-wide latch below is for a rate spread
+        // across several keys.
+        if (noteKeyReread(state.auto.reread, key)) {
+            state.auto.recent = state.auto.recent.filter((entry) => entry.key !== key);
+            ctx.logger?.warn?.(`oh-my-clm: not clearing ${key} again this session: it came back ${BREAKER_KEY_REREADS}× after being cleared`);
+            return;
+        }
         const total = Math.max(state.auto.clearedTotal, 1);
         if (state.auto.rereads < BREAKER_MIN_REREADS || state.auto.rereads * 2 < total)
             continue;
@@ -608,7 +637,10 @@ function installClearProjection(ctx, state) {
 function seedCanary(ctx, session, projection, config) {
     const state = {
         config,
-        tracker: new SupersessionTracker({ staleTurns: config.autoClear.staleTurns }),
+        tracker: new SupersessionTracker({
+            staleTurns: config.autoClear.staleTurns,
+            staleSteps: config.autoClear.staleSteps,
+        }),
         callSeqs: new Map(),
         callKeys: new Map(),
         gate: canaryGate(config),
@@ -626,6 +658,7 @@ function seedCanary(ctx, session, projection, config) {
             turnErrors: 0,
             turnErrorRereads: 0,
             qualityDirty: false,
+            reread: createRereadPolicy(),
         },
         writer: { state: "pending" },
     };
@@ -663,7 +696,19 @@ function seedCleared(state, data) {
         const tokens = canaryValue(target, "tokens");
         if (typeof tokens === "number" && Number.isFinite(tokens))
             state.auto.clearedTokens += Math.max(0, tokens);
+        // Put the cleared keys back in the breaker window at the position they had
+        // in the log: the seed replays events in order, so a later recorded re-read
+        // ages them exactly as it did live.
+        const keys = canaryValue(target, "keys");
+        if (!Array.isArray(keys))
+            continue;
+        for (const key of keys) {
+            if (typeof key === "string" && key.length > 0) {
+                state.auto.recent.push({ key, at: state.tracker.resultsSeen });
+            }
+        }
     }
+    pruneRecent(state);
 }
 function readText(filePath) {
     try {
@@ -1078,12 +1123,17 @@ function autoClearStatusText(state) {
     // Four zeroes are one fact unless the line says which check stopped the last
     // settlement: no candidate, the gate, occupancy, the seam, or the breaker.
     const last = state.auto.last;
+    // A refused key is a per-target stop, so the line has to name it: otherwise a
+    // block that is never cleared again looks like a selector that missed it.
+    const refused = state.auto.reread.refused.size > 0
+        ? ` · ${state.auto.reread.refused.size} key(s) refused after re-reads`
+        : "";
     const lastText = last === undefined
         ? "last: none"
         : `last: ${last.outcome} (turn ${String(last.turn ?? "?")}, ${last.candidates} candidate(s), ~${last.tokens} tok)`;
     if (!state.config.autoClear.enabled) {
         const stop = state.auto.stop === undefined ? "open" : `stopped (${state.auto.stop})`;
-        return `auto-clear: canary only · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s) · ${lastText}`;
+        return `auto-clear: canary only · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s)${refused} · ${lastText}`;
     }
     const armed = state.writer.state === "missing"
         ? "off: this host exposes no ignorable plugin-record seam"
@@ -1091,7 +1141,7 @@ function autoClearStatusText(state) {
             ? "starting: resolving the host record seam"
             : state.projection.ready ? "armed" : "armed, no projection";
     const stop = state.auto.stop === undefined ? "open" : `stopped (${state.auto.stop})`;
-    return `auto-clear: ${armed} · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s) · ${lastText}`;
+    return `auto-clear: ${armed} · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s)${refused} · ${lastText}`;
 }
 function createDshClmCommand(onModeChange, autoStatus) {
     return {

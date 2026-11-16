@@ -4,7 +4,10 @@ import {
 	DEFAULT_BATCH_GATE,
 	SupersessionTracker,
 	batchPassesGate,
+	candidateRefused,
+	createRereadPolicy,
 	describeCall,
+	noteKeyReread,
 	parseToolArguments,
 	readWindowOf,
 	supersedes,
@@ -311,3 +314,74 @@ test("pointer labels name the target and stay one line", () => {
 });
 
 
+
+/**
+ * The stale rule's second clock. A turn is 11–39 steps wide, so a turn count
+ * cannot age anything inside one long turn; tool results land once per step, so
+ * counting them bounds the age the way the turn count never can.
+ */
+test("a block also ages by tool results, not only by turn boundaries", () => {
+	const tracker = new SupersessionTracker({ staleTurns: 0, staleSteps: 3 });
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "old", 1));
+	tracker.noteOutput(1, 2_000);
+	tracker.noteBlockLanding();
+	tracker.noteBlockTokens("old", 2_000, 42, 2);
+	// Two results later it is still inside the step budget, and no turn boundary
+	// exists to age it.
+	assert.deepEqual(tracker.peekBatch().candidates, []);
+	tracker.noteBlockLanding();
+	tracker.noteBlockLanding();
+	assert.deepEqual(tracker.peekBatch().candidates, []);
+	tracker.noteBlockLanding();
+	const [candidate] = tracker.peekBatch().candidates;
+	assert.equal(candidate?.blockId, "old");
+	assert.equal(candidate?.reason, "stale");
+	assert.equal(candidate?.ageSteps, 3);
+	// The turn clock is off, so this is purely the step clock: no boundary needed.
+	assert.equal(candidate?.ageTurns, undefined);
+});
+
+test("the step clock is off by default and can be disabled on its own", () => {
+	const tracker = new SupersessionTracker();
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "old", 1));
+	tracker.noteOutput(1, 2_000);
+	tracker.noteBlockLanding();
+	tracker.noteBlockTokens("old", 2_000, 42, 1);
+	for (let index = 0; index < 50; index += 1) tracker.noteBlockLanding();
+	assert.deepEqual(tracker.peekBatch(1).candidates, []);
+
+	const turnOnly = new SupersessionTracker({ staleTurns: 1, staleSteps: 0 });
+	turnOnly.noteCall(call("read", { file_path: "/a.ts" }, "old", 1));
+	turnOnly.noteOutput(1, 2_000);
+	turnOnly.noteBlockLanding();
+	turnOnly.noteBlockTokens("old", 2_000, 42, 1);
+	for (let index = 0; index < 50; index += 1) turnOnly.noteBlockLanding();
+	assert.deepEqual(turnOnly.peekBatch(1).candidates, [], "steps alone must not age it");
+	assert.equal(turnOnly.peekBatch(2).candidates[0]?.reason, "stale");
+});
+
+/**
+ * Refusing one key is the surgical answer to a target that keeps coming back;
+ * the session-wide latch is for a rate spread across many keys. Without it, one
+ * pathological file shuts the whole channel.
+ */
+test("a key that keeps coming back is refused, not the whole session", () => {
+	const policy = createRereadPolicy();
+	assert.equal(noteKeyReread(policy, "read\u0000/a.ts"), false);
+	assert.equal(noteKeyReread(policy, "read\u0000/a.ts"), true);
+	assert.deepEqual([...policy.refused], ["read\u0000/a.ts"]);
+	// A different target is untouched, so the channel stays open for it.
+	assert.equal(noteKeyReread(policy, "read\u0000/b.ts"), false);
+	assert.deepEqual([...policy.refused], ["read\u0000/a.ts"]);
+});
+
+test("a candidate that touches a refused key is skipped whole", () => {
+	const policy = createRereadPolicy();
+	const candidate = { keys: ["read\u0000/a.ts", "grep\u0000x"] };
+	assert.equal(candidateRefused(policy, candidate), false);
+	noteKeyReread(policy, "read\u0000/a.ts");
+	noteKeyReread(policy, "read\u0000/a.ts");
+	// Clearing rewrites the whole block, so one refused key inside it is enough:
+	// the model would be sent back to a target it already proved is live.
+	assert.equal(candidateRefused(policy, candidate), true);
+});

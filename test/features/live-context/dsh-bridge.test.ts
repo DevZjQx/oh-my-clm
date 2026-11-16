@@ -8,9 +8,11 @@ import { apply as dshHost } from "../../../dsh/index.ts";
 // package (its tool scheduler is keyed by a module-level Symbol), but the test
 // needs the host's real output validator to reproduce INVALID_TOOL_OUTPUT.
 import { validateJsonSchemaValue } from "@deepseek-ai/dsh-tools";
-import { sessionMirrorPath } from "../../../src/lib/clm-paths.ts";
+import { sessionCanaryPath, sessionMirrorPath } from "../../../src/lib/clm-paths.ts";
 import {
+	batchSuffixTokens,
 	buildDshMirrorRecords,
+	dshBatchSuffixTokens,
 	dshBlockIndexText,
 	dshSurfaceTokensAfter,
 	executeDshCleanup,
@@ -1459,4 +1461,229 @@ test("the surface tail behind a block is measured for a mid-turn clear", () => {
 		content: [{ type: "text", text: `Snapshot that is ${"not a tail ".repeat(500)}` }],
 	}, { surfaceOp: { op: "append" } });
 	assert.equal(dshSurfaceTokensAfter(session, last), 0);
+});
+
+/**
+ * The ledger's cost half. One batch pays one prefix break, so the bytes a later
+ * request must re-prefill start after the earliest cleared block and exclude the
+ * bodies the same batch also removes from that tail.
+ */
+test("a batch's re-prefill cost starts after its earliest cleared block", () => {
+	const tails = new Map([[3, 500], [4, 20]]);
+	assert.equal(batchSuffixTokens([{ seq: 3, tokens: 200 }], tails), 500);
+	assert.equal(batchSuffixTokens([{ seq: 3, tokens: 200 }, { seq: 4, tokens: 50 }], tails), 450);
+	assert.equal(batchSuffixTokens([], tails), undefined);
+	assert.equal(batchSuffixTokens([{ seq: 9, tokens: 1 }], tails), undefined, "an unpriced seq is not free");
+
+	const session = dshSession("/workspace/cost", "dsh-cost");
+	const assistant = session.surface.nodes[2];
+	assert.ok(assistant !== undefined);
+	assert.equal(
+		dshBatchSuffixTokens(session, [{ seq: assistant, tokens: 0 }]),
+		dshSurfaceTokensAfter(session, assistant),
+	);
+	assert.equal(dshBatchSuffixTokens(session, [{ seq: -1, tokens: 5 }]), undefined);
+});
+
+/**
+ * Drive the host entry far enough to settle one real clearing pass, so the
+ * ledger line can be read back from `CANARY.jsonl`.
+ *
+ * Clearing needs both host seams: an ignorable-record writer (pointed at a
+ * temporary module through `host.pluginRecordModule`) and a `sessions` service
+ * carrying the message projection. Without them a pass is skipped, which is why
+ * a canary-only test cannot observe what clearing actually did.
+ */
+interface AutoClearHost {
+	readonly session: TestSession;
+	readonly emit: (name: string, ...args: unknown[]) => Promise<unknown>;
+	readonly status: () => Promise<string>;
+	readonly canaryLines: () => Array<Record<string, unknown>>;
+	readonly clearRecords: () => Array<Record<string, unknown>>;
+}
+
+async function startAutoClearHost(
+	id: string,
+	extraConfig: Record<string, unknown> = {},
+	seed?: (session: TestSession) => void,
+): Promise<AutoClearHost> {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-autoclear-"));
+	const seam = path.join(cwd, "seam.mjs");
+	fs.writeFileSync(
+		seam,
+		"export function appendPluginRecord(session, type, data) {\n\tsession.record(type, data);\n\treturn 1;\n}\n",
+		"utf8",
+	);
+	writeConfig(cwd, {
+		autoClear: {
+			enabled: true,
+			canary: true,
+			staleTurns: 0,
+			minTokens: 0,
+			minBlocks: 1,
+			minSharePercent: 0,
+			stopPercent: 90,
+		},
+		host: { pluginRecordModule: seam },
+		...extraConfig,
+	});
+	const root = listenerContext();
+	const agentContext = listenerContext();
+	const logs: string[] = [];
+	let session: TestSession;
+	session = dshSession(cwd, id, (event) => {
+		void root.emit("session/event", session, event);
+	});
+	// History that exists before the plugin loads, i.e. a resumed session.
+	seed?.(session);
+	dshHost({
+		...root,
+		// The clearing projection installs synchronously in `apply` when the
+		// `sessions` service is readable; `sessionProjections` stays absent so the
+		// usage line falls back to the `~` estimate.
+		get: (name: string) => name === "sessions"
+			? { registerMessageProjection: () => () => {} }
+			: undefined,
+		logger: { info: (message: string) => logs.push(message), warn: (message: string) => logs.push(message) },
+	} as any);
+	const agent = { id: String(session.id), session, ctx: agentContext };
+	await root.emit("agent/created", { agent });
+	const command = root.commands.definitions.get("clm");
+	return {
+		session,
+		emit: (name: string, ...args: unknown[]) => root.emit(name, ...args),
+		async status() {
+			const result = await command.handler({ agent, rawInput: "status" });
+			return String(result.text ?? "");
+		},
+		canaryLines() {
+			const file = sessionCanaryPath(String(session.id));
+			if (!fs.existsSync(file)) return [];
+			return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+		},
+		clearRecords() {
+			return session.snapshotEvents()
+				.filter((event) => event.type === "plugin:oh-my-clm/clear")
+				.map((event) => event.data as Record<string, unknown>);
+		},
+	};
+}
+
+/** Append one complete `read` call/result pair for one target path. */
+function appendRead(session: TestSession, callId: string, text: string, file = "src/a.ts"): void {
+	session.record("tool/call", { callId, name: "read", arguments: JSON.stringify({ path: file }) });
+	session.append("tool/result", {
+		message: {
+			id: `tool-${callId}`,
+			role: "tool",
+			source: { kind: "tool", callId },
+			toolCallId: callId,
+			content: [{ type: "text", text }],
+		},
+	}, { surfaceOp: { op: "append" } } as any);
+}
+
+async function settle(): Promise<void> {
+	for (let index = 0; index < 4; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+test("the canary ledger records what one pass must re-prefill", async () => {
+	const host = await startAutoClearHost("dsh-cost-ledger");
+	try {
+		// Two reads of one target: the second retires the first, which leaves the
+		// second read's output behind the cleared block as a real tail.
+		appendRead(host.session, "call-a", "First read of the file, a long output that will be superseded.");
+		appendRead(host.session, "call-b", "Second read of the same file, which the model already has.");
+		host.session.record("turn/end", { turn: 1 });
+		await settle();
+
+		const records = host.clearRecords();
+		assert.equal(records.length, 1, "the pass must have cleared, not been skipped");
+		const lines = host.canaryLines();
+		const cleared = lines.filter((line) => line.outcome === "cleared");
+		assert.equal(cleared.length, 1);
+		const line = cleared[0] as { suffixTokens?: number; tokens?: number };
+		assert.ok((line.tokens ?? 0) > 0);
+		assert.equal(typeof line.suffixTokens, "number", "the ledger must carry the cost side");
+		assert.ok((line.suffixTokens ?? 0) > 0, "a block with a tail is not free to clear");
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(host.session.id))), { recursive: true, force: true });
+	}
+});
+
+/**
+ * One target the model keeps asking for is a mispriced target, not a broken
+ * selector. Refusing that key has to leave the channel open for every other
+ * dead block, otherwise a single hot file silently disables clearing.
+ */
+test("a key that keeps coming back is refused without closing the channel", async () => {
+	const host = await startAutoClearHost("dsh-reread-policy");
+	try {
+		appendRead(host.session, "call-a", "First read of the file, a long output that will be superseded.");
+		appendRead(host.session, "call-b", "Second read of the same file, which the model already has.");
+		host.session.record("turn/end", { turn: 1 });
+		await settle();
+		assert.equal(host.clearRecords().length, 1, "the first pass must clear");
+
+		// Three re-reads of the cleared target: the model proves it is still live.
+		for (const index of [0, 1, 2]) {
+			host.session.record("tool/call", {
+				callId: `reread-${index}`,
+				name: "read",
+				arguments: JSON.stringify({ path: "src/a.ts" }),
+			});
+		}
+
+		// A different dead target, so the next boundary has something to clear.
+		appendRead(host.session, "call-c", "First read of another file, superseded below.", "src/b.ts");
+		appendRead(host.session, "call-d", "Second read of that other file.", "src/b.ts");
+		host.session.record("turn/end", { turn: 2 });
+		await settle();
+
+		assert.equal(host.clearRecords().length, 2, "a refused key must not stop another target");
+		const status = await host.status();
+		assert.doesNotMatch(status, /stopped \(breaker\)/);
+		assert.match(status, /2 re-read\(s\)/);
+		assert.match(status, /1 key\(s\) refused after re-reads/);
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(host.session.id))), { recursive: true, force: true });
+	}
+});
+
+/**
+ * A resumed session replays its log. The clear record must therefore carry the
+ * selector's target keys: without them the re-read window is empty, and a target
+ * the model already proved live is cleared a second time.
+ */
+test("a resumed session keeps the re-read evidence of an earlier clear", async () => {
+	const target = { node: -1 };
+	const host = await startAutoClearHost("dsh-seed-keys", {}, (session) => {
+		appendRead(session, "call-a", "First read of the file, superseded below.");
+		appendRead(session, "call-b", "Second read of the same file.");
+		target.node = session.surface.nodes[5] ?? -1;
+		session.record("plugin:oh-my-clm/clear", {
+			v: 1,
+			targets: [{
+				seq: target.node,
+				label: "read src/a.ts",
+				tokens: 100,
+				keys: ["read\u0000src/a.ts"],
+			}],
+		});
+	});
+	try {
+		assert.ok(target.node >= 0, "the seeded log must target a real surface node");
+		for (const index of [0, 1]) {
+			host.session.record("tool/call", {
+				callId: `resume-reread-${index}`,
+				name: "read",
+				arguments: JSON.stringify({ path: "src/a.ts" }),
+			});
+		}
+		const status = await host.status();
+		assert.match(status, /2 re-read\(s\)/, "the seeded clear must be matched by the live re-reads");
+		assert.match(status, /1 key\(s\) refused after re-reads/);
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(host.session.id))), { recursive: true, force: true });
+	}
 });

@@ -16,9 +16,11 @@
  *   results that landed between the cleared call and its superseder, and
  *   nothing is cleared on position alone.
  * - **stale**: a block whose result landed at least `staleTurns` turn boundaries
- *   ago and whose whole body is re-fetchable. Supersession only ever names
- *   output the model just asked for again; the rot worth clearing is the large
- *   result nobody came back to, and no later call marks that dead.
+ *   and/or `staleSteps` tool results ago and whose whole body is re-fetchable.
+ *   Supersession only ever names output the model just asked for again; the rot
+ *   worth clearing is the large result nobody came back to, and no later call
+ *   marks that dead. A turn is 11–39 steps wide, so the turn clock alone cannot
+ *   age anything inside one long turn; the step clock is the one that can.
  *
  * A clear replaces the *whole* model-visible block, so both rules also require
  * that re-fetchable output is nearly all of it: a PTC program that printed live
@@ -56,8 +58,10 @@ interface RefetchRecord {
 interface BlockRecord {
 	/** Session seq of the `tool/result` that carries this block. */
 	seq?: number;
-	/** Turn the block's result landed in; the clock behind the stale rule. */
+	/** Turn the block's result landed in; the coarse clock behind the stale rule. */
 	turn?: number;
+	/** Tool results that had landed when this block's result arrived; the fine clock. */
+	landedAt?: number;
 	/** Model-visible tokens of the whole block, once its result lands. */
 	tokens: number;
 	/** Tokens of the re-fetchable calls whose output sits in this block. */
@@ -90,6 +94,8 @@ export interface ClearCandidate {
 	readonly reason: ClearReason;
 	/** Turn boundaries since the block landed, when both turns are known. */
 	readonly ageTurns?: number;
+	/** Tool results since the block landed; the age a long turn cannot express. */
+	readonly ageSteps?: number;
 }
 
 /** What one selector pass found. Written to the canary log, never to context. */
@@ -109,14 +115,22 @@ export interface SelectorOptions {
 	readonly deadShare?: number;
 	/**
 	 * Turn boundaries after which an all-re-fetchable block is rot. `0` disables
-	 * the age rule, leaving supersession as the only trigger.
+	 * the turn clock, leaving supersession and the step clock as the triggers.
 	 */
 	readonly staleTurns?: number;
+	/**
+	 * Tool results after which an all-re-fetchable block is rot. `0` disables the
+	 * step clock. Off by default: it is a second trigger, not a replacement, so
+	 * an uncalibrated value must not change what an existing config clears.
+	 */
+	readonly staleSteps?: number;
 }
 
 export const DEFAULT_DEAD_SHARE = 0.95;
 /** Calibrated with the gate: a read from three turns ago is not the hot set. */
 export const DEFAULT_STALE_TURNS = 3;
+/** The step clock ships off: a turn count is the only calibrated age bound. */
+export const DEFAULT_STALE_STEPS = 0;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -278,6 +292,7 @@ export class SupersessionTracker {
 		this.options = {
 			deadShare: options.deadShare ?? DEFAULT_DEAD_SHARE,
 			staleTurns: options.staleTurns ?? DEFAULT_STALE_TURNS,
+			staleSteps: options.staleSteps ?? DEFAULT_STALE_STEPS,
 		};
 	}
 
@@ -336,6 +351,9 @@ export class SupersessionTracker {
 		block.tokens = Math.max(block.tokens, Math.max(0, tokens));
 		if (seq !== undefined) block.seq = seq;
 		if (turn !== undefined && Number.isSafeInteger(turn)) block.turn = turn;
+		// The step clock reads the landing index, which is stable once the block
+		// arrives: a later pass over the same block must not reset its age.
+		block.landedAt ??= this.resultsLanded;
 	}
 
 	/** Whether one block's visible body is almost entirely re-fetchable output. */
@@ -357,12 +375,21 @@ export class SupersessionTracker {
 		return block.supersededTokens >= block.refetchTokens * this.options.deadShare;
 	}
 
-	/** Whether a re-fetchable block has outlived its turn budget. */
+	/** Whether a re-fetchable block has outlived its turn or step budget. */
 	isStale(blockId: string, turn: number | undefined): boolean {
 		const block = this.blocks.get(blockId);
-		if (block === undefined || !(this.options.staleTurns > 0)) return false;
-		if (turn === undefined || block.turn === undefined) return false;
-		return turn - block.turn >= this.options.staleTurns;
+		if (block === undefined) return false;
+		const ageTurns = turn !== undefined && block.turn !== undefined ? turn - block.turn : undefined;
+		if (this.options.staleTurns > 0 && ageTurns !== undefined && ageTurns >= this.options.staleTurns) return true;
+		if (!(this.options.staleSteps > 0) || block.landedAt === undefined) return false;
+		return this.resultsLanded - block.landedAt >= this.options.staleSteps;
+	}
+
+	/** Tool results since one block landed, when it has landed at all. */
+	ageStepsOf(blockId: string): number | undefined {
+		const block = this.blocks.get(blockId);
+		if (block === undefined || block.landedAt === undefined) return undefined;
+		return Math.max(0, this.resultsLanded - block.landedAt);
 	}
 
 	/**
@@ -390,6 +417,7 @@ export class SupersessionTracker {
 				record.call.blockId === blockId && (!superseded || record.supersededBySeq !== undefined),
 			);
 			const ageTurns = turn !== undefined && block.turn !== undefined ? Math.max(0, turn - block.turn) : undefined;
+			const ageSteps = this.ageStepsOf(blockId);
 			candidates.push({
 				blockId,
 				seq: block.seq ?? -1,
@@ -400,6 +428,7 @@ export class SupersessionTracker {
 				ageBlocks: block.ageBlocks ?? 0,
 				reason: superseded ? "superseded" : "stale",
 				...(ageTurns !== undefined ? { ageTurns } : {}),
+				...(ageSteps !== undefined ? { ageSteps } : {}),
 			});
 		}
 		return { candidates, tokens: candidates.reduce((total, candidate) => total + candidate.tokens, 0) };
@@ -436,6 +465,60 @@ export class SupersessionTracker {
 		}
 		return block;
 	}
+}
+
+/**
+ * Re-read accounting for cleared targets.
+ *
+ * A re-read is not by itself a mistake: the placeholder invites one, and a file
+ * that changed after the clear legitimately needs it again. What must not
+ * continue is a *key* that keeps coming back — that target was live, not dead,
+ * and clearing it again manufactures tool calls. Refusing one key is surgical;
+ * the session-wide breaker stays for a rate spread across several keys.
+ */
+export interface RereadPolicy {
+	/** Re-reads seen per target key. */
+	readonly rereads: Map<string, number>;
+	/** Keys this session must never clear again. */
+	readonly refused: Set<string>;
+}
+
+/**
+ * Re-reads after which one key is refused. Lower than the session-wide
+ * `BREAKER_MIN_REREADS` on purpose: the per-key answer is cheaper and should win
+ * before the global latch is a decision.
+ */
+export const BREAKER_KEY_REREADS = 2;
+
+export function createRereadPolicy(): RereadPolicy {
+	return { rereads: new Map(), refused: new Set() };
+}
+
+/**
+ * Record one re-read of a cleared target. Returns true when this re-read refused
+ * the key, so the caller can drop its evidence and keep the channel open.
+ */
+export function noteKeyReread(policy: RereadPolicy, key: string): boolean {
+	if (policy.refused.has(key)) return true;
+	const count = (policy.rereads.get(key) ?? 0) + 1;
+	policy.rereads.set(key, count);
+	if (count < BREAKER_KEY_REREADS) return false;
+	policy.refused.add(key);
+	return true;
+}
+
+/**
+ * Whether a candidate touches a refused key.
+ *
+ * A clear rewrites the whole block, so *any* refused key in it is enough to skip
+ * it: the placeholder would send the model back to a target it already proved is
+ * still live.
+ */
+export function candidateRefused(
+	policy: RereadPolicy,
+	candidate: { readonly keys: readonly string[] },
+): boolean {
+	return candidate.keys.some((key) => policy.refused.has(key));
 }
 
 /**
@@ -490,6 +573,15 @@ export interface CanaryRecord {
 	 */
 	readonly step?: unknown;
 	readonly tokens: number;
+	/**
+	 * One-time re-prefill cost of the batch: model-visible tokens behind its
+	 * earliest cleared block, minus the bodies the same batch also removes (see
+	 * `batchSuffixTokens`). Absent when the host could not price the surface.
+	 *
+	 * Recorded, never used: the anti-rot gate is not priced in tokens, so this
+	 * exists so a replay can compare what a pass freed against what it cost.
+	 */
+	readonly suffixTokens?: number;
 	readonly candidates: readonly ClearCandidate[];
 	/** True when the batch would have been executed. */
 	readonly gate: boolean;

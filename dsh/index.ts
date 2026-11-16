@@ -8,15 +8,20 @@ import {
 import { loadClmConfig, type ClmConfig } from "../src/lib/clm-config.ts";
 import { appendPrivateLine, writePrivateText } from "../src/lib/clm-files.ts";
 import {
+	BREAKER_KEY_REREADS,
 	REFETCH_TOOL_NAMES,
 	SupersessionTracker,
 	batchPassesGate,
+	candidateRefused,
+	createRereadPolicy,
+	noteKeyReread,
 	parseToolArguments,
 	targetKeyOf,
 	type BatchGate,
 	type CanaryBatch,
 	type CanaryQuality,
 	type CanaryRecord,
+	type RereadPolicy,
 } from "../src/features/live-context/auto-clear.ts";
 import {
 	CLEAR_EVENT_TYPE,
@@ -32,7 +37,9 @@ import {
 	type PluginRecordSeam,
 } from "../src/features/live-context/plugin-record.ts";
 import {
+	batchSuffixTokens,
 	buildDshMirrorRecords,
+	dshBatchSuffixTokens,
 	dshBlockIndexText,
 	dshOpenTurnStep,
 	dshSurfaceTokensAfterEach,
@@ -221,6 +228,11 @@ interface Settlement {
 	readonly batch: CanaryBatch;
 	readonly gate: boolean;
 	readonly usage: HostUsage | undefined;
+	/**
+	 * One-time re-prefill cost of this batch, read from the surface at the
+	 * boundary. Recorded in the ledger only; no admission check reads it.
+	 */
+	readonly suffixTokens?: number;
 	/** This turn's counters, read before {@link resetTurnQuality} clears them. */
 	readonly turn: CanaryQuality["turn"];
 	/** Whether a post-clear outcome is waiting for this line. */
@@ -251,6 +263,11 @@ interface AutoClearState {
 	errors: number;
 	/** Error results whose call targeted a block this session cleared. */
 	errorRereads: number;
+	/**
+	 * Keys that have been cleared and keep coming straight back, plus the
+	 * re-read count that refused them. Bounded by the session's cleared targets.
+	 */
+	readonly reread: RereadPolicy;
 	/** Per-turn quality counters; reset after the turn's ledger line. */
 	turnRereads: number;
 	turnErrors: number;
@@ -441,7 +458,14 @@ function feedCanary(
 	}
 	// Snapshot before scheduling: the turn counters belong to the turn that just
 	// ended, and the host may append the next turn before the deferred pass runs.
-	const settlement = settlementOf(state, { turn }, batch, batchPassesGate(batch, state.gate, usage?.tokens ?? 0), usage);
+	const settlement = settlementOf(
+		state,
+		{ turn },
+		batch,
+		batchPassesGate(batch, state.gate, usage?.tokens ?? 0),
+		usage,
+		dshBatchSuffixTokens(session, batch.candidates),
+	);
 	resetTurnQuality(state);
 	scheduleSettlement(ctx, session, state, settlement);
 }
@@ -480,7 +504,7 @@ function maybeMidTurnPass(
 	const stepNumber = typeof step === "number" && Number.isSafeInteger(step) ? step : undefined;
 	if (turnNumber === undefined || stepNumber === undefined) return;
 	if (state.midTurnTurn === turnNumber) return;
-	const batch = state.tracker.peekBatch(turnNumber);
+	const batch = liveBatchOf(state, state.tracker.peekBatch(turnNumber));
 	if (batch.candidates.length === 0) return;
 	const tails = dshSurfaceTokensAfterEach(
 		session,
@@ -507,6 +531,7 @@ function maybeMidTurnPass(
 		{ candidates: cheap, tokens: freed },
 		true,
 		usage,
+		batchSuffixTokens(cheap, tails),
 	);
 	// The ration is spent only by a pass that actually wrote its record: a skip for
 	// a transient reason (occupancy, projection not registered) must get another
@@ -526,12 +551,14 @@ function settlementOf(
 	batch: CanaryBatch,
 	gate: boolean,
 	usage: HostUsage | undefined,
+	suffixTokens?: number,
 ): Settlement {
 	return {
 		where,
 		batch,
 		gate,
 		usage,
+		...(suffixTokens === undefined ? {} : { suffixTokens }),
 		turn: {
 			rereads: state.auto.turnRereads,
 			errors: state.auto.turnErrors,
@@ -613,21 +640,37 @@ function runPass(
 		turn: where.turn,
 		candidates: batch.candidates.length,
 		tokens: batch.tokens,
-		outcome: applied
-			? "cleared"
-			: blocked !== undefined
-				? blocked
-				: enabled
-					? "rejected"
-					: gate ? "canary" : "gate",
+		outcome: passOutcome(applied, blocked, enabled, gate),
 	};
 	if (canaryEnabled(state.config)) writeCanaryRecord(ctx, session, state, { ...settlement, batch });
 	return applied;
 }
 
-/** The part of a captured batch that is still unretired when its settlement runs. */
+/**
+ * Why this settlement cleared or skipped, in the order the checks ran: the pass
+ * either applied, was refused by one named check, was rejected by the host, or
+ * never ran because clearing is off (canary armed the gate, or it stayed shut).
+ */
+function passOutcome(
+	applied: boolean,
+	blocked: PassOutcome | undefined,
+	enabled: boolean,
+	gate: boolean,
+): PassOutcome {
+	if (applied) return "cleared";
+	if (blocked !== undefined) return blocked;
+	if (enabled) return "rejected";
+	return gate ? "canary" : "gate";
+}
+
+/**
+ * The part of a captured batch a settlement may still act on: nothing a pass
+ * ahead of it retired, and nothing touching a key this session refused.
+ */
 function liveBatchOf(state: CanaryRuntime, batch: CanaryBatch): CanaryBatch {
-	const candidates = batch.candidates.filter((candidate) => !state.tracker.isRetired(candidate.blockId));
+	const candidates = batch.candidates.filter((candidate) =>
+		!state.tracker.isRetired(candidate.blockId) && !candidateRefused(state.auto.reread, candidate),
+	);
 	if (candidates.length === batch.candidates.length) return batch;
 	return { candidates, tokens: candidates.reduce((total, candidate) => total + Math.max(0, candidate.tokens), 0) };
 }
@@ -661,6 +704,7 @@ function writeCanaryRecord(
 		turn: settlement.where.turn ?? null,
 		...(settlement.where.step !== undefined ? { step: settlement.where.step } : {}),
 		tokens: fresh.reduce((total, candidate) => total + candidate.tokens, 0),
+		...(settlement.suffixTokens === undefined ? {} : { suffixTokens: settlement.suffixTokens }),
 		candidates: fresh,
 		gate: settlement.gate,
 		...(state.auto.last !== undefined ? { outcome: state.auto.last.outcome } : {}),
@@ -792,7 +836,14 @@ function applyClear(ctx: DshContext, session: DshSessionLike, state: CanaryRunti
 		if (!Number.isSafeInteger(candidate.seq) || candidate.seq < 0) continue;
 		if (candidate.label.length === 0 || candidate.label.length > CLEAR_LABEL_MAX_CHARS) continue;
 		const size = Math.max(0, Math.round(candidate.tokens));
-		targets.push({ seq: candidate.seq, label: candidate.label, tokens: size });
+		targets.push({
+			seq: candidate.seq,
+			label: candidate.label,
+			tokens: size,
+			// Replay metadata: the projection ignores it, and a resumed session uses
+			// it to keep the breaker's re-read evidence.
+			...(candidate.keys.length > 0 ? { keys: candidate.keys } : {}),
+		});
 		retired.push(candidate.blockId);
 		tokens += size;
 	}
@@ -849,6 +900,17 @@ function noteRefetch(ctx: DshContext, state: CanaryRuntime, name: string, args: 
 		state.auto.rereads += 1;
 		state.auto.turnRereads += 1;
 		state.auto.qualityDirty = true;
+		// One target that keeps coming back is a mispriced target, not a broken
+		// selector. Refuse that key, drop its evidence, and leave the channel open
+		// for every other block; the session-wide latch below is for a rate spread
+		// across several keys.
+		if (noteKeyReread(state.auto.reread, key)) {
+			state.auto.recent = state.auto.recent.filter((entry) => entry.key !== key);
+			ctx.logger?.warn?.(
+				`oh-my-clm: not clearing ${key} again this session: it came back ${BREAKER_KEY_REREADS}× after being cleared`,
+			);
+			return;
+		}
 		const total = Math.max(state.auto.clearedTotal, 1);
 		if (state.auto.rereads < BREAKER_MIN_REREADS || state.auto.rereads * 2 < total) continue;
 		state.auto.stop = "breaker";
@@ -903,7 +965,10 @@ function seedCanary(
 ): CanaryRuntime {
 	const state: CanaryRuntime = {
 		config,
-		tracker: new SupersessionTracker({ staleTurns: config.autoClear.staleTurns }),
+		tracker: new SupersessionTracker({
+			staleTurns: config.autoClear.staleTurns,
+			staleSteps: config.autoClear.staleSteps,
+		}),
 		callSeqs: new Map(),
 		callKeys: new Map(),
 		gate: canaryGate(config),
@@ -921,6 +986,7 @@ function seedCanary(
 			turnErrors: 0,
 			turnErrorRereads: 0,
 			qualityDirty: false,
+			reread: createRereadPolicy(),
 		},
 		writer: { state: "pending" },
 	};
@@ -955,7 +1021,18 @@ function seedCleared(state: CanaryRuntime, data: unknown): void {
 		state.auto.clearedTotal += 1;
 		const tokens = canaryValue(target, "tokens");
 		if (typeof tokens === "number" && Number.isFinite(tokens)) state.auto.clearedTokens += Math.max(0, tokens);
+		// Put the cleared keys back in the breaker window at the position they had
+		// in the log: the seed replays events in order, so a later recorded re-read
+		// ages them exactly as it did live.
+		const keys = canaryValue(target, "keys");
+		if (!Array.isArray(keys)) continue;
+		for (const key of keys) {
+			if (typeof key === "string" && key.length > 0) {
+				state.auto.recent.push({ key, at: state.tracker.resultsSeen });
+			}
+		}
 	}
+	pruneRecent(state);
 }
 
 function readText(filePath: string): string | undefined {
@@ -1396,12 +1473,17 @@ function autoClearStatusText(state: CanaryRuntime | undefined): string {
 	// Four zeroes are one fact unless the line says which check stopped the last
 	// settlement: no candidate, the gate, occupancy, the seam, or the breaker.
 	const last = state.auto.last;
+	// A refused key is a per-target stop, so the line has to name it: otherwise a
+	// block that is never cleared again looks like a selector that missed it.
+	const refused = state.auto.reread.refused.size > 0
+		? ` · ${state.auto.reread.refused.size} key(s) refused after re-reads`
+		: "";
 	const lastText = last === undefined
 		? "last: none"
 		: `last: ${last.outcome} (turn ${String(last.turn ?? "?")}, ${last.candidates} candidate(s), ~${last.tokens} tok)`;
 	if (!state.config.autoClear.enabled) {
 		const stop = state.auto.stop === undefined ? "open" : `stopped (${state.auto.stop})`;
-		return `auto-clear: canary only · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s) · ${lastText}`;
+		return `auto-clear: canary only · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s)${refused} · ${lastText}`;
 	}
 	const armed = state.writer.state === "missing"
 		? "off: this host exposes no ignorable plugin-record seam"
@@ -1409,7 +1491,7 @@ function autoClearStatusText(state: CanaryRuntime | undefined): string {
 			? "starting: resolving the host record seam"
 			: state.projection.ready ? "armed" : "armed, no projection";
 	const stop = state.auto.stop === undefined ? "open" : `stopped (${state.auto.stop})`;
-	return `auto-clear: ${armed} · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s) · ${lastText}`;
+	return `auto-clear: ${armed} · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s)${refused} · ${lastText}`;
 }
 
 function createDshClmCommand(
