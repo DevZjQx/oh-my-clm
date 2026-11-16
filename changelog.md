@@ -2,7 +2,9 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；实现细节见 git 提交记录与对应版本的源码注释。
 
-## 未发布
+## 0.1.19（当前版本）
+
+自动清理通道整批落地：JSON 配置、消息投影与 `appendPluginRecord` 记录缝、turn / step 两个老化时钟、canary 账本、单目标拒收与全局熔断。`npm test` 214/214、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
 
 - JSON 配置取代全部 `CLM_*` 环境变量：用户级与项目级文件，逐 key 覆盖；非法值回退到默认值并写 warning。每次请求重新读取。
 - DSH 新增自动清理通道，默认关闭：`autoClear.canary` 只记账，`autoClear.enabled` 通过 `appendPluginRecord` 记录被取代的 tool result，消息投影只改模型可见副本。当前契约见 [自动清理](docs/features/auto-clear.md)。
@@ -15,8 +17,12 @@
 - 自动清理的结算改在 `turn/end` / `step/end` 通知之后的 microtask 执行。宿主在通知 `session/event` 时仍持有该 append，`appendPluginRecord` 拒绝嵌套写入，于是同步结算在真实宿主上每一轮都落成 `rejected`（`0 pass(es)`、候选不退休）。批次、闸门、turn 计数在边界处快照；host harness 补上这条 dispatch 顺序，`test/harness/clm-dsh-host-test.mjs` 第 17 节在旧代码上红、修复后绿。同一 tick 内入队的两个结算（一步结束整个 turn 时正是这种形态）捕获的是同一批候选，因此结算执行前剔除已被前一个结算 retire 的块：否则同一目标写两条记录，`pass(es)`、释放 token 与熔断分母都会双计（harness 第 18 节、`auto-clear.test.ts` 的 `isRetired` 用例）。
 - 新增 step 计时器（`completedSteps` / `stepsSinceCleanup` / `stepsOld` / `paybackSteps`）与 `autoClear.midTurnSuffixTokens`。
 - DSH 专用包改为整棵 `dist` 打包，并在发布前检查入口 import 闭包。
+- 老化规则新增第二个时钟 `autoClear.staleSteps`（默认 `0`，即关闭）：按 tool result 计数。一个 turn 有 11–39 个 step，turn 时钟管不到单个长 turn 内部，step 时钟能；两个时钟任一到点即算老化，`0` 关闭对应时钟。
+- 单个目标被重读 2 次即拒收该 key：只停这一个目标，其余死块照常清理，`/clm status` 显示 `N key(s) refused after re-reads`。此前一个热点文件会把整个会话推到 `stopped (breaker)`；拒收后该 key 的证据一并丢弃，所以它不再推高全局重读率。
+- canary 账本每行新增 `suffixTokens`：一批的一次性重算成本（最早被清块之后的模型可见 token，减去同批一起删掉的正文）。只记录、不参与判定——闸门仍是抗 rot 判据而不是省钱判据；有了它，重放才能把「清掉多少」和「重算多少」放在一起读。
+- clear 记录的目标带上选择器的 `keys`：只供重放使用，投影不读它，占位符与不带 `keys` 的记录逐字节相同，版本号因此不提升。恢复的会话据此保留重读证据，不会重清一个已被证明还活着的目标。
 
-## 0.1.18（当前版本）
+## 0.1.18
 
 在真实 Pi + `deepseek-flash` 会话上完成首次标定（§5.6），据此修正两处**方向性错误**（`r` 高估 5 倍、Pi 的触发基准在 1M 窗口上不可达），并修掉空消息被误判成 cleanup 删除、导致 Pi 反复弹出 shrink 警告的问题。`npm test` 145/145、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
 
