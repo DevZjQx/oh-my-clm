@@ -37,11 +37,11 @@ export const DEFAULT_CLM_CONFIG = {
     autoClear: {
         enabled: false,
         canary: false,
+        staleTurns: 3,
         minTokens: 1_200,
         minBlocks: 2,
         minSharePercent: 5,
         stopPercent: 60,
-        maxTokens: 40_000,
         midTurnSuffixTokens: 0,
     },
     host: {
@@ -151,6 +151,18 @@ function readString(value, key, fallback, source, label, warnings) {
     return raw;
 }
 /**
+ * Report a key this version stopped reading.
+ *
+ * Unknown keys stay silent so a newer config still loads, but a key that used
+ * to change behaviour must not disappear quietly: a session that set the old
+ * value would run under different rules and never hear about it.
+ */
+function removedKey(value, key, note, source, label, warnings) {
+    if (value[key] === undefined)
+        return;
+    warnings.push(`${source}: "${label}" is no longer used and is ignored; ${note}`);
+}
+/**
  * Apply one parsed JSON document on top of a base config.
  *
  * Exported so tests (and future host integrations) can validate a document
@@ -205,13 +217,14 @@ export function parseClmConfig(document, base = DEFAULT_CLM_CONFIG, source = "<m
     }
     const autoClear = group(document, "autoClear", source, warnings);
     if (autoClear) {
+        removedKey(autoClear, "maxTokens", "clearing has no cumulative token cap", source, "autoClear.maxTokens", warnings);
         config.autoClear.enabled = readBoolean(autoClear, "enabled", config.autoClear.enabled, source, "autoClear.enabled", warnings);
         config.autoClear.canary = readBoolean(autoClear, "canary", config.autoClear.canary, source, "autoClear.canary", warnings);
+        config.autoClear.staleTurns = readNumber(autoClear, "staleTurns", config.autoClear.staleTurns, source, "autoClear.staleTurns", warnings, { min: 0, integer: true });
         config.autoClear.minTokens = readNumber(autoClear, "minTokens", config.autoClear.minTokens, source, "autoClear.minTokens", warnings, { min: 0 });
         config.autoClear.minBlocks = readNumber(autoClear, "minBlocks", config.autoClear.minBlocks, source, "autoClear.minBlocks", warnings, { min: 1, integer: true });
         config.autoClear.minSharePercent = readNumber(autoClear, "minSharePercent", config.autoClear.minSharePercent, source, "autoClear.minSharePercent", warnings, { min: 0, max: 100 });
         config.autoClear.stopPercent = readNumber(autoClear, "stopPercent", config.autoClear.stopPercent, source, "autoClear.stopPercent", warnings, { min: 0, max: 100 });
-        config.autoClear.maxTokens = readNumber(autoClear, "maxTokens", config.autoClear.maxTokens, source, "autoClear.maxTokens", warnings, { min: 1 });
         config.autoClear.midTurnSuffixTokens = readNumber(autoClear, "midTurnSuffixTokens", config.autoClear.midTurnSuffixTokens, source, "autoClear.midTurnSuffixTokens", warnings, { min: 0, integer: true });
     }
     const host = group(document, "host", source, warnings);

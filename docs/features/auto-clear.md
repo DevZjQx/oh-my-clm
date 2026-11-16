@@ -1,212 +1,94 @@
-# 自动清理：canary、投影与熔断
+# 自动清理
 
-DSH 侧新增的一条通道：在 turn 边界把**已被同一目标取代**的 tool-result 块换成一行指针，让模型仍能按指针重取，但不再为死内容付钱、也不再让死内容埋在窗口里。
+DSH 侧的可选通道：在 turn 边界把**可重取**的 tool result（`read` / `read_image` / `grep` / `glob` / `web_fetch`）换成一行重取指针。候选来自两条规则：同一目标被后续调用取代，或块正文全部可重取且超过 `staleTurns` 个 turn。记录是 log-only 的 `ignorable` plugin record，消息投影只改模型可见副本；会话日志、surface 与人类 transcript 保持原文。默认关闭。
 
-三个开关互相独立，全部写在配置文件里（用户级 `$XDG_CONFIG_HOME/oh-my-clm/config.json`，未设时为 `~/.config/oh-my-clm/config.json`；或项目级 `.oh-my-clm.json`）：
+行为由 `src/features/live-context/auto-clear.ts`（选择器、闸门、账本类型）、`clear-projection.ts`（投影）、`plugin-record.ts`（宿主 seam）拥有；本文只写契约摘要与入口。配置文件的读取顺序见根 [README](../../README.md#配置)。
 
-| 配置项 | 默认 | 作用 |
+## 开关
+
+| 配置项 | 默认 | 行为 |
 | --- | --- | --- |
-| `autoClear.canary` | `false` | 只记录"本来会清哪些"，写 `CANARY.jsonl`，模型侧逐字节不变 |
-| `autoClear.enabled` | `false` | 真正清理：追加一条 durable 记录，投影把正文换成指针 |
-| `/clm` | — | `status` 末尾多一行自动清理状态；熔断后显示 `stopped (breaker)` |
+| `autoClear.canary` | `false` | 只写 `CANARY.jsonl`，模型输入逐字节不变 |
+| `autoClear.enabled` | `false` | 写入清理记录，投影替换模型可见正文 |
+| `/clm status` | — | 报告当前状态与上一次结算的结果；停止时显示 `stopped (...)` 原因 |
 
-默认都不开。原因写在 [changelog](../changelog.md)：0.1.18 曾用自家数据证明"就地清理在 `r=0.02` 下不省钱"，这条路卖的是**抗 rot**，不是省钱；在没有真实会话账本之前默认改模型输入，等于拿用户的会话做实验。
+两个开关互不依赖；都不开时选择器只参与恢复与离线重放。
 
-## 为什么不是 `llm/stream`
+## 选择器
 
-早期方案想让插件在 `llm/stream` 里改投递副本（cookbook 的"服务端编辑只改副本"）。DSH 上不可行：
+- 可重取工具是 `read` / `read_image` / `grep` / `glob` / `web_fetch`。`grep` / `glob` 参数规范化后相同即同一目标，`read_image` 按文件路径，`web_fetch` 按 URL；`read` 要求新行区间覆盖旧区间。
+- **被取代**：块内可重取输出 ≥95% 被后续调用取代。
+- **老化**：块的结果落在至少 `staleTurns` 个 turn 之前（见 [README](../../README.md#配置)）；只贡献“没人回头取”的那部分 rot。
+- 两条规则都要求块正文几乎全部可重取（同一 95% 口径）。清理替换的是整块可见正文，PTC 程序里混着现场输出时不清，避免用一行指针换掉还要用的分析。
+- 候选按 turn 组装，被跳过的批次不消费，留到下一个边界。
 
-- `dsh-agent-loop` 把请求冻结：`deepFreeze(message)` 逐条、`Object.freeze(boundaryMessages)`、`Object.freeze(GenerateOptions)`（`lib/index.js:1084-1093`）。
-- `llm/stream` 的 `next` 不接受参数（`dsh-llm/lib/types/index.d.ts:45`），监听器只能旁听。
-- 宿主把这条写成了规则：`agent/request` "Model-visible content must use logged channels; this waterfall **cannot** mutate messages"（`dsh-agent/lib/types/runtime-types.d.ts:350`）。
-
-宿主的替代面是**日志事件 + 消息投影**：`ctx.sessions.registerMessageProjection({ type, project })`。它和 surface replacement 的区别恰好是我们需要的：
-
-| | surface replacement（旧 `cleanup`） | 消息投影（本通道） |
-| --- | --- | --- |
-| 会话日志 | 新增一条替换事件，正文本复制 | 只新增一条决策记录 |
-| surface / ID | 变（要重编号、要镜像对齐） | **不变** |
-| 人类 transcript | 原文被替换掉 | 保留原文 |
-| 回放 | 依赖替换事件自洽 | 纯函数按日志重算 |
-
-## 选择器：什么算死块
-
-只有**可重取工具**（`read` / `grep` / `glob`）的结果会成为候选，且必须被同一目标的后续调用取代。
-
-- `grep` / `glob`：参数规范化后相同即同一目标。
-- `read`：同一路径**且**新读取的行区间覆盖旧区间；`offset 200` 不取代 `offset 1 limit 100`。缺 `limit` 视为读到文件末尾。
-- `bash` / `write` / `web` 一律不是候选：结果不可确定重取。
-
-块级判定：PTC 执行器下一个 `run_code` 块装多个子调用，**块内全部可重取输出都被取代**（`deadShare = 0.95`）才算死块。否则删整块会连带删掉仍然有效的子结果。
+判定、年龄与指针文案的口径见 `auto-clear.ts` 的模块注释。
 
 ## 记录与投影
 
-清理追加一条 **ignorable plugin record**（无 `surfaceOp`，不新增 surface 节点）：
+追加一条无 `surfaceOp` 的 record：
 
 ```json
 {"type":"plugin:oh-my-clm/clear","ignorable":true,"data":{"v":1,
   "targets":[{"seq":41,"label":"read src/x.ts:120-260","tokens":3400}]}}
 ```
 
-写入走宿主的 `appendPluginRecord(session, type, data)`（`@deepseek-ai/dsh-session` ≥ 0.2.2-rc.1）。`ignorable: true` 是这个通道能存在的前提：宿主的持久化读路径（`dsh-session-persistence` 的 `validateStoredEvents`）对**不认识且未标 ignorable** 的事件类型直接抛 `SessionFormatUnsupportedError`，拒绝恢复整个会话。`Session.append()` 没有设置该标记的入口，所以用 `append()` 写插件事件 = 重启后用户的会话打不开——用用户的 transcript 换 token 不划算。
-
-插件**不静态 import** 宿主的 `dsh-session`：profile 安装只解析插件自己的依赖，静态 import 会让插件在它要发布的环境里加载失败。因此 `src/features/live-context/plugin-record.ts` 在会话创建时动态解析 `appendPluginRecord`。
-
-**只在插件目录里 `import()` 是不够的。** 真实布局是插件在 `~/.dsh/profiles/<name>/node_modules/<plugin>`，宿主包在 DSH 安装目录（`.../node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-session`）。Node 按导入方所在路径解析裸 specifier，所以那个 import 会失败，开着 `autoClear.enabled` 的 profile 就锁在 `unrecordable`——0.1.18 在真实机器上正是这个状态（canary 有记录、没有一条 clear 记录）。现在按顺序尝试：
-
-1. specifier 本身（`file:` URL 或绝对路径直接可用）；
-2. 宿主入口（`process.argv[1]`，即 `.../@deepseek-ai/dsh/lib/bin.js`）的解析链——它所在的 `node_modules` 拥有会话所用的那份 `dsh-session`；
-3. 全局模块根（`~/.local/lib/node_modules`、`/usr/local/lib/node_modules` 等），给从 wrapper 启动、`argv` 里没有宿主入口的场景兜底。
-
-`appendPluginRecord` 关闭的是 `Session` 类的私有字段（`session.#appendRecord`），**必须是同一份模块副本**。解析出的模块导出 `Session` 时，写入前会比较它的 prototype 与当前 session 的原型；不一致就锁存 `unrecordable` 并 warn，而不是让第一次清理变成一次费解的 rejection。
-
-| 宿主 | 行为 |
-| --- | --- |
-| 有 `appendPluginRecord`（≥ 0.2.2-rc.1 且可解析） | 记录可写，清理可用 |
-| 没有（旧宿主 / 不可解析 / 解析到另一份 `dsh-session`） | **绝不退回 `append()`**：会话创建时 warn 一次，本会话清理锁存为 `stopped (unrecordable)`，`/clm` 明写原因 |
-
-`host.pluginRecordModule` 可覆盖解析目标（默认 `@deepseek-ai/dsh-session`），harness 用它注入一个等价 writer 验证“记录确实是 ignorable 的、且没有新增 surface 节点”。这是配置里**唯一**把字符串变成代码执行的点：设了它并打开 `autoClear.enabled`，等于信任写这份配置的仓库，所以它定位为高级/测试开关；不设就是宿主自己的包，没有额外风险。
-
-投影（`src/features/live-context/clear-projection.ts`）把目标节点推导成：
+投影保留目标的 `id` / `role` / `toolCallId` / `isError`，只把 `content` 换成：
 
 ```text
 [cleared 3.4k tok · read src/x.ts:120-260 · re-read if needed]
 ```
 
-保留 `id` / `role` / `toolCallId` / `isError`，只换 `content`。校验分两类：
+- 记录 envelope 损坏（非对象、版本未知、空 `targets`）抛错；目标已被 compaction 移出或已被先前记录清过则跳过；目标适用但畸形抛错。回放必须收敛。
+- 写入必须走宿主的 `appendPluginRecord`，不能退回 `Session.append()`：后者写不出 `ignorable`，重启后整份会话会被宿主拒绝。宿主没有该 seam 时会话锁存为 `stopped (unrecordable)`，canary 不受影响。
+- 结算发生在 `turn/end`（或 `step/end`）通知之后的一个 microtask：宿主在通知 `session/event` 时仍持有该 append，`appendPluginRecord` 会拒绝嵌套写入。批次、闸门与 turn 计数在边界处快照，延迟执行的只有判定与写入；见 `dsh/index.ts` 的 `scheduleSettlement`。
+- 解析顺序、模块身份校验与 `host.pluginRecordModule` 的语义见 `plugin-record.ts`。
 
-- **记录本身坏了就抛**（不是对象、版本不认识、`targets` 为空）——这类日志无法解释。
-- **目标不适用就跳过**：位置已被宿主 compaction 移出 surface（模型读不到，没什么可换），或同一条记录之前已经清过它（回放必须收敛）。为一条读不到的指针拒绝加载整个会话，代价远大于收益。
-- **目标适用却畸形仍抛**（`label` 1–200 字符、`tokens` 非负整数、同记录内不重复）。静默丢掉会造出“日志说清了、模型没看到”的状态。
+## 闸门
 
-**一个已知取舍**：`ignorable` 记录在宿主格式迁移中是 best-effort 保留的；真丢了，模型看到的只是原文回来（多花 token），不会损坏会话。
-
-## 闸门与限额
-
-一个 turn 结束结算一次，满足其一即可执行：
+每 turn 边界结算一次，任一条件成立即执行：
 
 | 配置项 | 默认 | 含义 |
 | --- | --- | --- |
-| `autoClear.minTokens` | `1200` | 一批至少释放这么多 token（**量**的下限，不是目标） |
-| `autoClear.minBlocks` | `2` | 或者至少这么多个死块 |
-| `autoClear.minSharePercent` | `5` | 或者死块占当前 prompt 的百分比达到该值（**腐烂浓度**信号） |
-| `autoClear.stopPercent` | `60` | 占用达到窗口百分比就停手，交给宿主 compaction |
-| `autoClear.maxTokens` | `40000` | 单会话累计清理上限 |
-| `autoClear.midTurnSuffixTokens` | `0` | 允许单块在 turn 内清理；见下节 |
+| `autoClear.minTokens` | `1200` | 一批至少释放的 token；量的下限，不是目标 |
+| `autoClear.minBlocks` | `2` | 或者至少这么多个候选块 |
+| `autoClear.minSharePercent` | `5` | 或者候选块占当前 prompt 的百分比达到该值；`0` = 只按量 |
+| `autoClear.stopPercent` | `60` | 占用达到窗口百分比即停手，交给宿主 compaction |
+| `autoClear.midTurnSuffixTokens` | `0` | 允许 turn 内清理的尾部预算；`0` 关闭 |
 
-闸门很小，因为每次清理都会在清理位置断开前缀缓存：真实会话里一轮尾部滚动通常只有 1–3 块，8k 的闸门会让它永不触发（0.1.18 的失败形态）。
-
-**两条路径回答两个不同问题。** `minTokens` / `minBlocks` 回答“这次断点值不值”，是量的下限；`minSharePercent` 回答“死内容是不是已经占模型读到的东西的一大部分”，这是抗 rot 的判据。后者为 `0` 时闸门退回纯量口径。它用宿主上报的 prompt 尺寸做分母；宿主没有精确用量时不猜，只走量路径。
-
-**预算不是整批否决。** 一批 73,646 token 对 40,000 上限时，旧逻辑会在清任何东西之前锁存 `stopped (budget)`；现在按 seq 从旧到新切片，只清预算还付得起的那部分，剩余候选留到下一个边界。首个批次允许超一个候选（单个超大块），否则一个比预算还大的死块永远清不掉，只能等宿主 compaction。
-
-**被跳过的批次不会被丢掉。** `peekBatch()` 是只读的，只有真正写入成功的那一批才 `retire()`：闸门不够、占用过高、投影还没注册时，候选留在池子里，下一个 turn 边界连同新死的块一起再算一次，因此“每轮只死一块、单块不足闸门”的会话也能累积到一次可执行的清理。canary 账本对每个块只写一行（按 blockId 去重），重复跳过不会刷屏。
-
-## 结算点：为什么批次价格按 turn 算
-
-候选的产生完全发生在 turn 内部——被取代的调用和取代它的调用往往只隔几步——但**执行**放在 `turn/end`。这不是因为 turn 更准，而是因为一次断点的成本是“断点之后整段尾部重算”，必须摊到尽量多的块上。273 个真实 DSH 会话（579 turn / 10,142 step）的离线重放：
-
-| | `turn/end` 结算（现状） | `step/end` 结算 |
-| --- | --- | --- |
-| 批次次数 | 116 | 218（+88%） |
-| 释放 token | 531,660 | 526,713（−1%） |
-| 每批块数 | 4.40（p50 3，max 37） | 2.28（p50 2） |
-| Σ 断点尾长 | 6.88M | 9.05M（+31%） |
-
-同一批内容，按步结算多付 31% 的前缀重算，换来的只是“早清几步”：同 turn 内死亡 719 个死块（占全部死亡 token 的 81%），它们平均还要在 turn 里挂 7 步（p75 12，p90 24）。逐块按 `remaining × r × D − (1−r) × suffix` 结算，`r = 0.02` 时 719 个里 **0 个**提前清是划算的（`r = 0.1` 才 18 个 / 47k token，`r = 0.3` 才 13%）。原因很结构性：取代旧块的那次重读结果就落在旧块后面，断点尾部约等于被删块大小，回本要 ~50 步。
-
-因此：**计时器按步，执行点按 turn**。`completedSteps` / `stepsSinceCleanup` / 候选的 `stepsOld` / 摊销 `N` 都按 step 计数（一个 turn 实测 11–39 步，按轮计数等于用一个漂移 40 倍的量尺）；闸门、预算、候选区间与结算点留在 turn。
-
-### 唯一的例外：`autoClear.midTurnSuffixTokens`
-
-`> 0` 时，`step/end` 会检查池子里的死块：该块之后待重算的尾部（减去被删正文）≤ `midTurnSuffixTokens` 才在 turn 内清。
-
-每个 turn 最多一次（`midTurnTurn` 锁），闸门被绕过（它存在的意义是摊薄一次断点，而这种断点本来就不贵），`stop`/预算/投影就绪/熔断照旧生效；canary 账本在这种情况下多写一个 `step` 字段。
-
-0.1.18 还要求 `earlyClearPays()`（这一次断点要在下一个请求内回本）。那是**省钱**判据：在 `r = 0.02` 下没有真实死块能过，等于默认永久关闭。定位改成抗 rot 之后，这个判据被移除——剩下的只有尾部预算：只要断点便宜，就让它尽早停止污染 prompt。默认仍为 `0`，因为 turn 内清理会多断一次前缀，等真实会话账本再说。
+- 量闸门回答“这次断点值不值”；`minSharePercent` 回答“可清的旧内容是否已占模型读到内容的一大块”，是抗 rot 判据。
+- 没有累计清理上限：`autoClear.enabled` 期间只有熔断、seam/投影缺失和 `stopPercent` 占用线能让本会话停手。
+- **计时器按 step，执行点按 turn**：`completedSteps` / `stepsSinceCleanup` / `stepsOld` / 摊销 `N` 按请求计，批次、候选区间与结算点按 turn。计价的完整公式见 `clm-config.ts` 与 `context-trigger.ts`。
+- `midTurnSuffixTokens > 0` 时每 turn 最多一次 turn 内清理：候选块之后待重算的尾部不超过该值即可，闸门绕过，`stop` / 投影就绪 / 熔断仍生效。
 
 ## 熔断
 
 | 信号 | 条件 | 动作 |
 | --- | --- | --- |
-| 重读率 | 被清目标在 3 个 tool result 内被重取，累计 ≥2 次且占已清目标一半以上 | 本会话停止清理，`/clm` 显示 `stopped (breaker)` |
-| 预算 | 累计清理超过 `autoClear.maxTokens` | 本会话停止，`stopped (budget)` |
-| 记录缝缺失 | 宿主没有 `appendPluginRecord`（或旧宿主） | 本会话锁存 `stopped (unrecordable)`，绝不退回 `session.append` |
-| 投影缺失 | `sessions.registerMessageProjection` 尚未可用 | **跳过本轮**，不锁存；候选留到下一个 turn 边界，注册成功前绝不追加记录 |
-| 占用 | ≥ `autoClear.stopPercent` | **跳过本轮**，不锁存；占用降下来后连同未清候选一起恢复 |
-| 写法失败 | writer 抛错 | 记 warn，本轮不算清理，候选不 retire |
+| 重读率 | 被清目标在 3 个 tool result 内被重取，累计 ≥3 次且占已清目标一半以上 | 本会话停止清理，显示 `stopped (breaker)` |
+| 记录缝缺失 | 宿主没有 `appendPluginRecord`，或解析不到同一份模块 | 锁存 `stopped (unrecordable)`，不退回 `append()` |
+| 投影缺失 | `sessions.registerMessageProjection` 尚未可用 | 跳过本轮，不锁存；候选留到下一个边界 |
+| 占用 | ≥ `autoClear.stopPercent` | 跳过本轮，不锁存；占用降下来后恢复 |
+| 写法失败 | writer 抛错 | 记 warn，本轮不算清理，不 retire 候选 |
 
-重读本身不算误判：占位符就是请模型按需重读。熔断看的是**比例**——多数被清目标立刻回来，说明清理在制造工具调用而不是删废料。熔断窗口只保留最近 3 个 tool result 内的记录（`pruneRecent`），所以账本不随会话长度增长。
+重读本身不算误判，占位符就是请模型按需重读；熔断看的是比例。一批两个块各自被重读一次是一次正常往返，不足以锁存会话。窗口只保留最近 3 个 tool result 内的记录，账本不随会话长度增长。
 
 ## 账本
 
-`autoClear.canary: true` 时每个 turn 决策写一行到 `<会话临时目录>/CANARY.jsonl`：
+`autoClear.canary: true` 时每个 turn 边界写一行到 `<会话临时目录>/CANARY.jsonl`，包括候选为空的一次：候选、`gate`、`outcome`，以及 `quality`（`rereads` / `errors` / `errorRereads` / `contextTokens`，分 turn 增量与 session 累计）。`outcome` 说明这次结算为何执行或跳过（`cleared` / `gate` / `occupancy` / `breaker` / `no-candidate` 等）。字段定义见 `auto-clear.ts` 的 `CanaryRecord` / `CanaryQuality`。空边界也落盘，所以 `0 pass(es)` 能与“选择器没看到死块”区分开。
 
-```json
-{"at":1794770,"turn":3,"tokens":4697,"gate":true,
- "candidates":[{"blockId":"call_…","seq":41,"tokens":4697,
-                "calls":[{"name":"grep","seq":21}],"keys":["grep\u0000pattern=\"needle\""],
-                "label":"grep \"needle\"","ageBlocks":12}],
- "quality":{"contextTokens":319000,
-            "turn":{"rereads":1,"errors":0,"errorRereads":0},
-            "session":{"results":61,"clearedBlocks":4,"clearedTokens":3200,
-                       "passes":2,"rereads":2,"errors":5,"errorRereads":1}}}
-```
+## 恢复与离线重放
 
-- `seq`：目标 `tool/result` 的会话序号，投影的寻址单位。
-- `turn` / `step`：决策发生在哪个 turn 边界；`step` 只在 turn 内（`midTurnSuffixTokens`）清理时出现。
-- `ageBlocks`：被取代的调用与取代它的调用之间落了多少个 tool result，即"断点离尾部多远"。
-- `gate`：这次是否够格执行。
-- `quality`：这次清理**实际发生了什么**，是「质量工具」唯一可被证伪的证据面：
-  - `rereads`：被清目标又被取回来（占位符邀请的一次重读，或一次误判）；
-  - `errors`：报错的 tool result 总数；
-  - `errorRereads`：报错的 tool result 命中的正是本会话清过的目标——指针把模型送回了已经不可用的位置，这是最刺眼的信号；
-  - `contextTokens`：宿主上报的 prompt 尺寸，同一行就能读出 dead share；
-  - `turn` 是自上次边界以来的增量，`session` 是累计。`clearedBlocks` / `clearedTokens` / `passes` 在**真正写入记录之后**才计入，所以这一行报告的是本次 pass 的结果，不是上一次的。
+- 加载时用 `session.snapshotEvents()` 重放 `tool/call` / `tool/result` / `tool/ptc-dispatch`，并 retire 历史 clear 记录；历史 `turn/end` 不重放。
+- `npm run build:dsh && npm run canary:replay`，或 `node scripts/canary-replay.mjs <log>`；会话目录默认 `~/.dsh/sessions`，`--sessions-root` 覆盖。需要 PATH 上的 `zstd`。
 
-账本在两种情况下都会写：有新死块，或者没有新死块但上一次清理产生了重读/报错（`qualityDirty`）。只记提案的账本永远无法回答"清理有没有帮上忙"。
+## 索引
 
-日志写在 `/tmp/clm-<session-id>/`（与 mirror 同目录、同样私有权限），随临时目录消失；不写改模型输入的事件之外的任何会话日志，也不需要新增 manifest 权限。
-
-## 恢复（resumed session）
-
-插件加载时用 `session.snapshotEvents()` 重建选择器：
-
-- 历史里的 `tool/call` / `tool/result` / `tool/ptc-dispatch` 照常喂给选择器，所以插件加载前就死掉的块仍会在**第一个** live turn 边界被报告/清理一次。
-- 历史里的 `turn/end` **不重放**：那一刻的批次早就在上一次运行里决定过了，重放会消费候选、让第一个 live 边界无话可说。
-- 历史里的 `plugin:oh-my-clm/clear` 记录会 retire 对应目标，并把已清 token 计入预算——否则 resumed 会话会把同一块清第二遍（记录是 log-only，原文还在）。
-
-## 离线重放
-
-同一个选择器可以跑在已存会话上，不需要模型调用：
-
-```bash
-npm run build:dsh
-npm run canary:replay          # 或 node scripts/canary-replay.mjs <log> [...]
-node scripts/canary-replay.mjs --all --sessions-root /path/to/.dsh/sessions
-```
-
-会话目录默认 `~/.dsh/sessions`（`os.homedir()`），用 `--sessions-root` 指定其他位置；不再读取 `DSH_HOME`/`HOME` 环境变量。需要宿主之外的 `zstd` 可执行文件（会话日志是 `.jsonl.zstd`）；`scripts/canary-replay.mjs` 随包发布，`npm run canary:replay` 在安装后的包里同样可用。
-
-实测（12 个最大的真实 DSH 会话，共 1.33M tool-result token）：8 个会话有候选、14 个 turn 边界出批次、11 个过闸门、合计 124,669 token、最大单批 73,646 token；4 个会话从头到尾 0 候选。
+`dsh/index.ts` 把 clear 记录折成 `dsh:<seq>` → `{ label, tokens }`，传给 block index：`blocks` 行显示 `[cleared …]` 而不是 preview，`digest` 扣除已清 token 并附 `cleared`，缓存失效键包含已清数量。
 
 ## 与宿主的分工
 
-- 宿主 `compaction-basic` 在约 80% 占用时压缩整窗，`tool-result-pruner` 在压缩后把超长 tool result 切成头尾。插件不重复这两件事。
-- 插件的停手线是 60%：再往上让宿主接手，避免两边在同一段前缀上打架。
-- 模型侧永远能按指针重取；`cleanup` 工具仍保留为手动逃生通道。
-
-## 索引与清理结果
-
-消息投影只改模型可见副本，索引必须与它一致——否则模型会看到它已经读不到的正文的 preview。因此 `dsh/index.ts` 的 `clearedMarksOf()` 把日志里的 `plugin:oh-my-clm/clear` 折成 `dsh:<seq>` → `{ label, tokens }`，传给 `renderBlockIndex` / `renderBlockDigest`：
-
-- `blocks` 模式：该行变成 `12. toolResult: [cleared 3.4k tok · read src/x.ts:120-260]`；
-- `digest` 模式：该 turn 的估算 token 扣除已清部分，并附 `, 1 cleared`；
-- 两种模式的 header 在 `autoClear.enabled` 时改为说明 `[cleared]` 行是重取指针而非正文；
-- 索引缓存的失效键里多了 `clearedCount`，新增一条清理记录会在同一步内重渲染。
-
-## 未做
-
-- 错误率回退熔断：需要"清理前后工具错误率"基线，未标定。
-- Pi 侧对等实现：Pi 的 seam 是 `turn_end` + mirror 改写，与消息投影不是一套东西；本通道只落 DSH。
-- 清理后按指针自动预取：重取仍由模型按需发起，插件不去猜。
+- 宿主 compaction 在约 80% 占用时压缩，`tool-result-pruner` 在压缩后裁剪超长结果；插件不重复这两件事。
+- 插件在 `autoClear.stopPercent`（默认 60%）停手，避免两边改同一段前缀。
+- 模型始终可按指针重取；`cleanup` 保留为手动通道。
+- 不实现错误率回退熔断、Pi 侧对等实现或清理后自动预取。

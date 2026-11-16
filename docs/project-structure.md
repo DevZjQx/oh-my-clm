@@ -47,7 +47,7 @@ oh-my-clm
 - feature 之间不能互相导入；需要组合时在 host adapter 组合，或把共用部分上移到 `src/lib`。
 - `src/lib` 不知道任何 feature 或 host adapter。
 - host adapter 不承载可复用业务逻辑；mirror 协议与安全校验属于 `features/live-context`。
-- 不使用 barrel 文件：不建 `index.ts`，不写 `export * from`。
+- `src/**` 内不使用 barrel 文件：不建 `index.ts`，不写 `export * from`。宿主入口 `dsh/index.ts` 是硬约定路径的例外，不要改名或移动。
 - 宿主发现路径是硬约定：`package.json` 的 `pi.extensions` 指向 `./extensions/clm.ts`，`dsh-plugin.json` 的 host entry 指向 `dist/dsh/index.js`。因此入口留在仓库顶层，不放进 `src/app`。
 
 ## 新代码放在哪里

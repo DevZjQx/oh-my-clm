@@ -135,6 +135,25 @@ test("unknown keys are ignored for forward compatibility", () => {
 	assert.deepEqual(parsed.warnings, []);
 });
 
+test("a key this version no longer reads is reported instead of vanishing", () => {
+	// Unknown keys stay silent, but `autoClear.maxTokens` used to cap a session.
+	// A config that still names it must hear that clearing no longer has a cap.
+	const parsed = parseClmConfig({ autoClear: { maxTokens: 40_000 } }, DEFAULT_CLM_CONFIG, "removed.json");
+	assert.equal("maxTokens" in parsed.config.autoClear, false);
+	assert.equal(parsed.warnings.length, 1);
+	assert.ok(parsed.warnings[0]?.includes("autoClear.maxTokens"));
+});
+
+test("the stale rule has its own turn budget", () => {
+	assert.equal(DEFAULT_CLM_CONFIG.autoClear.staleTurns, 3);
+	const parsed = parseClmConfig({ autoClear: { staleTurns: 6 } }, DEFAULT_CLM_CONFIG, "stale.json");
+	assert.deepEqual(parsed.warnings, []);
+	assert.equal(parsed.config.autoClear.staleTurns, 6);
+	const bad = parseClmConfig({ autoClear: { staleTurns: 1.5 } }, DEFAULT_CLM_CONFIG, "bad-stale.json");
+	assert.equal(bad.config.autoClear.staleTurns, 3);
+	assert.ok(bad.warnings.some((warning) => warning.includes("autoClear.staleTurns")));
+});
+
 test("step clocks and the request horizon are their own keys, defaulting off", () => {
 	assert.equal(DEFAULT_CLM_CONFIG.cleanup.trigger.completedSteps, 0);
 	assert.equal(DEFAULT_CLM_CONFIG.cleanup.trigger.stepsSinceCleanup, 0);

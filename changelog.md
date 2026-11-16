@@ -1,37 +1,20 @@
 # 更新日志
 
-版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；更早的实现细节见 git 提交记录和 [`docs/features/live-context-mirror.md`](./docs/features/live-context-mirror.md)。
+版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；实现细节见 git 提交记录与对应版本的源码注释。
 
 ## 未发布
 
-新增 DSH 侧**自动清理**通道，默认关闭：turn 边界把"被同一目标后续调用取代"的 tool-result 块换成一行重取指针。并把全部 `CLM_*` 环境变量迁移到 JSON 配置文件。`npm test` 199/199、host harness 145/145、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
-
-- **环境变量全部移除，改为配置文件。** 配置按会话工作目录解析：用户级 `$XDG_CONFIG_HOME/oh-my-clm/config.json`（未设或非绝对路径时退到 `~/.config/oh-my-clm/config.json`），项目级 `<cwd>/.oh-my-clm.json` 逐 key 覆盖。`src/lib/clm-config.ts` 负责读取、合并、类型校验与 warning；非法值只回退对应 key，不会让 mirror/cleanup 整体失效。原先 25 个 `CLM_*` 变量映射为分组字段，例如 `CLM_CONTEXT_BUDGET` → `context.budgetTokens`、`CLM_INDEX_MODE` → `index.mode`、`CLM_TRIGGER_PCT` → `cleanup.trigger.usagePercent`、`CLM_AUTO_CLEAR` → `autoClear.enabled`。每次调用重新读文件，因此 `/clm status` 与运行中的 A/B 不再需要重启宿主；`/clm mode` 仍是进程级临时覆盖。DSH 的 `appendPluginRecord` seam 改为按会话配置 (`host.pluginRecordModule`) 异步解析：解析期间跳过本轮，无 seam 时锁存 `stopped (unrecordable)` 并 warn 一次。`XDG_CONFIG_HOME` 只决定用户级文件的位置（标准 XDG 语义，非插件开关）；测试与 harness 把它指向临时目录，因此套件不再受机器上已有的用户配置影响（此前一份 `~/.config/oh-my-clm/config.json` 就能让 `npm test` 失败）。新增 `test/lib/clm-config.test.ts`（默认值、逐 key 覆盖、非法值回退、坏 JSON、未知 key、用户级文件被项目级按 key 覆盖、XDG 绝对/相对路径）。
-
-- **为什么不是 `llm/stream` 交付副本。** 宿主的 agent loop 把请求冻结（`deepFreeze(message)` + `Object.freeze(options)`），`llm/stream` 的 `next()` 不接受参数，`agent/request` 也明写 "cannot mutate messages"。插件改不了投递副本，只能走宿主留的合法面：日志事件 + `ctx.sessions.registerMessageProjection()`。
-- **投影而不是 surface replacement。** 清理追加一条 log-only 记录 `plugin:oh-my-clm/clear`（无 `surfaceOp`），纯函数投影把目标 `tool/result` 的 `content` 换成 `[cleared 3.4k tok · read src/x.ts:120-260 · re-read if needed]`，保留 `id`/`role`/`toolCallId`/`isError`。会话日志、surface、人类 transcript 都不动；回放靠日志重算，不靠替换事件自洽。
-- **记录必须是 `ignorable`，否则等于毁掉会话。** 一开始用 `session.append()` 写记录：宿主的持久化读路径（`dsh-session-persistence/validateStoredEvents`）对不认识且未标 `ignorable` 的事件类型直接抛 `SessionFormatUnsupportedError`，重启后该会话**打不开**；而 `append()` 没有设置该标记的入口。现在改用宿主的 `appendPluginRecord(session, type, data)`（`@deepseek-ai/dsh-session` ≥ 0.2.2-rc.1，提交 `ignorable: true`，不新增 surface 节点）。已在真实宿主（0.2.2-rc.1）上直接验证：`appendPluginRecord` 接受 `plugin:oh-my-clm/clear`、`pluginRecordOf` 可读回、`ignorable === true`、严格读路径不再拒绝；同一类型走 `append()` 则 `ignorable === undefined`、严格读路径拒绝。插件不静态 import 宿主包（profile 安装不解析宿主的依赖），改为加载时动态解析：解析不到宿主 seam 时**绝不退回 `append()`**，只 warn 一次并把该会话锁存为 `stopped (unrecordable)`，`/clm` 明写原因。
-- **选择器口径。** 只认 `read`/`grep`/`glob` 被同一目标的后续调用取代；`read` 要求新行区间覆盖旧区间。PTC 下一个 `run_code` 块装多个子调用，因此按**块**判定：块内可重取输出 ≥95% 死亡才算死块。
-- **跳过不等于丢弃。** `peekBatch()` 只读、只有真正写入成功的那一批才 `retire()`。闸门不够、占用过高、投影未就绪时候选留在池子里，下一个边界连同新死的块一起重算——原实现先消费后判定，导致"每轮只死一块、单块不足闸门"的会话永远不触发，且文档承诺的"跳过本轮"实际是永久丢弃。
-- **原样重放的边界不消费候选。** 种子化曾对历史 `turn/end` 也走一次决策，于是真实 resume 形态（日志以 `turn/end` 结尾）在加载后的第一个边界写出**空**账本——候选被静默吃掉。现在种子化只重放 tool 流量，历史边界跳过；历史里的 `plugin:oh-my-clm/clear` 记录会 retire 对应目标并把已清 token 计入预算，resume 不会把同一块清第二遍。
-- **投影对"目标不适用"降级。** 目标已被宿主 compaction 移出 surface、或同一块已被先前记录清过时**跳过**（回放收敛）；只有记录本身坏了（非对象/版本未知/空 targets）或目标适用却畸形（label/tokens/重复）才抛。为一条读不到的指针拒绝加载整个会话，比丢一个占位符昂贵得多。
-- **闸门与限额。** 一批 ≥1200 token 或 ≥2 个死块才执行（每次清理都断一次前缀，小步清理更贵）；占用 ≥60% 停手交给宿主 compaction；单会话累计上限 40000 token。超出剩余预算的批次按 seq 从旧到新切片，只有首批允许超一个候选（单个超大块）；旧逻辑会整批拒绝并在清任何东西之前锁存 `stopped (budget)`——离线重放里最大的一批就是 73,646 token。
-- **熔断。** 被清目标在 3 个 tool result 内被重取、累计 ≥2 次且占已清目标一半以上 → 本会话停手，`/clm` 显示 `stopped (breaker)`。重读本身不算误判（占位符就是请模型按需重读），看的是比例；熔断窗口只保留最近 3 个 tool result 内的记录，账本不随会话长度增长。
-- **账本。** `autoClear.canary: true` 时每个 turn 决策写一行 `CANARY.jsonl`（`seq`/`tokens`/`ageBlocks`/`gate`），落在 `/tmp/clm-<session>/`，不写会话日志、不新增 manifest 权限；按 blockId 去重，重复跳过不刷屏。
-- **离线标定。** `npm run canary:replay` 让同一个选择器跑已存会话（现在是 peek/retire 语义，即真实清理行为）：12 个最大的真实会话（1.33M tool-result token）里 8 个有候选、14 个边界出批次、11 个过闸门、合计 124,669 token、最大单批 73,646；4 个会话 0 候选。这条数字决定了闸门取 1200 而不是 8k。脚本随包发布（`files` 含 `scripts/canary-replay.mjs`），需 PATH 上有 `zstd`，缺失时报错带安装提示。
-- **回归。** 选择器单测 20 条（含 peek 不消费、retire、按 seq retire、预算切片）、投影单测 10 条（含 compaction 陈旧目标、已清目标收敛、陈旧与存活目标同批、陈旧目标畸形不致命）、harness 新增第 12/13 节：被跳过的批次在下一个边界累积生效、陈旧目标不致致命、无 seam 宿主不写事件且 `/clm` 报 `stopped (unrecordable)`、加载时 warn 一次。
-- **自动清理只落 DSH，Pi 只做配置迁移。** 自动清理通道一行都没进 Pi：两边的提交时机与 seam 不同（Pi 是 `turn_end` + mirror 改写，DSH 是 log-only 记录 + 消息投影）。`extensions/clm.ts` 本版唯一改动是把 `CLM_*` 环境变量换成 `loadClmConfig(ctx.cwd)`，行为不变——它读的正是同一组字段（`context.budgetTokens`、`context.maxBlockChars`、`cleanup.cacheDiscountPercent` 等），`session_start` 多报一条配置 warning。
-
-- **`appendPluginRecord` 在真实 profile 上终于可达（P0）。** 0.1.18 的解析只做 `import("@deepseek-ai/dsh-session")`，而 profile 里的插件解析不到安装目录下的宿主包：Node 按导入方路径解析裸 specifier，这个 import 必然失败。后果不是“少个功能”，而是真实机器上 `autoClear.enabled: true` 直接锁存 `stopped (unrecordable)`——canary 照写，清理一条都不执行（实测会话：185 个可编辑块、319k token、1.3MB 日志，0 条 `plugin:oh-my-clm/clear`）。现在解析器先试 specifier 本身，再从宿主入口（`process.argv[1]` = `dsh/lib/bin.js`）的解析链里找，最后用全局模块根兜底；`file:`/绝对路径覆盖仍然直接 import。写入前还会比对解析出的 `Session.prototype` 与当前 session 的原型——`appendPluginRecord` 关的是私有字段，另一份模块副本会抛，提前锁存并说清原因比第一次清理才炸好。新增 6 条单测（宿主导入链、全局根兜底、绝对路径/`file:`、无 `Session` 时不做身份声明、缺 seam 返回 undefined）。**发布前仍需在真实 profile 上跑一次 enabled 会话**，确认 `plugin:oh-my-clm/clear` 真的进日志并能重启恢复。
-- **自动清理的闸门多了“腐烂浓度”，少了“回本”。** 新增 `autoClear.minSharePercent`（默认 `5`）：死块占当前 prompt 的百分比达到该值就过闸，不再只看 1200 token / 2 块；`0` 时退回纯量口径。分母取宿主上报的 prompt 尺寸，没有精确用量时不猜。同时删掉 `earlyClearPays()`（`r · tokens > (1−r) · suffix`）与 `midTurnSuffixTokens` 的联动：那是省钱判据，和“尽早把死内容从模型眼前拿走”的定位相反；`minTokens` / `minBlocks` 保留为量的下限。手动 `cleanup` 候选的 `net` 排序与 `cacheDiscountPercent` / `payback*` 不变。
-- **canary 账本从“提案”变成“结果”。** 每条记录新增 `quality`：`rereads` / `errors` / `errorRereads`（报错的 result 命中的正是本会话清过的目标，最刺眼的信号）/ `contextTokens`，分 `turn` 增量与 `session` 累计；`clearedBlocks` / `clearedTokens` / `passes` 在**记录真正写入之后**才计数（旧顺序会把上一次 pass 的结果写成这一次的），因此账本现在能回答“清理有没有帮上忙”，而不只是“本来会清哪些”。没有新死块但上一轮清理产生了重读/报错时也会写一行，否则这类结果永远进不了账本。`/clm status` 多报 `error re-read(s)`。
-- **DSH 专用包修掉一个会直接坏安装的打包 bug。** `scripts/build-dsh-plugin.mjs` 原先按一份手写清单（6 个文件）拷贝 `dist`，清单停在 0.1.13 之前：`auto-clear` / `clear-projection` / `plugin-record` / `context-prompt` / `context-trigger` / `clm-config` 都在 `index.js` 的 import 里，却不在包里。现在整棵 `dist` 原样打包，并在打包前用 staged 入口真的 `import()` 一次；`check-dsh-package.mjs` 新增从入口出发的静态 import 闭包检查（当前 12 个运行时文件），`npm test` 也加了同口径用例。npm 主包（Pi + DSH 完整包）不受影响。
-- **回归。** 新增 `plugin-record.test.ts` 6 条、1 条 `minSharePercent` 配置用例与 1 条 DSH 入口闭包用例；`auto-clear.test.ts` 增加死内容占比开闸、分母未知/占比关闭两条边界；harness 第 11 节扩展到两批清理、账本质量字段、无候选但仍记账（子区间 `read` 不取代全量读取），共 145 项。
-- **在 273 个真实 DSH 会话上标定了“按步还是按轮”（2026-11-16）。** 579 turn / 10,142 step：一个 turn 平均 **17.5 步**（p50 11、p90 39、max 150），step 与 tool result 之比 1.00。按同一选择器离线重放：同 turn 内死亡 719 个死块（1.22M token，占全部死亡 token 的 81%），它们平均还要在 turn 里挂 7 步（p90 24）；但把结算点从 `turn/end` 挪到 `step/end`，批次从 116 次涨到 218 次（+88%），同样的内容多付 **31%** 的断点尾长（6.88M → 9.05M），逐块按 `remaining × r × D − (1−r) × suffix` 算，`r = 0.02` 时 **0/719** 提前清划算（`r = 0.1` 才 18 个）。结论落成两半：**计时器按步，执行点按轮**。
-- **新增按步计数的计时器。** `cleanup.trigger.completedSteps`、`cleanup.trigger.stepsSinceCleanup`（与保留的 `completedTurns` / `turnsSinceCleanup` 并存）、候选的 `stepsOld`（按 turn 之后的 tool result 计数，实测 1.00/步）以及用量行 `last cleanup at turn 4 (step 53)`。候选排序的最终 tie-break 从 `turnsOld` 换成 `stepsOld`，方向不变（更老更稳的先清）。Pi 侧此前把 `completedSteps` 塞进 `completedTurns`，于是 `completedTurns` 阈值实际被放大 17 倍才命中；现在各归各位，Pi 报 step 时钟、DSH 报两者。
-- **摊销口径改成“请求数”。** `paybackTurns` 的 `N` 除以的是后续请求次数（租按请求收，断点只付一次），按轮理解会把成本高估一个 steps-per-turn；新增 `cleanup.paybackSteps` 显式覆盖。默认值仍取保守的 10 个请求，不替用户假设长 run。
-- **新增 `autoClear.midTurnSuffixTokens`（默认 0 关闭）。** 唯一允许在 turn 内清理的形态：死块之后待重算的尾部 ≤ 该值即可；每个 turn 最多一次，闸门绕过、`stop`/预算/投影/熔断照旧，canary 账本多写 `step`。0.1.18 曾在此处要求 `earlyClearPays()` 回本，那是省钱判据（`r = 0.02` 下没有真实死块能过），本版移除。
-- **回归。** 新增 9 条单测（step 时钟独立触发、`stepsOld` 排序与渲染、`paybackSteps` 覆盖、用量行 step 戳、四个新配置 key 的默认值与非法值回退、`dshSurfaceTokensAfter` 的尾部度量且跳过 runtime-context 快照）；harness 新增第 13 节：turn 内的死块在尾部够短时被清、第二个候选被“每 turn 一次”的配额挡住并留给 `turn/end`、canary 记下 `step`。
+- JSON 配置取代全部 `CLM_*` 环境变量：用户级与项目级文件，逐 key 覆盖；非法值回退到默认值并写 warning。每次请求重新读取。
+- DSH 新增自动清理通道，默认关闭：`autoClear.canary` 只记账，`autoClear.enabled` 通过 `appendPluginRecord` 记录被取代的 tool result，消息投影只改模型可见副本。当前契约见 [自动清理](docs/features/auto-clear.md)。
+- 自动清理新增年龄触发器 `autoClear.staleTurns`（默认 `3`，`0` 关闭）：正文全部可重取的块过期后按 rot 清理，不再只依赖“同目标被再次取用”。被取代与老化都要求块正文几乎全部可重取，避免 PTC 程序里的现场输出被一行指针换掉。
+- 可重取工具集扩到 `read_image` 与 `web_fetch`（分别按路径与 URL 判同一目标）；离线重放同步按 turn 结算年龄规则。
+- 自动清理的可观测性补齐：空批次也写一行 canary（含 `outcome`），`/clm status` 显示上一次结算的候选数与结果（`no-candidate` / `gate` / `occupancy` / `cleared` 等），不再让 `0 pass(es)` 同时代表六种状态。
+- 删除 `autoClear.maxTokens`：自动清理不再有累计上限，长期通畅的会话一直清理，只有熔断、seam/投影缺失与 `stopPercent` 能让它停手。配置里仍写着该 key 时解析会写一条 warning 并忽略该 key，而不是静默改变行为。
+- 熔断的重读率增加最小样本：累计重读 ≥3 次且占已清目标一半以上才锁存，一批两个块各被重读一次不算误判。
+- 自动清理要求宿主提供 `appendPluginRecord`；解析不到时锁存 `stopped (unrecordable)`，不退回 `Session.append()`。
+- 自动清理的结算改在 `turn/end` / `step/end` 通知之后的 microtask 执行。宿主在通知 `session/event` 时仍持有该 append，`appendPluginRecord` 拒绝嵌套写入，于是同步结算在真实宿主上每一轮都落成 `rejected`（`0 pass(es)`、候选不退休）。批次、闸门、turn 计数在边界处快照；host harness 补上这条 dispatch 顺序，`test/harness/clm-dsh-host-test.mjs` 第 17 节在旧代码上红、修复后绿。同一 tick 内入队的两个结算（一步结束整个 turn 时正是这种形态）捕获的是同一批候选，因此结算执行前剔除已被前一个结算 retire 的块：否则同一目标写两条记录，`pass(es)`、释放 token 与熔断分母都会双计（harness 第 18 节、`auto-clear.test.ts` 的 `isRetired` 用例）。
+- 新增 step 计时器（`completedSteps` / `stepsSinceCleanup` / `stepsOld` / `paybackSteps`）与 `autoClear.midTurnSuffixTokens`。
+- DSH 专用包改为整棵 `dist` 打包，并在发布前检查入口 import 闭包。
 
 ## 0.1.18（当前版本）
 

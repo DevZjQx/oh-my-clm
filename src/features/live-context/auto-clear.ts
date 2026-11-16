@@ -7,18 +7,28 @@
  * this file; a canary run must stay model-invisible so the numbers can be
  * calibrated before any content is replaced.
  *
- * The trigger is "superseded": a re-fetchable tool result (`read` / `grep` /
- * `glob`) whose target was fetched again later. Position matters more than
- * volume — an in-place clear breaks the prefix cache from the cleared block to
- * the tail — so every candidate carries the number of tool results that landed
- * between the cleared call and its superseder, and nothing is cleared on
- * position alone.
+ * Two rules nominate a block:
+ *
+ * - **superseded**: a re-fetchable tool result (`read` / `read_image` / `grep` /
+ *   `glob` / `web_fetch`) whose target was fetched again later. Position matters
+ *   more than volume — an in-place clear breaks the prefix cache from the
+ *   cleared block to the tail — so every candidate carries the number of tool
+ *   results that landed between the cleared call and its superseder, and
+ *   nothing is cleared on position alone.
+ * - **stale**: a block whose result landed at least `staleTurns` turn boundaries
+ *   ago and whose whole body is re-fetchable. Supersession only ever names
+ *   output the model just asked for again; the rot worth clearing is the large
+ *   result nobody came back to, and no later call marks that dead.
+ *
+ * A clear replaces the *whole* model-visible block, so both rules also require
+ * that re-fetchable output is nearly all of it: a PTC program that printed live
+ * analysis next to one dead read must not become that read's pointer.
  */
 
 /** Tools whose output the model can re-obtain by calling the tool again. */
-export const REFETCH_TOOL_NAMES = ["read", "grep", "glob"] as const;
+export const REFETCH_TOOL_NAMES = ["read", "read_image", "grep", "glob", "web_fetch"] as const;
 
-/** A fetch call whose output the model can reproduce. */
+/** A fetch call whose output the model can re-obtain. */
 export interface RefetchCall {
 	/** Tool name, one of {@link REFETCH_TOOL_NAMES}. */
 	readonly name: string;
@@ -46,6 +56,8 @@ interface RefetchRecord {
 interface BlockRecord {
 	/** Session seq of the `tool/result` that carries this block. */
 	seq?: number;
+	/** Turn the block's result landed in; the clock behind the stale rule. */
+	turn?: number;
 	/** Model-visible tokens of the whole block, once its result lands. */
 	tokens: number;
 	/** Tokens of the re-fetchable calls whose output sits in this block. */
@@ -56,14 +68,17 @@ interface BlockRecord {
 	ageBlocks?: number;
 }
 
-/** One block whose re-fetchable output is entirely superseded. */
+/** Why a block is a candidate. */
+export type ClearReason = "superseded" | "stale";
+
+/** One block whose re-fetchable output is dead or old enough to clear. */
 export interface ClearCandidate {
 	readonly blockId: string;
 	/** Session seq of the `tool/result` event: the surface node a projection targets. */
 	readonly seq: number;
 	/** Model-visible tokens the block would free. */
 	readonly tokens: number;
-	/** Re-fetch calls inside the block that a later call superseded. */
+	/** Re-fetch calls the pointer has to name: all of them for a stale block. */
 	readonly calls: readonly { readonly name: string; readonly seq: number }[];
 	/** Target keys of those calls; a later fetch of one is a selector miss. */
 	readonly keys: readonly string[];
@@ -71,6 +86,10 @@ export interface ClearCandidate {
 	readonly label: string;
 	/** See {@link BlockRecord.ageBlocks}. */
 	readonly ageBlocks: number;
+	/** Which rule nominated this block. */
+	readonly reason: ClearReason;
+	/** Turn boundaries since the block landed, when both turns are known. */
+	readonly ageTurns?: number;
 }
 
 /** What one selector pass found. Written to the canary log, never to context. */
@@ -83,13 +102,21 @@ export interface CanaryBatch {
 export interface SelectorOptions {
 	/**
 	 * A block counts as dead when this share of its re-fetchable output is
-	 * superseded. Blocks also carry aggregation prose and non-re-fetchable
-	 * output, so a partial ratio leaves live content behind and is not cleared.
+	 * superseded. The same share also decides whether the block is re-fetchable
+	 * enough to replace: clearing rewrites the whole visible body, so a block
+	 * that is mostly live output is never a candidate.
 	 */
 	readonly deadShare?: number;
+	/**
+	 * Turn boundaries after which an all-re-fetchable block is rot. `0` disables
+	 * the age rule, leaving supersession as the only trigger.
+	 */
+	readonly staleTurns?: number;
 }
 
 export const DEFAULT_DEAD_SHARE = 0.95;
+/** Calibrated with the gate: a read from three turns ago is not the hot set. */
+export const DEFAULT_STALE_TURNS = 3;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -160,6 +187,14 @@ export function targetKeyOf(name: string, args: unknown): string | undefined {
 		const window = readWindowOf(args);
 		return window === undefined ? undefined : `read\u0000${window.path}`;
 	}
+	if (name === "read_image") {
+		const path = stringField(args, "file_path", "path");
+		return path === undefined ? undefined : `read_image\u0000${path}`;
+	}
+	if (name === "web_fetch") {
+		const url = stringField(args, "url");
+		return url === undefined ? undefined : `web_fetch\u0000${url}`;
+	}
 	if (name === "grep" || name === "glob") return `${name}\u0000${canonicalArguments(args)}`;
 	return undefined;
 }
@@ -191,6 +226,14 @@ function truncate(value: string, max: number): string {
  * when the call was a `read`, the exact line window that was cleared.
  */
 export function describeCall(call: { readonly name: string; readonly args: unknown }): string {
+	if (call.name === "web_fetch") {
+		const url = stringField(call.args, "url");
+		return url === undefined ? call.name : `web_fetch ${truncate(url, 80)}`;
+	}
+	if (call.name === "read_image") {
+		const path = stringField(call.args, "file_path", "path");
+		return path === undefined ? call.name : `read image ${truncate(path, 80)}`;
+	}
 	if (call.name === "read") {
 		const window = readWindowOf(call.args);
 		if (window === undefined) return "read";
@@ -211,8 +254,9 @@ function describeCalls(calls: readonly { readonly name: string; readonly args: u
 }
 
 /**
- * Tracks fetch calls and their outputs, and reports the blocks whose
- * re-fetchable output a later call has made dead.
+ * Tracks fetch calls and their outputs, and reports the blocks a pass may clear:
+ * those whose re-fetchable output a later call has made dead, and those whose
+ * whole body is re-fetchable but has aged past the turn budget.
  *
  * One tracker per session. Its state is derived from the session log's own
  * events, so a canary run can be replayed offline from a stored log.
@@ -231,7 +275,10 @@ export class SupersessionTracker {
 	private resultsLanded = 0;
 
 	constructor(options: SelectorOptions = {}) {
-		this.options = { deadShare: options.deadShare ?? DEFAULT_DEAD_SHARE };
+		this.options = {
+			deadShare: options.deadShare ?? DEFAULT_DEAD_SHARE,
+			staleTurns: options.staleTurns ?? DEFAULT_STALE_TURNS,
+		};
 	}
 
 	/** Register one `tool/result` landing; call ages are counted in results. */
@@ -283,11 +330,22 @@ export class SupersessionTracker {
 		if (record.supersededBySeq !== undefined) block.supersededTokens += delta;
 	}
 
-	/** Record the model-visible size and surface seq of a block, once its result lands. */
-	noteBlockTokens(blockId: string, tokens: number, seq?: number): void {
+	/** Record the model-visible size, surface seq and turn of a block. */
+	noteBlockTokens(blockId: string, tokens: number, seq?: number, turn?: number): void {
 		const block = this.blockFor(blockId);
 		block.tokens = Math.max(block.tokens, Math.max(0, tokens));
 		if (seq !== undefined) block.seq = seq;
+		if (turn !== undefined && Number.isSafeInteger(turn)) block.turn = turn;
+	}
+
+	/** Whether one block's visible body is almost entirely re-fetchable output. */
+	isRefetchOnly(blockId: string): boolean {
+		const block = this.blocks.get(blockId);
+		if (block === undefined || block.refetchTokens === 0 || block.tokens === 0) return false;
+		// Clearing rewrites the whole block, so the pointer may only replace a body
+		// that the model can re-obtain in full. A PTC program that printed live
+		// analysis next to one read would otherwise lose the analysis.
+		return block.refetchTokens >= block.tokens * this.options.deadShare;
 	}
 
 	/** Whether one block currently has no live re-fetchable output. */
@@ -299,31 +357,57 @@ export class SupersessionTracker {
 		return block.supersededTokens >= block.refetchTokens * this.options.deadShare;
 	}
 
+	/** Whether a re-fetchable block has outlived its turn budget. */
+	isStale(blockId: string, turn: number | undefined): boolean {
+		const block = this.blocks.get(blockId);
+		if (block === undefined || !(this.options.staleTurns > 0)) return false;
+		if (turn === undefined || block.turn === undefined) return false;
+		return turn - block.turn >= this.options.staleTurns;
+	}
+
 	/**
 	 * Candidates a clearing pass would free right now, and their total.
+	 *
+	 * `turn` is the boundary the pass is settling at: it ages the stale rule.
+	 * Without it only superseded blocks are candidates, which is what a replay
+	 * that has no boundary to place the decision at must use.
 	 *
 	 * Read-only on purpose: a pass that the gate, the occupancy floor, or a
 	 * missing projection skips must leave its candidates for the next boundary
 	 * instead of consuming them. Only {@link retire} removes a block.
 	 */
-	peekBatch(): CanaryBatch {
+	peekBatch(turn?: number): CanaryBatch {
 		const candidates: ClearCandidate[] = [];
 		for (const [blockId, block] of this.blocks) {
-			if (this.retired.has(blockId) || !this.isDead(blockId)) continue;
-			const dead = [...this.records.values()]
-				.filter((record) => record.call.blockId === blockId && record.supersededBySeq !== undefined);
-			const calls = dead.map((record) => ({ name: record.call.name, seq: record.call.seq }));
+			if (this.retired.has(blockId) || !this.isRefetchOnly(blockId)) continue;
+			const superseded = this.isDead(blockId);
+			const stale = !superseded && this.isStale(blockId, turn);
+			if (!superseded && !stale) continue;
+			// A superseded block names the dead calls, so the breaker can tell which
+			// targets the pointer sent the model back to. A stale block names every
+			// re-fetchable call it replaces, because the pointer has to describe them.
+			const named = [...this.records.values()].filter((record) =>
+				record.call.blockId === blockId && (!superseded || record.supersededBySeq !== undefined),
+			);
+			const ageTurns = turn !== undefined && block.turn !== undefined ? Math.max(0, turn - block.turn) : undefined;
 			candidates.push({
 				blockId,
 				seq: block.seq ?? -1,
 				tokens: block.tokens,
-				calls,
-				keys: dead.map((record) => record.key),
-				label: describeCalls(dead.map((record) => record.call)),
+				calls: named.map((record) => ({ name: record.call.name, seq: record.call.seq })),
+				keys: named.map((record) => record.key),
+				label: describeCalls(named.map((record) => record.call)),
 				ageBlocks: block.ageBlocks ?? 0,
+				reason: superseded ? "superseded" : "stale",
+				...(ageTurns !== undefined ? { ageTurns } : {}),
 			});
 		}
 		return { candidates, tokens: candidates.reduce((total, candidate) => total + candidate.tokens, 0) };
+	}
+
+	/** Whether a committed pass has already cleared this block. */
+	isRetired(blockId: string): boolean {
+		return this.retired.has(blockId);
 	}
 
 	/** Retire the blocks one committed pass cleared, so no later pass repeats them. */
@@ -396,39 +480,6 @@ export function batchPassesGate(
 	return batch.tokens / contextTokens >= gate.minShare;
 }
 
-/**
- * Trim a batch to what the session budget can still pay for.
- *
- * The budget is cumulative, but a real batch can exceed it on its own: the
- * largest replayed session produced a 73,646-token batch against the 40,000
- * default, and a whole-batch veto latched `stopped (budget)` before clearing
- * anything. Slice oldest-first instead, and let the first pass overshoot by
- * one candidate when the only dead block is larger than the cap — otherwise a
- * single oversized block could never be cleared and only host compaction
- * would touch it.
- */
-export function fitBatch(
-	batch: CanaryBatch,
-	maxTokens: number,
-	allowOversizeSingle = false,
-): CanaryBatch | undefined {
-	const candidates = [...batch.candidates].sort((left, right) => left.seq - right.seq);
-	if (candidates.length === 0) return undefined;
-	const cap = Math.max(0, maxTokens);
-	const selected: ClearCandidate[] = [];
-	let total = 0;
-	for (const candidate of candidates) {
-		const size = Math.max(0, candidate.tokens);
-		if (total + size > cap) continue;
-		selected.push(candidate);
-		total += size;
-	}
-	if (selected.length > 0) return { candidates: selected, tokens: total };
-	const first = candidates[0];
-	if (first === undefined || !allowOversizeSingle) return undefined;
-	return { candidates: [first], tokens: Math.max(0, first.tokens) };
-}
-
 /** One canary log line: the selector's decision, with the facts needed to judge it. */
 export interface CanaryRecord {
 	readonly at: number;
@@ -442,6 +493,12 @@ export interface CanaryRecord {
 	readonly candidates: readonly ClearCandidate[];
 	/** True when the batch would have been executed. */
 	readonly gate: boolean;
+	/**
+	 * What the settlement did: `cleared`, `canary`, `gate`, `occupancy`,
+	 * `unavailable`, `unrecordable`, `breaker`, `rejected`, or `no-candidate`.
+	 * Without it a skipped pass cannot be told from a gate that never opened.
+	 */
+	readonly outcome?: string;
 	/** What clearing did to the session, not what it might save. */
 	readonly quality?: CanaryQuality;
 }

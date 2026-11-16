@@ -69,6 +69,13 @@ export interface ClmAutoClearConfig {
 	enabled: boolean;
 	/** Append decisions to `CANARY.jsonl` without changing model input. */
 	canary: boolean;
+	/**
+	 * Turn boundaries after which a block whose visible body is entirely
+	 * re-fetchable is treated as rot and cleared even if nothing fetched it
+	 * again. `0` leaves supersession as the only trigger. Keep the default in
+	 * sync with `DEFAULT_STALE_TURNS` in `auto-clear.ts`.
+	 */
+	staleTurns: number;
 	minTokens: number;
 	minBlocks: number;
 	/**
@@ -81,8 +88,6 @@ export interface ClmAutoClearConfig {
 	minSharePercent: number;
 	/** Occupancy percentage at which clearing hands off to host compaction. */
 	stopPercent: number;
-	/** Cumulative tokens one session may clear. */
-	maxTokens: number;
 	/**
 	 * Free a candidate before the turn boundary when at most this many
 	 * model-visible tokens sit after it; `0` disables mid-turn passes.
@@ -165,11 +170,11 @@ export const DEFAULT_CLM_CONFIG: ClmConfig = {
 	autoClear: {
 		enabled: false,
 		canary: false,
+		staleTurns: 3,
 		minTokens: 1_200,
 		minBlocks: 2,
 		minSharePercent: 5,
 		stopPercent: 60,
-		maxTokens: 40_000,
 		midTurnSuffixTokens: 0,
 	},
 	host: {
@@ -328,6 +333,25 @@ function readString(
 }
 
 /**
+ * Report a key this version stopped reading.
+ *
+ * Unknown keys stay silent so a newer config still loads, but a key that used
+ * to change behaviour must not disappear quietly: a session that set the old
+ * value would run under different rules and never hear about it.
+ */
+function removedKey(
+	value: Record<string, unknown>,
+	key: string,
+	note: string,
+	source: string,
+	label: string,
+	warnings: string[],
+): void {
+	if (value[key] === undefined) return;
+	warnings.push(`${source}: "${label}" is no longer used and is ignored; ${note}`);
+}
+
+/**
  * Apply one parsed JSON document on top of a base config.
  *
  * Exported so tests (and future host integrations) can validate a document
@@ -390,13 +414,14 @@ export function parseClmConfig(
 
 	const autoClear = group(document, "autoClear", source, warnings);
 	if (autoClear) {
+		removedKey(autoClear, "maxTokens", "clearing has no cumulative token cap", source, "autoClear.maxTokens", warnings);
 		config.autoClear.enabled = readBoolean(autoClear, "enabled", config.autoClear.enabled, source, "autoClear.enabled", warnings);
 		config.autoClear.canary = readBoolean(autoClear, "canary", config.autoClear.canary, source, "autoClear.canary", warnings);
+		config.autoClear.staleTurns = readNumber(autoClear, "staleTurns", config.autoClear.staleTurns, source, "autoClear.staleTurns", warnings, { min: 0, integer: true });
 		config.autoClear.minTokens = readNumber(autoClear, "minTokens", config.autoClear.minTokens, source, "autoClear.minTokens", warnings, { min: 0 });
 		config.autoClear.minBlocks = readNumber(autoClear, "minBlocks", config.autoClear.minBlocks, source, "autoClear.minBlocks", warnings, { min: 1, integer: true });
 		config.autoClear.minSharePercent = readNumber(autoClear, "minSharePercent", config.autoClear.minSharePercent, source, "autoClear.minSharePercent", warnings, { min: 0, max: 100 });
 		config.autoClear.stopPercent = readNumber(autoClear, "stopPercent", config.autoClear.stopPercent, source, "autoClear.stopPercent", warnings, { min: 0, max: 100 });
-		config.autoClear.maxTokens = readNumber(autoClear, "maxTokens", config.autoClear.maxTokens, source, "autoClear.maxTokens", warnings, { min: 1 });
 		config.autoClear.midTurnSuffixTokens = readNumber(autoClear, "midTurnSuffixTokens", config.autoClear.midTurnSuffixTokens, source, "autoClear.midTurnSuffixTokens", warnings, { min: 0, integer: true });
 	}
 

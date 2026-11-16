@@ -5,13 +5,10 @@ import {
 	SupersessionTracker,
 	batchPassesGate,
 	describeCall,
-	fitBatch,
 	parseToolArguments,
 	readWindowOf,
 	supersedes,
 	targetKeyOf,
-	type CanaryBatch,
-	type ClearCandidate,
 	type RefetchCall,
 } from "../../../src/features/live-context/auto-clear.ts";
 
@@ -85,13 +82,13 @@ test("a block that still holds live output stays alive", () => {
 	assert.deepEqual(tracker.peekBatch().candidates, []);
 });
 
-test("a PTC block dies only when every refetch inside it is superseded", () => {
+test("a PTC block dies only when its refetch output is the whole visible body", () => {
 	const tracker = new SupersessionTracker();
 	tracker.noteCall(call("read", { file_path: "/a.ts" }, "root1", 1));
 	tracker.noteOutput(1, 1_000);
 	tracker.noteCall(call("grep", { pattern: "needle" }, "root1", 2));
 	tracker.noteOutput(2, 1_000);
-	tracker.noteBlockTokens("root1", 2_400);
+	tracker.noteBlockTokens("root1", 2_000);
 
 	tracker.noteCall(call("read", { file_path: "/a.ts" }, "root2", 3));
 	assert.deepEqual(tracker.peekBatch().candidates, []);
@@ -99,7 +96,76 @@ test("a PTC block dies only when every refetch inside it is superseded", () => {
 	tracker.noteCall(call("grep", { pattern: "needle" }, "root2", 4));
 	const batch = tracker.peekBatch();
 	assert.equal(batch.candidates.length, 1);
-	assert.equal(batch.tokens, 2_400);
+	assert.equal(batch.tokens, 2_000);
+});
+
+test("a program that printed live analysis is never replaced by one dead read", () => {
+	const tracker = new SupersessionTracker();
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "prog", 1));
+	tracker.noteOutput(1, 400);
+	tracker.noteBlockTokens("prog", 6_000);
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "again", 2));
+	// The read itself is dead, but the block is mostly stdout the model still needs.
+	assert.deepEqual(tracker.peekBatch().candidates, []);
+});
+
+test("an old all-refetchable block is cleared without a superseder", () => {
+	const tracker = new SupersessionTracker({ staleTurns: 3 });
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "old", 1));
+	tracker.noteOutput(1, 2_000);
+	tracker.noteBlockTokens("old", 2_000, 42, 2);
+	assert.deepEqual(tracker.peekBatch(4).candidates, []);
+	const [candidate] = tracker.peekBatch(5).candidates;
+	assert.equal(candidate?.blockId, "old");
+	assert.equal(candidate?.reason, "stale");
+	assert.equal(candidate?.ageTurns, 3);
+	assert.equal(candidate?.label, "read /a.ts");
+	assert.deepEqual(candidate?.keys, ["read\u0000/a.ts"]);
+});
+
+test("a recent block is not stale, and the age rule can be turned off", () => {
+	const tracker = new SupersessionTracker({ staleTurns: 3 });
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "block", 1));
+	tracker.noteOutput(1, 2_000);
+	tracker.noteBlockTokens("block", 2_000, 42, 4);
+	assert.deepEqual(tracker.peekBatch(5).candidates, []);
+	tracker.noteBlockTokens("block", 2_000, 42, 1);
+	assert.equal(tracker.peekBatch(4).candidates[0]?.reason, "stale");
+	// Without a boundary turn the age rule cannot run; the entry point keeps the
+	// offline replay honest instead of clearing everything as "old".
+	assert.deepEqual(tracker.peekBatch().candidates, []);
+	const off = new SupersessionTracker({ staleTurns: 0 });
+	off.noteCall(call("read", { file_path: "/a.ts" }, "block", 1));
+	off.noteOutput(1, 2_000);
+	off.noteBlockTokens("block", 2_000, 42, 1);
+	assert.deepEqual(off.peekBatch(99).candidates, []);
+});
+
+test("a stale block still has to be re-fetchable in full", () => {
+	const tracker = new SupersessionTracker({ staleTurns: 1 });
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "mixed", 1));
+	tracker.noteOutput(1, 300);
+	tracker.noteBlockTokens("mixed", 5_000, 42, 1);
+	assert.deepEqual(tracker.peekBatch(9).candidates, []);
+});
+
+test("an image or a URL is a re-fetchable target too", () => {
+	const tracker = new SupersessionTracker();
+	tracker.noteCall(call("read_image", { file_path: "/a.png" }, "img1", 1));
+	tracker.noteOutput(1, 1_500);
+	tracker.noteBlockTokens("img1", 1_500);
+	tracker.noteCall(call("read_image", { file_path: "/a.png" }, "img2", 2));
+	assert.equal(tracker.peekBatch().candidates[0]?.label, "read image /a.png");
+
+	tracker.noteCall(call("web_fetch", { url: "https://example.com/a" }, "web1", 3));
+	tracker.noteOutput(3, 900);
+	tracker.noteBlockTokens("web1", 900);
+	tracker.noteCall(call("web_fetch", { url: "https://example.com/a" }, "web2", 4));
+	assert.equal(tracker.peekBatch().candidates.at(-1)?.label, "web_fetch https://example.com/a");
+	assert.notEqual(
+		targetKeyOf("web_fetch", { url: "https://example.com/a" }),
+		targetKeyOf("web_fetch", { url: "https://example.com/b" }),
+	);
 });
 
 test("a peek consumes nothing: a skipped pass re-offers its candidates", () => {
@@ -132,6 +198,21 @@ test("retiring the blocks one pass cleared is the only irreversible step", () =>
 	assert.equal(tracker.peekBatch().candidates.length, 0);
 });
 
+test("a settlement can ask whether a pass ahead of it already retired a block", () => {
+	const tracker = new SupersessionTracker();
+	tracker.noteCall(call("glob", { pattern: "**/*.ts" }, "g1", 1));
+	tracker.noteOutput(1, 2_000);
+	tracker.noteBlockTokens("g1", 2_000);
+	tracker.noteCall(call("glob", { pattern: "**/*.ts" }, "g2", 2));
+	// Two boundaries announced in one tick capture this batch twice; the second
+	// settlement has to see that the first one already took the block.
+	const captured = tracker.peekBatch();
+	assert.equal(tracker.isRetired("g1"), false);
+	tracker.retire(captured.candidates.map((candidate) => candidate.blockId));
+	assert.equal(tracker.isRetired("g1"), true);
+	assert.deepEqual(tracker.peekBatch().candidates, []);
+});
+
 test("a replayed decision retires its target by the tool/result seq it names", () => {
 	const tracker = new SupersessionTracker();
 	tracker.noteCall(call("grep", { pattern: "x" }, "c1", 1));
@@ -155,13 +236,13 @@ test("output recorded after supersession still counts toward the dead share", ()
 
 test("the gate needs enough tokens, enough blocks, or enough rot to matter", () => {
 	const one = {
-		candidates: [{ blockId: "a", seq: 7, tokens: 300, calls: [], keys: [], label: "read /a.ts", ageBlocks: 2 }],
+		candidates: [{ blockId: "a", seq: 7, tokens: 300, calls: [], keys: [], label: "read /a.ts", ageBlocks: 2, reason: "superseded" as const }],
 		tokens: 300,
 	};
 	const two = {
 		candidates: [
-			{ blockId: "a", seq: 7, tokens: 700, calls: [], keys: [], label: "read /a.ts", ageBlocks: 2 },
-			{ blockId: "b", seq: 8, tokens: 700, calls: [], keys: [], label: "read /b.ts", ageBlocks: 3 },
+			{ blockId: "a", seq: 7, tokens: 700, calls: [], keys: [], label: "read /a.ts", ageBlocks: 2, reason: "superseded" as const },
+			{ blockId: "b", seq: 8, tokens: 700, calls: [], keys: [], label: "read /b.ts", ageBlocks: 3, reason: "superseded" as const },
 		],
 		tokens: 1_400,
 	};
@@ -177,7 +258,7 @@ test("dead share of the live prompt opens the gate without crossing the volume f
 	// 800 dead tokens is below minTokens; the gate stays shut in a large prompt
 	// and opens once the same rot is 5% of what the model reads.
 	const batch = {
-		candidates: [{ blockId: "a", seq: 7, tokens: 800, calls: [], keys: [], label: "read /a.ts", ageBlocks: 2 }],
+		candidates: [{ blockId: "a", seq: 7, tokens: 800, calls: [], keys: [], label: "read /a.ts", ageBlocks: 2, reason: "superseded" as const }],
 		tokens: 800,
 	};
 	const gate = { minTokens: 1_200, minBlocks: 5, minShare: 0.05 };
@@ -199,11 +280,12 @@ test("a candidate carries the surface seq, the target keys and a pointer label",
 	const tracker = new SupersessionTracker();
 	tracker.noteCall(call("read", { file_path: "/src/a.ts", offset: 10, limit: 20 }, "c1", 1));
 	tracker.noteOutput(1, 3_000);
-	tracker.noteBlockTokens("c1", 3_200, 42);
+	tracker.noteBlockTokens("c1", 3_000, 42);
 	tracker.noteCall(call("read", { file_path: "/src/a.ts", offset: 1, limit: 200 }, "c2", 2));
 	const [candidate] = tracker.peekBatch().candidates;
 	assert.equal(candidate?.seq, 42);
 	assert.equal(candidate?.label, "read /src/a.ts:10-29");
+	assert.equal(candidate?.reason, "superseded");
 	assert.deepEqual(candidate?.keys, ["read\u0000/src/a.ts"]);
 });
 
@@ -221,33 +303,11 @@ test("pointer labels name the target and stay one line", () => {
 	assert.equal(describeCall({ name: "read", args: { file_path: "/a.ts" } }), "read /a.ts");
 	assert.equal(describeCall({ name: "read", args: { file_path: "/a.ts", offset: 5 } }), "read /a.ts:5-");
 	assert.equal(describeCall({ name: "grep", args: { pattern: "needle" } }), 'grep "needle"');
+	assert.equal(describeCall({ name: "web_fetch", args: { url: "https://example.com/a" } }), "web_fetch https://example.com/a");
+	assert.equal(describeCall({ name: "read_image", args: { file_path: "/a.png" } }), "read image /a.png");
 	const long = describeCall({ name: "grep", args: { pattern: "x".repeat(200) } });
 	assert.equal(long.includes("\n"), false);
 	assert.equal(long.length < 90, true);
 });
 
-function candidate(blockId: string, seq: number, tokens: number): ClearCandidate {
-	return { blockId, seq, tokens, calls: [], keys: [], label: `read ${blockId}`, ageBlocks: 0 };
-}
-
-function batchOf(...candidates: ClearCandidate[]): CanaryBatch {
-	return { candidates, tokens: candidates.reduce((total, entry) => total + entry.tokens, 0) };
-}
-
-test("a batch larger than the remaining budget is sliced oldest-first", () => {
-	const batch = batchOf(candidate("c3", 3, 10_000), candidate("c1", 1, 30_000), candidate("c2", 2, 25_000));
-	const fitted = fitBatch(batch, 40_000);
-	assert.deepEqual(fitted?.candidates.map((entry) => entry.blockId), ["c1", "c3"]);
-	assert.equal(fitted?.tokens, 40_000);
-});
-
-test("an oversized single block runs only as the first pass", () => {
-	const batch = batchOf(candidate("big", 1, 73_646));
-	assert.equal(fitBatch(batch, 40_000), undefined);
-	assert.deepEqual(fitBatch(batch, 40_000, true)?.candidates.map((entry) => entry.blockId), ["big"]);
-});
-
-test("an empty batch never reaches the budget slicer", () => {
-	assert.equal(fitBatch({ candidates: [], tokens: 0 }, 40_000), undefined);
-});
 

@@ -26,16 +26,17 @@ cleanup({ list: "3-16" })
 
 - ID 是当前 mirror/index 的编辑序号；不改 ID、不重排 block。
 - `list` 不能与 `blockIds` / `ranges` / `skipRoles` / `offload` 同时出现。
-- `offload` 的 note 必须单行、非空、≤240 字符，替换后的估算 token 必须严格小于原正文；note 不能携带保留来源声明（`oh-my-clm … source=/owner=/agent=/trusted=/provenance=`）或 preview 截断 marker。
+- `offload` 的 note 必须单行、非空、≤240 字符，替换后的估算 token 必须严格小于原正文；note 不能携带保留来源声明或 preview 截断 marker。
 - `offload` 只允许 `assistant` / `toolResult`。block 1 是 load-bearing 锚点；user-authored 正文只能省略，不能被 note 取代。
 - offload 带 tool call 的 assistant 会丢掉 tool call 结构，因此配对 tool result 一起 omit；offload tool result 只是内容改写，owner assistant 保留。
-- 显式 ID 1 拒绝；range 覆盖 1 时保留 1。共享的 `loadBearingRecord()` 守卫让 mirror 编辑路径同样无法删除 block 1。
-- 配对级联删除单独报告为 `pairedRemovalIds` / `paired`，不混入调用者请求的 ID。
+- 显式 ID 1 拒绝；range 覆盖 1 时保留 1。mirror 编辑路径复用同一守卫。
+- 配对级联删除单独报告，不混入调用者请求的 ID。
 - 删除最后一个可编辑 block 时保留 `<!-- CLM_EMPTY -->`；`offload` 不删除 span，因此不触发 `CLM_EMPTY`。
-- 删除与 offload 使用与解析相同的顶层 span 扫描；body 中引用或手写的 `[[CLM_ENTRY ...]]` 不会被当成可删块。
 - 损坏（缺 closing marker、重复顶层 ID、目标 span 不存在）返回 `rejected` 与具体 ID；写盘失败返回结果对象，不产生半状态。
-- Pi 侧一个 step 最多调用一次 cleanup，且必须在该 step 任何 mirror 编辑之前。同一 step 先改 body 再 cleanup 会整体拒绝，reason 会点明顺序。
-- 单次 `list` 结果约 6 KB 字符预算；截断时末尾给出继续读取的区间，不静默返回部分视图。
+- Pi 侧一个 step 最多调用一次 cleanup，且必须在该 step 任何 mirror 编辑之前；顺序错误整体拒绝。
+- 单次 `list` 有字符预算；截断时末尾给出继续读取的区间，不静默返回部分视图。
+
+参数校验与删除规划在 `context-cleanup.ts`；顶层 span 扫描与 ID 规则在 `context-format.ts`。
 
 ## block index
 
@@ -62,9 +63,9 @@ IDs 5.. (current turn, not listed): One more turn.
 
 ### 刷新
 
-索引的静态协议放在 system prompt，随 prompt 缓存；runtime context 只携带动态行。同一 turn 内最多每 `index.refreshSteps`（默认 4）步重渲染一次，按“打开中的 turn + 已关闭 step 数”计数；`1` 恢复每步刷新。追加 block 不重编号，删除会重编号，因此 cleanup 或 mirror edit 生效后立即清空缓存并重渲染；compaction 也保守失效。
+索引的静态协议放在 system prompt，随 prompt 缓存；runtime context 只携带动态行。同一 turn 内最多每 `index.refreshSteps`（默认 4）步重渲染一次；`1` 恢复每步刷新。cleanup 或 mirror edit 生效后立即失效并重渲染，compaction 也保守失效。
 
-DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程切换索引形状并清空缓存，从下一步生效；`auto` 回到配置文件的 `index.mode`（默认 `digest`）。这是进程级覆盖，影响当前进程所有 session。
+DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程切换索引形状并清空缓存，从下一步生效；`auto` 回到配置文件的 `index.mode`。这是进程级覆盖，影响当前进程所有 session。
 
 ## 结果模式
 
@@ -76,25 +77,11 @@ DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程切换索引形状并清
 | `full` | 结果后附带刷新后的索引（拒绝时也附带）。 |
 | `none` | 只抑制成功确认；`rejected` 始终返回可行动 reason，`list` 始终返回行内容。 |
 
-结果模式只影响模型可见结果，不改变工具调用记录。
-
-动作报告示例：`cleanup applied; removed 2 block(s): 2-3.`；软卸载为 `cleanup applied; offloaded 1 block(s): 2.`；混用时分别列出，配对删除单列 `Paired (not requested): 3.`。
+结果模式只影响模型可见结果，不改变工具调用记录。动作报告示例：`cleanup applied; removed 2 block(s): 2-3.`；软卸载为 `cleanup applied; offloaded 1 block(s): 2.`；混用时分别列出，配对删除单列 `Paired (not requested): 3.`。
 
 ## 配置
 
-以下配置项只在 DSH host bridge 中读取；Pi 侧没有 block index。写进 `~/.config/oh-my-clm/config.json` 或项目级 `.oh-my-clm.json`。
-
-| 配置项 | 默认 | 作用 |
-| --- | --- | --- |
-| `index.mode` | `digest` | 索引形状：`digest` / `blocks`。 |
-| `index.previewChars` | `64` | `blocks` 模式每行 preview 字符数。 |
-| `index.headBlocks` | `12` | 列表开头保留的 block 数。 |
-| `index.tailBlocks` | `40` | 列表尾部窗口宽度。 |
-| `index.maxLines` | `40` | `digest` 模式最多列出的 turn 数。 |
-| `index.refreshSteps` | `4` | 同一 turn 内最多每几步重渲染一次。 |
-| `cleanup.resultMode` | `compact` | `compact` / `full` / `none`。 |
-
-清理触发阈值与缓存计价见根 [README](../../README.md#配置)。
+索引开关 `index.mode` / `previewChars` / `headBlocks` / `tailBlocks` / `maxLines` / `refreshSteps`、`cleanup.resultMode` 与清理触发阈值的默认值统一列在根 [README](../../README.md#配置)。Pi 侧没有 block index。
 
 ## 宿主差异
 

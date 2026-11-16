@@ -10,6 +10,7 @@
  *
  * Usage: node scripts/canary-replay.mjs <session.v4.jsonl.zstd> [...more]
  *        node scripts/canary-replay.mjs --all [--limit N] [--sessions-root DIR]
+ *        [--stale-turns N]
  *
  * Requires a completed `npm run build:dsh`, because it imports the compiled
  * selector rather than re-implementing it. Stored logs are zstd-compressed, so
@@ -31,12 +32,12 @@ if (!existsSync(selectorPath)) {
 	console.error("build the plugin first: npm run build:dsh");
 	process.exit(2);
 }
-const { DEFAULT_BATCH_GATE, SupersessionTracker, batchPassesGate, parseToolArguments } = await import(
+const { DEFAULT_BATCH_GATE, DEFAULT_STALE_TURNS, SupersessionTracker, batchPassesGate, parseToolArguments } = await import(
 	selectorPath.href
 );
 
 const DEFAULT_SESSIONS_ROOT = join(homedir(), ".dsh", "sessions");
-const REFETCH = ["read", "grep", "glob"];
+const REFETCH = ["read", "read_image", "grep", "glob", "web_fetch"];
 
 function readEvents(file) {
 	let raw;
@@ -76,7 +77,7 @@ function estimate(text) {
 
 /** One boundary's decision: what a live pass would have looked at, and whether it ran. */
 function decide(tracker, turn, batches) {
-	const batch = tracker.peekBatch();
+	const batch = tracker.peekBatch(typeof turn === "number" && Number.isSafeInteger(turn) ? turn : undefined);
 	if (batch.candidates.length === 0) return;
 	const gate = batchPassesGate(batch);
 	batches.push({ turn, gate, ...batch });
@@ -87,7 +88,7 @@ function decide(tracker, turn, batches) {
 
 /** Feed one session's events through the selector exactly as the host bridge does. */
 function replay(file) {
-	const tracker = new SupersessionTracker();
+	const tracker = new SupersessionTracker({ staleTurns });
 	const callSeqs = new Map();
 	const batches = [];
 	for (const event of readEvents(file)) {
@@ -117,7 +118,7 @@ function replay(file) {
 			if (typeof callId !== "string") continue;
 			const tokens = estimate(textOf(data.message.content));
 			tracker.noteBlockLanding();
-			tracker.noteBlockTokens(callId, tokens);
+			tracker.noteBlockTokens(callId, tokens, seq, typeof data.turn === "number" ? data.turn : undefined);
 			const callSeq = callSeqs.get(callId);
 			if (callSeq !== undefined) {
 				callSeqs.delete(callId);
@@ -147,11 +148,17 @@ const limitIndex = args.indexOf("--limit");
 const limit = limitIndex >= 0 ? Number(args[limitIndex + 1]) : 12;
 const rootIndex = args.indexOf("--sessions-root");
 const sessionsRoot = rootIndex >= 0 ? args[rootIndex + 1] : DEFAULT_SESSIONS_ROOT;
+const staleIndex = args.indexOf("--stale-turns");
+const staleTurns = staleIndex >= 0 ? Number(args[staleIndex + 1]) : DEFAULT_STALE_TURNS;
+if (!Number.isSafeInteger(staleTurns) || staleTurns < 0) {
+	console.error("--stale-turns needs a non-negative integer");
+	process.exit(2);
+}
 if (!sessionsRoot) {
 	console.error("--sessions-root needs a directory");
 	process.exit(2);
 }
-const valueOptions = new Set(["--limit", "--sessions-root"]);
+const valueOptions = new Set(["--limit", "--sessions-root", "--stale-turns"]);
 const positional = args.filter((arg, index) =>
 	!arg.startsWith("--") && !valueOptions.has(args[index - 1] ?? ""),
 );

@@ -11,7 +11,6 @@ import {
 	REFETCH_TOOL_NAMES,
 	SupersessionTracker,
 	batchPassesGate,
-	fitBatch,
 	parseToolArguments,
 	targetKeyOf,
 	type BatchGate,
@@ -174,12 +173,61 @@ function triggerOptions(config: ClmConfig): CleanupTriggerOptions {
 
 /** Tool results a cleared target may come back within and still count as a miss. */
 const BREAKER_WINDOW_RESULTS = 3;
+/**
+ * Cleared targets a session must have before a re-read rate can latch the
+ * breaker. A batch of two blocks re-read once each is one normal round trip,
+ * not evidence that the selector cleared live content.
+ */
+const BREAKER_MIN_REREADS = 3;
 
 /** The ignorable-record seam is resolved per session, from that session's config. */
 type WriterState =
 	| { readonly state: "pending" }
 	| { readonly state: "ready"; readonly seam: PluginRecordSeam }
 	| { readonly state: "missing" };
+
+/** Why one settlement cleared or skipped, as `/clm status` reports it. */
+type PassOutcome =
+	| "no-candidate"
+	| "gate"
+	| "canary"
+	| "cleared"
+	| "rejected"
+	| "occupancy"
+	| "unavailable"
+	| "unrecordable"
+	| "breaker";
+
+/** What the last settlement saw and did; the answer to "why 0 passes". */
+interface BoundaryReport {
+	readonly turn: unknown;
+	readonly candidates: number;
+	readonly tokens: number;
+	readonly outcome: PassOutcome;
+}
+
+/**
+ * One boundary's inputs, read while the host is announcing it and settled in a
+ * later microtask.
+ *
+ * The write cannot happen at the announcement: `Session.commit()` keeps the
+ * append active while it notifies `session/event`, and `appendPluginRecord`
+ * refuses a nested append. Everything the decision needs is therefore captured
+ * here, so the deferred pass cannot read a state the next turn has already moved
+ * on. See {@link scheduleSettlement}.
+ */
+interface Settlement {
+	readonly where: { readonly turn: unknown; readonly step?: unknown };
+	readonly batch: CanaryBatch;
+	readonly gate: boolean;
+	readonly usage: HostUsage | undefined;
+	/** This turn's counters, read before {@link resetTurnQuality} clears them. */
+	readonly turn: CanaryQuality["turn"];
+	/** Whether a post-clear outcome is waiting for this line. */
+	readonly dirty: boolean;
+	/** Candidates this session has not written to the ledger yet. */
+	readonly fresh: CanaryBatch["candidates"];
+}
 
 /** What the plugin has actually cleared in one session, and why it may stop. */
 interface AutoClearState {
@@ -212,8 +260,10 @@ interface AutoClearState {
 	 * boundary should write it even if no new block died.
 	 */
 	qualityDirty: boolean;
+	/** Last settlement's candidate count and outcome, for the status line. */
+	last?: BoundaryReport;
 	/** Set once this session stops clearing; survives until the plugin reloads. */
-	stop?: "breaker" | "budget" | "unavailable" | "unrecordable";
+	stop?: "breaker" | "unavailable" | "unrecordable";
 }
 
 /** Canary selector state, one per live agent session. */
@@ -237,6 +287,11 @@ interface CanaryRuntime {
 	 * one prefix break per step, so the exception is rationed here.
 	 */
 	midTurnTurn?: number;
+	/**
+	 * Set when the session leaves the canary map, so a settlement queued against it
+	 * cannot write into a session the host is tearing down.
+	 */
+	disposed?: boolean;
 }
 
 /** The slice of the `sessions` service this plugin uses. */
@@ -277,11 +332,6 @@ function autoClearEnabled(config: ClmConfig): boolean {
 /** Occupancy at which clearing hands the session back to host compaction. */
 function autoClearStopPercent(config: ClmConfig): number {
 	return config.autoClear.stopPercent;
-}
-
-/** Total tokens one session may clear before the budget stops it. */
-function autoClearBudget(config: ClmConfig): number {
-	return config.autoClear.maxTokens;
 }
 
 function canaryValue(value: unknown, name: string): unknown {
@@ -354,7 +404,8 @@ function feedCanary(
 		const tokens = estimateTokens([canaryText(canaryValue(message, "content"))]);
 		noteToolOutcome(state, callId, canaryValue(message, "isError") === true);
 		state.tracker.noteBlockLanding();
-		state.tracker.noteBlockTokens(callId, tokens, seq);
+		const blockTurn = canaryValue(data, "turn");
+		state.tracker.noteBlockTokens(callId, tokens, seq, typeof blockTurn === "number" ? blockTurn : undefined);
 		const callSeq = state.callSeqs.get(callId);
 		if (callSeq !== undefined) {
 			state.callSeqs.delete(callId);
@@ -375,19 +426,24 @@ function feedCanary(
 	// read-only: a pass the gate, the occupancy floor, or a missing projection
 	// skips leaves its candidates for the next boundary instead of consuming them.
 	const turn = canaryValue(data, "turn");
-	const batch = state.tracker.peekBatch();
+	const boundary = typeof turn === "number" && Number.isSafeInteger(turn) ? turn : undefined;
+	const batch = state.tracker.peekBatch(boundary);
+	const usage = hostUsageFor(session, state.config);
 	if (batch.candidates.length === 0) {
-		// No newly dead block, but a post-clear re-read or error still belongs in
-		// the ledger: that is the outcome a quality tool has to be judged on.
-		if (canaryEnabled(state.config) && state.auto.qualityDirty) {
-			writeCanaryRecord(ctx, session, state, { turn }, { candidates: [], tokens: 0 }, false);
+		// An empty batch is a decision too: the selector looked and found nothing.
+		// Recording it is what separates "no rot yet" from a gate that never opens.
+		state.auto.last = { turn, candidates: 0, tokens: 0, outcome: "no-candidate" };
+		if (canaryEnabled(state.config)) {
+			writeCanaryRecord(ctx, session, state, settlementOf(state, { turn }, batch, false, usage));
 		}
 		resetTurnQuality(state);
 		return;
 	}
-	const usage = hostUsageFor(session, state.config);
-	runPass(ctx, session, state, { turn }, batch, batchPassesGate(batch, state.gate, usage?.tokens ?? 0));
+	// Snapshot before scheduling: the turn counters belong to the turn that just
+	// ended, and the host may append the next turn before the deferred pass runs.
+	const settlement = settlementOf(state, { turn }, batch, batchPassesGate(batch, state.gate, usage?.tokens ?? 0), usage);
 	resetTurnQuality(state);
+	scheduleSettlement(ctx, session, state, settlement);
 }
 
 /**
@@ -424,7 +480,7 @@ function maybeMidTurnPass(
 	const stepNumber = typeof step === "number" && Number.isSafeInteger(step) ? step : undefined;
 	if (turnNumber === undefined || stepNumber === undefined) return;
 	if (state.midTurnTurn === turnNumber) return;
-	const batch = state.tracker.peekBatch();
+	const batch = state.tracker.peekBatch(turnNumber);
 	if (batch.candidates.length === 0) return;
 	const tails = dshSurfaceTokensAfterEach(
 		session,
@@ -444,60 +500,136 @@ function maybeMidTurnPass(
 	const freed = cheap.reduce((total, candidate) => total + Math.max(0, candidate.tokens), 0);
 	// The volume gate is deliberately bypassed: it exists to amortise one break
 	// over many blocks, and this break is already free (or priced above).
-	const applied = runPass(ctx, session, state, { turn: turnNumber, step: stepNumber }, { candidates: cheap, tokens: freed }, true);
+	const usage = hostUsageFor(session, state.config);
+	const settlement = settlementOf(
+		state,
+		{ turn: turnNumber, step: stepNumber },
+		{ candidates: cheap, tokens: freed },
+		true,
+		usage,
+	);
 	// The ration is spent only by a pass that actually wrote its record: a skip for
 	// a transient reason (occupancy, projection not registered) must get another
-	// chance inside this same turn.
-	if (applied) state.midTurnTurn = turnNumber;
+	// chance inside this same turn. Reserve it now — a second `step/end` in the
+	// same tick must not schedule a second break — and hand it back if nothing was
+	// written.
+	state.midTurnTurn = turnNumber;
+	scheduleSettlement(ctx, session, state, settlement, (applied) => {
+		if (!applied) state.midTurnTurn = undefined;
+	});
+}
+
+/** Everything one settlement needs, read at the boundary it belongs to. */
+function settlementOf(
+	state: CanaryRuntime,
+	where: { readonly turn: unknown; readonly step?: unknown },
+	batch: CanaryBatch,
+	gate: boolean,
+	usage: HostUsage | undefined,
+): Settlement {
+	return {
+		where,
+		batch,
+		gate,
+		usage,
+		turn: {
+			rereads: state.auto.turnRereads,
+			errors: state.auto.turnErrors,
+			errorRereads: state.auto.turnErrorRereads,
+		},
+		dirty: state.auto.qualityDirty,
+		fresh: batch.candidates.filter((candidate) => !state.reported.has(candidate.blockId)),
+	};
 }
 
 /**
- * One settlement: canary record, admissibility, budget slice, apply.
+ * Settle one boundary after the host finishes publishing the event that opened
+ * it.
+ *
+ * `Session.commit()` notifies `session/event` observers while the append is
+ * still marked active, and `appendPluginRecord` refuses a nested append
+ * ("session append cannot reenter while another append is being published").
+ * Writing the clear record from inside the observer therefore fails on every
+ * boundary and reports `rejected` with `0 pass(es)`: the decision is sound, the
+ * record is not. The microtask runs once that append has returned; the
+ * settlement carries everything the decision reads, so nothing drifts in
+ * between.
+ */
+function scheduleSettlement(
+	ctx: DshContext,
+	session: DshSessionLike,
+	state: CanaryRuntime,
+	settlement: Settlement,
+	onSettled?: (applied: boolean) => void,
+): void {
+	queueMicrotask(() => {
+		if (state.disposed === true) return;
+		try {
+			// Not `onSettled?.(runPass(...))`: an optional call does not evaluate its
+			// arguments, so the settlement itself would be skipped whenever there is
+			// no callback to hand the result to.
+			const applied = runPass(ctx, session, state, settlement);
+			onSettled?.(applied);
+		} catch (error) {
+			ctx.logger?.warn?.(`oh-my-clm: settlement failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	});
+}
+
+/**
+ * One settlement: canary record, admissibility, apply.
  *
  * Shared by the turn boundary and the mid-turn exception so both obey the same
- * breaker, occupancy floor, seam checks and cumulative budget.
+ * breaker, occupancy floor and seam checks.
  */
 function runPass(
 	ctx: DshContext,
 	session: DshSessionLike,
 	state: CanaryRuntime,
-	where: { turn: unknown; step?: unknown },
-	batch: CanaryBatch,
-	gate: boolean,
+	settlement: Settlement,
 ): boolean {
+	const { where, gate } = settlement;
+	// Two boundaries announced in one tick (a step that ends its turn) both capture
+	// the same live blocks, and the settlement queued first retires them. Trim to
+	// what is still live, or the same target is written twice and the pass, the
+	// freed tokens and the breaker's denominator are all counted twice.
+	const batch = liveBatchOf(state, settlement.batch);
+	if (batch.candidates.length === 0) {
+		// The honest report: this boundary saw only what a pass ahead of it already
+		// cleared.
+		state.auto.last = { turn: where.turn, candidates: 0, tokens: 0, outcome: "no-candidate" };
+		if (canaryEnabled(state.config)) writeCanaryRecord(ctx, session, state, { ...settlement, batch });
+		return false;
+	}
 	// Execute first, then log: the ledger's quality block reports what this pass
 	// actually did (blocks retired, tokens freed), so writing it before the write
 	// would report the previous pass's totals one boundary late.
-	const applied = executePass(ctx, session, state, batch, gate);
-	if (canaryEnabled(state.config)) writeCanaryRecord(ctx, session, state, where, batch, gate);
+	const enabled = autoClearEnabled(state.config);
+	const blocked: PassOutcome | undefined = enabled ? admitClear(state, gate, settlement.usage) : undefined;
+	const applied = enabled && blocked === undefined ? applyClear(ctx, session, state, batch) : false;
+	// A settlement that cleared nothing still has to say which check stopped it;
+	// otherwise `0 pass(es)` is the same text for six different states.
+	state.auto.last = {
+		turn: where.turn,
+		candidates: batch.candidates.length,
+		tokens: batch.tokens,
+		outcome: applied
+			? "cleared"
+			: blocked !== undefined
+				? blocked
+				: enabled
+					? "rejected"
+					: gate ? "canary" : "gate",
+	};
+	if (canaryEnabled(state.config)) writeCanaryRecord(ctx, session, state, { ...settlement, batch });
 	return applied;
 }
 
-/** The admissibility + budget + apply half of {@link runPass}. */
-function executePass(
-	ctx: DshContext,
-	session: DshSessionLike,
-	state: CanaryRuntime,
-	batch: CanaryBatch,
-	gate: boolean,
-): boolean {
-	if (!autoClearEnabled(state.config)) return false;
-	if (admitClear(session, state, gate) !== undefined) return false;
-	// The budget is a cumulative cap, not a whole-batch veto: a 73k batch
-	// against a 40k cap used to latch `stopped (budget)` before clearing
-	// anything. Slice instead, oldest-first; the first pass may overshoot by
-	// one candidate when the only dead block is larger than the cap.
-	const remaining = autoClearBudget(state.config) - state.auto.clearedTokens;
-	if (remaining <= 0) {
-		state.auto.stop = "budget";
-		return false;
-	}
-	const fitted = fitBatch(batch, remaining, state.auto.clearedTokens === 0);
-	if (fitted === undefined) {
-		state.auto.stop = "budget";
-		return false;
-	}
-	return applyClear(ctx, session, state, fitted);
+/** The part of a captured batch that is still unretired when its settlement runs. */
+function liveBatchOf(state: CanaryRuntime, batch: CanaryBatch): CanaryBatch {
+	const candidates = batch.candidates.filter((candidate) => !state.tracker.isRetired(candidate.blockId));
+	if (candidates.length === batch.candidates.length) return batch;
+	return { candidates, tokens: candidates.reduce((total, candidate) => total + Math.max(0, candidate.tokens), 0) };
 }
 
 /**
@@ -515,21 +647,26 @@ function writeCanaryRecord(
 	ctx: DshContext,
 	session: DshSessionLike,
 	state: CanaryRuntime,
-	where: { turn: unknown; step?: unknown },
-	batch: CanaryBatch,
-	gate: boolean,
+	settlement: Settlement,
 ): void {
-	const fresh = batch.candidates.filter((candidate) => !state.reported.has(candidate.blockId));
-	if (fresh.length === 0 && !state.auto.qualityDirty) return;
-	const usage = hostUsageFor(session, state.config);
+	// Read the snapshot, then intersect with `reported`: another settlement queued
+	// ahead of this one may have logged a block already. The snapshot still decides
+	// the line, so a candidate logged once is never logged twice.
+	const fresh = settlement.fresh.filter((candidate) => !state.reported.has(candidate.blockId));
+	// An empty batch is written even without a fresh candidate or a new outcome:
+	// the line is the only evidence that the selector ran and found nothing.
+	if (fresh.length === 0 && settlement.batch.candidates.length > 0 && !settlement.dirty) return;
 	const record: CanaryRecord = {
 		at: Date.now(),
-		turn: where.turn ?? null,
-		...(where.step !== undefined ? { step: where.step } : {}),
+		turn: settlement.where.turn ?? null,
+		...(settlement.where.step !== undefined ? { step: settlement.where.step } : {}),
 		tokens: fresh.reduce((total, candidate) => total + candidate.tokens, 0),
 		candidates: fresh,
-		gate,
-		quality: qualityOf(state, usage?.tokens ?? 0),
+		gate: settlement.gate,
+		...(state.auto.last !== undefined ? { outcome: state.auto.last.outcome } : {}),
+		// The session totals are read here, after the apply this line reports; only
+		// the turn counters need the snapshot, because the boundary resets them.
+		quality: qualityOf(state, settlement.usage?.tokens ?? 0, settlement.turn),
 	};
 	try {
 		appendPrivateLine(sessionCanaryPath(session.id), JSON.stringify(record));
@@ -541,10 +678,14 @@ function writeCanaryRecord(
 }
 
 /** Quality counters, split into this turn's outcomes and the session totals. */
-function qualityOf(state: CanaryRuntime, contextTokens: number): CanaryQuality {
+function qualityOf(
+	state: CanaryRuntime,
+	contextTokens: number,
+	turn?: CanaryQuality["turn"],
+): CanaryQuality {
 	return {
 		contextTokens: Math.max(0, Math.round(contextTokens)),
-		turn: {
+		turn: turn ?? {
 			rereads: state.auto.turnRereads,
 			errors: state.auto.turnErrors,
 			errorRereads: state.auto.turnErrorRereads,
@@ -599,17 +740,20 @@ function noteToolOutcome(state: CanaryRuntime, callId: string, isError: boolean)
  * Why this pass must not run, or `undefined` to run it.
  *
  * The limits answer different failures: the breaker answers a selector that
- * cleared something live, the budget answers unbounded churn, the missing
- * record seam answers a host that cannot store the decision safely, and the
- * occupancy stop hands the tail of the job to host compaction instead of
- * fighting it. The breaker, the budget and the seam latch; occupancy and
- * projection readiness are re-measured every pass.
+ * cleared something live, the missing record seam answers a host that cannot
+ * store the decision safely, and the occupancy stop hands the tail of the job
+ * to host compaction instead of fighting it. The breaker and the seam latch;
+ * occupancy and projection readiness are re-measured every pass.
+ *
+ * There is deliberately no cumulative-volume cap: while `autoClear.enabled`
+ * is true, a healthy session keeps clearing, and only the breaker, the seam or
+ * host occupancy can stop it.
  */
 function admitClear(
-	session: DshSessionLike,
 	state: CanaryRuntime,
 	gate: boolean,
-): string | undefined {
+	usage: HostUsage | undefined,
+): PassOutcome | undefined {
 	if (state.auto.stop !== undefined) return state.auto.stop;
 	if (state.writer.state === "missing") return "unrecordable";
 	// `pending` is not fatal: the writer is resolved from this session's config
@@ -619,7 +763,6 @@ function admitClear(
 	// pass that runs before that is skipped, not fatal.
 	if (!state.projection.ready) return "unavailable";
 	if (!gate) return "gate";
-	const usage = hostUsageFor(session, state.config);
 	if (usage !== undefined && (usage.tokens / usage.contextWindow) * 100 >= autoClearStopPercent(state.config)) {
 		return "occupancy";
 	}
@@ -692,7 +835,8 @@ function pruneRecent(state: CanaryRuntime): void {
  * file that changed after the clear legitimately needs re-reading. What the
  * breaker watches is the rate — when most cleared targets come straight back,
  * clearing is manufacturing tool calls instead of removing dead weight, and the
- * session stops clearing.
+ * session stops clearing. A sample below {@link BREAKER_MIN_REREADS} is one
+ * normal round trip, not a rate, so it cannot latch the session.
  */
 function noteRefetch(ctx: DshContext, state: CanaryRuntime, name: string, args: unknown): void {
 	if (state.auto.stop !== undefined) return;
@@ -706,7 +850,7 @@ function noteRefetch(ctx: DshContext, state: CanaryRuntime, name: string, args: 
 		state.auto.turnRereads += 1;
 		state.auto.qualityDirty = true;
 		const total = Math.max(state.auto.clearedTotal, 1);
-		if (state.auto.rereads < 2 || state.auto.rereads * 2 < total) continue;
+		if (state.auto.rereads < BREAKER_MIN_REREADS || state.auto.rereads * 2 < total) continue;
 		state.auto.stop = "breaker";
 		ctx.logger?.warn?.(
 			`oh-my-clm: clearing stopped for this session: ${state.auto.rereads} of ${total} cleared target(s) were re-read within ${BREAKER_WINDOW_RESULTS} tool results`,
@@ -759,7 +903,7 @@ function seedCanary(
 ): CanaryRuntime {
 	const state: CanaryRuntime = {
 		config,
-		tracker: new SupersessionTracker(),
+		tracker: new SupersessionTracker({ staleTurns: config.autoClear.staleTurns }),
 		callSeqs: new Map(),
 		callKeys: new Map(),
 		gate: canaryGate(config),
@@ -797,8 +941,9 @@ function seedCanary(
  * Replay one recorded decision: retire its targets and carry its cost forward.
  *
  * Without this a resumed session would clear the same block twice (the record is
- * log-only, so the original body is still there) and forget the tokens it had
- * already spent against the session budget.
+ * log-only, so the original body is still there) and forget how many tokens it
+ * had already freed; the freed total feeds only `/clm` status now that there is
+ * no cumulative budget to spend it against.
  */
 function seedCleared(state: CanaryRuntime, data: unknown): void {
 	const targets = canaryValue(data, "targets");
@@ -1248,9 +1393,15 @@ function autoClearStatusText(state: CanaryRuntime | undefined): string {
 	const midTurn = state.config.autoClear.midTurnSuffixTokens > 0
 		? `mid-turn ≤${state.config.autoClear.midTurnSuffixTokens} tok tail`
 		: "mid-turn off";
+	// Four zeroes are one fact unless the line says which check stopped the last
+	// settlement: no candidate, the gate, occupancy, the seam, or the breaker.
+	const last = state.auto.last;
+	const lastText = last === undefined
+		? "last: none"
+		: `last: ${last.outcome} (turn ${String(last.turn ?? "?")}, ${last.candidates} candidate(s), ~${last.tokens} tok)`;
 	if (!state.config.autoClear.enabled) {
 		const stop = state.auto.stop === undefined ? "open" : `stopped (${state.auto.stop})`;
-		return `auto-clear: canary only · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s)`;
+		return `auto-clear: canary only · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s) · ${lastText}`;
 	}
 	const armed = state.writer.state === "missing"
 		? "off: this host exposes no ignorable plugin-record seam"
@@ -1258,7 +1409,7 @@ function autoClearStatusText(state: CanaryRuntime | undefined): string {
 			? "starting: resolving the host record seam"
 			: state.projection.ready ? "armed" : "armed, no projection";
 	const stop = state.auto.stop === undefined ? "open" : `stopped (${state.auto.stop})`;
-	return `auto-clear: ${armed} · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s)`;
+	return `auto-clear: ${armed} · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s) · ${lastText}`;
 }
 
 function createDshClmCommand(
@@ -1377,6 +1528,7 @@ export function apply(ctx: DshContext): void {
 	installClearProjection(ctx, projection);
 	ctx.effect?.(() => () => {
 		states.clear();
+		for (const canary of canaries.values()) canary.disposed = true;
 		canaries.clear();
 		if (activeContext === ctx) activeContext = undefined;
 	}, "oh-my-clm.state");
@@ -1508,6 +1660,8 @@ export function apply(ctx: DshContext): void {
 	ctx.on("agent/disposed", ({ agent }: { agent: DshAgent }) => {
 		const key = String(agent.session?.id ?? agent.id);
 		states.delete(key);
+		const canary = canaries.get(key);
+		if (canary !== undefined) canary.disposed = true;
 		canaries.delete(key);
 	});
 }

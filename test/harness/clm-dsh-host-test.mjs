@@ -24,12 +24,14 @@ const entry = path.join(pluginRoot, "dist/dsh/index.js");
 // profile install does not resolve host packages for its plugins. This stand-in
 // is the harness's host: it commits `ignorable: true`, like
 // `@deepseek-ai/dsh-session`'s `appendPluginRecord`, so a record here is the same
-// kind of event the real persistence reader retains and skips.
+// kind of event the real persistence reader retains and skips — including the
+// host's refusal to append from inside another append's notification.
 const recordSeamModule = path.join(os.tmpdir(), `clm-plugin-record-seam-${process.pid}.mjs`);
 fs.writeFileSync(
 	recordSeamModule,
 	[
 		"export function appendPluginRecord(session, type, data) {",
+		"\tif (session.appending === true) throw new Error('session append cannot reenter while another append is being published');",
 		"\tconst seq = session.events.length === 0 ? 0 : session.events.at(-1).seq + 1;",
 		"\tsession.events.push({ type, seq, time: Date.now(), data, ignorable: true });",
 		"\treturn seq;",
@@ -203,6 +205,13 @@ class FakeSession {
 		this.header = { cwd: harnessCwd };
 		this.events = events;
 		this.surfaceSeq = events.filter((event) => SURFACE_EVENT_TYPES.has(event.type)).map((event) => event.seq);
+		// Real DSH notifies `session/event` from inside `Session.append()`, while the
+		// append is still active, and `appendPluginRecord` refuses a nested append.
+		// A stand-in that only notifies afterwards makes a plugin that writes during
+		// the observer look healthy here and fail on a host, so the flag is modelled.
+		this.appending = false;
+		/** Set to a synchronous dispatcher to deliver each append to the observers. */
+		this.onEvent = undefined;
 	}
 	get surface() {
 		return { nodes: [...this.surfaceSeq] };
@@ -222,7 +231,14 @@ class FakeSession {
 		} else if (SURFACE_EVENT_TYPES.has(type)) {
 			this.surfaceSeq.push(seq);
 		}
-		return this.events.at(-1);
+		const appended = this.events.at(-1);
+		this.appending = true;
+		try {
+			this.onEvent?.(appended);
+		} finally {
+			this.appending = false;
+		}
+		return appended;
 	}
 }
 
@@ -1000,6 +1016,182 @@ section("14. a host without the ignorable-record seam");
 	host.disposeAll();
 	setHarnessHost({ pluginRecordModule: pathToFileURL(recordSeamModule).href });
 	setHarnessAutoClear({ enabled: false });
+	cleanup(session.id);
+}
+
+section("15. clearing stays effective without a cumulative cap");
+{
+	// `autoClear.enabled` is meant to hold for the whole session. A cumulative
+	// cap would clear the first ~30k block and then latch `stopped (budget)` on
+	// the next one, which is exactly when the session still needs de-rotting.
+	setHarnessAutoClear({ enabled: true });
+	const session = sessionWithHistory("t-auto-clear-no-cap");
+	const { host, agent } = await boot(plugin, { sessionId: session.id, session });
+	const feed = async (type, data) => {
+		const appended = session.append(type, data);
+		await host.emit("session/event", session, { type, seq: appended.seq, data: appended.data });
+	};
+	const records = () => session.events.filter((event) => event.type === "plugin:oh-my-clm/clear");
+	const huge = "match ".repeat(20_000);
+	for (const turn of [1, 2]) {
+		await feed("tool/call", { turn, step: 3, callId: `call_cap_${turn}_1`, name: "grep", arguments: JSON.stringify({ pattern: `cap-${turn}` }) });
+		await feed("tool/result", { turn, step: 3, message: toolResultMessage(`call_cap_${turn}_1`, huge) });
+		await feed("tool/call", { turn, step: 4, callId: `call_cap_${turn}_2`, name: "grep", arguments: JSON.stringify({ pattern: `cap-${turn}` }) });
+		await feed("tool/result", { turn, step: 4, message: toolResultMessage(`call_cap_${turn}_2`, "match ".repeat(4)) });
+		await feed("turn/end", { turn });
+	}
+	const cleared = records();
+	const freed = cleared.reduce(
+		(total, event) => total + (event.data?.targets ?? []).reduce((sum, target) => sum + (target.tokens ?? 0), 0),
+		0,
+	);
+	check("a second pass still clears after more than the removed 40k cap", cleared.length === 2, String(cleared.length));
+	check("both passes together freed more than 40k tokens", freed > 40_000, String(freed));
+	const status = String(host.commands.get("clm").handler({ agent, rawInput: "status" }).text);
+	check("clearing is still open, not stopped on a budget", !status.includes("stopped (budget)") && status.includes("open"), status.split("\n").at(-1));
+	host.disposeAll();
+	setHarnessAutoClear({ enabled: false });
+	cleanup(session.id);
+}
+
+section("16. aged clearing, the empty boundary, and the breaker's sample floor");
+{
+	// Supersession only names output the model just asked for again. A read from
+	// several turns ago that nobody re-fetched is the rot the stale rule exists
+	// for, and an empty boundary still has to say so in both the ledger and the
+	// status line, or `0 pass(es)` cannot be told from a broken gate.
+	setHarnessAutoClear({ enabled: true, canary: true, staleTurns: 2 });
+	const session = sessionWithHistory("t-auto-clear-stale");
+	const { host, agent } = await boot(plugin, { sessionId: session.id, session });
+	const feed = async (type, data) => {
+		const appended = session.append(type, data);
+		await host.emit("session/event", session, { type, seq: appended.seq, data: appended.data });
+		return appended;
+	};
+	const records = () => session.events.filter((event) => event.type === "plugin:oh-my-clm/clear");
+	const canaryFile = path.join("/tmp", `clm-${encodeURIComponent(session.id)}`, "CANARY.jsonl");
+	const canaryLines = () => (readIfExists(canaryFile) ?? "").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+	const big = "match ".repeat(900);
+
+	await feed("tool/call", { turn: 1, step: 2, callId: "call_stale_1", name: "read", arguments: JSON.stringify({ file_path: "/old-a.ts" }) });
+	await feed("tool/result", { turn: 1, step: 2, message: toolResultMessage("call_stale_1", big) });
+	await feed("tool/call", { turn: 1, step: 3, callId: "call_stale_2", name: "read", arguments: JSON.stringify({ file_path: "/old-b.ts" }) });
+	await feed("tool/result", { turn: 1, step: 3, message: toolResultMessage("call_stale_2", big) });
+	await feed("turn/end", { turn: 1 });
+	check("a fresh read is not rot yet", records().length === 0, String(records().length));
+	const firstBoundary = canaryLines().at(-1) ?? {};
+	check("an empty boundary still writes its decision", firstBoundary.candidates?.length === 0, JSON.stringify(firstBoundary.candidates ?? null));
+	check("the empty boundary keeps the gate shut", firstBoundary.gate === false, JSON.stringify(firstBoundary.gate));
+	check("the empty boundary names its outcome", firstBoundary.outcome === "no-candidate", JSON.stringify(firstBoundary.outcome));
+	const emptyStatus = String(host.commands.get("clm").handler({ agent, rawInput: "status" }).text);
+	check("the status line says the boundary had no candidate", emptyStatus.includes("last: no-candidate"), emptyStatus.split("\n").at(-1));
+
+	await feed("turn/end", { turn: 2 });
+	await feed("turn/end", { turn: 3 });
+	const cleared = records();
+	check("an aged all-refetchable block is cleared", cleared.length === 1, String(cleared.length));
+	const staleTargets = cleared[0]?.data?.targets ?? [];
+	const staleLine = canaryLines().at(-1) ?? {};
+	check("the ledger names the settlement that ran", staleLine.outcome === "cleared", JSON.stringify(staleLine.outcome));
+	check("the stale batch clears both old reads", staleTargets.length === 2, JSON.stringify(staleTargets));
+	check("the pointer names what to re-fetch", staleTargets.every((target) => String(target.label).startsWith("read ")), JSON.stringify(staleTargets.map((target) => target.label)));
+	const staleStatus = String(host.commands.get("clm").handler({ agent, rawInput: "status" }).text);
+	check("the status line reports the successful settlement", staleStatus.includes("last: cleared"), staleStatus.split("\n").at(-1));
+
+	// Two cleared targets read back once each is one normal round trip. The
+	// breaker watches a rate, so it must not latch a session on that sample.
+	for (const [step, file] of [[1, "/old-a.ts"], [2, "/old-b.ts"]]) {
+		await feed("tool/call", { turn: 4, step, callId: `call_back_${step}`, name: "read", arguments: JSON.stringify({ file_path: file }) });
+		await feed("tool/result", { turn: 4, step, message: toolResultMessage(`call_back_${step}`, "match ".repeat(9)) });
+	}
+	await feed("turn/end", { turn: 4 });
+	const openStatus = String(host.commands.get("clm").handler({ agent, rawInput: "status" }).text);
+	check(
+		"two re-reads of a two-block batch do not trip the breaker",
+		openStatus.includes("open") && !openStatus.includes("stopped (breaker)"),
+		openStatus.split("\n").at(-1),
+	);
+	host.disposeAll();
+	setHarnessAutoClear({ enabled: false, canary: false, staleTurns: 3 });
+	cleanup(session.id);
+}
+
+section("17. a settlement settles after the append that announced it");
+{
+	// The real host publishes `session/event` from inside `Session.append()` and
+	// keeps the append active while observers run, so `appendPluginRecord` refuses
+	// a nested write. A pass that settles in the observer therefore loses its
+	// record on every boundary and reports `rejected` while the decision itself
+	// was fine. This drive models that dispatch order instead of emitting events
+	// by hand after the append has returned.
+	setHarnessAutoClear({ enabled: true, canary: true });
+	const session = sessionWithHistory("t-auto-clear-reentrant");
+	const { host, agent } = await boot(plugin, { sessionId: session.id, session });
+	session.onEvent = (appended) => {
+		void host.emit("session/event", session, appended);
+	};
+	const big = "match ".repeat(900);
+	session.append("tool/call", { turn: 1, step: 3, callId: "call_reenter_1", name: "grep", arguments: JSON.stringify({ pattern: "needle" }) });
+	session.append("tool/result", { turn: 1, step: 3, message: toolResultMessage("call_reenter_1", big) });
+	session.append("tool/call", { turn: 1, step: 4, callId: "call_reenter_2", name: "grep", arguments: JSON.stringify({ pattern: "needle" }) });
+	session.append("tool/result", { turn: 1, step: 4, message: toolResultMessage("call_reenter_2", big) });
+	session.append("turn/end", { turn: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	const records = session.events.filter((event) => event.type === "plugin:oh-my-clm/clear");
+	check("the record is written once the announcing append has returned", records.length === 1, String(records.length));
+	check("the deferred record is ignorable", records.every((event) => event.ignorable === true));
+	const canaryFile = path.join("/tmp", `clm-${encodeURIComponent(session.id)}`, "CANARY.jsonl");
+	const lines = (readIfExists(canaryFile) ?? "").trim().split("\n").filter(Boolean);
+	let record;
+	try {
+		record = JSON.parse(lines.at(-1) ?? "{}");
+	} catch (error) {
+		record = { parseError: String(error) };
+	}
+	check("the settlement reports a clear instead of a rejected write", record.outcome === "cleared", JSON.stringify({ outcome: record.outcome, warn: host.log.filter((entry) => entry.level === "warn") }));
+	const status = String(host.commands.get("clm").handler({ agent, rawInput: "status" }).text);
+	check(
+		"the status line counts the pass",
+		status.includes("last: cleared") && status.includes("1 pass(es)") && status.includes("open"),
+		status.split("\n").at(-1),
+	);
+	host.disposeAll();
+	setHarnessAutoClear({ enabled: false, canary: false });
+	cleanup(session.id);
+}
+
+section("18. two boundaries announced in one tick settle once");
+{
+	// A step that ends its turn publishes `step/end` and `turn/end` before any
+	// microtask runs, so both settlements are queued while the same block is still
+	// live. The settlement behind the pass must find nothing left to clear instead
+	// of writing the same target twice and counting the pass, the freed tokens and
+	// the breaker's denominator twice.
+	setHarnessAutoClear({ enabled: true, canary: true, midTurnSuffixTokens: 512 });
+	const session = sessionWithHistory("t-auto-clear-same-tick");
+	const { host, agent } = await boot(plugin, { sessionId: session.id, session });
+	session.onEvent = (appended) => {
+		void host.emit("session/event", session, appended);
+	};
+	const big = "match ".repeat(900);
+	const small = "match ".repeat(4);
+	session.append("tool/call", { turn: 1, step: 3, callId: "call_tick_1", name: "grep", arguments: JSON.stringify({ pattern: "tick" }) });
+	session.append("tool/result", { turn: 1, step: 3, message: toolResultMessage("call_tick_1", big) });
+	session.append("tool/call", { turn: 1, step: 4, callId: "call_tick_2", name: "grep", arguments: JSON.stringify({ pattern: "tick" }) });
+	session.append("tool/result", { turn: 1, step: 4, message: toolResultMessage("call_tick_2", small) });
+	await new Promise((resolve) => setImmediate(resolve));
+	// No await between the two boundaries: both settlements are queued first.
+	session.append("step/end", { turn: 1, step: 4 });
+	session.append("turn/end", { turn: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	const records = session.events.filter((event) => event.type === "plugin:oh-my-clm/clear");
+	check("a step and its turn boundary in one tick write one record", records.length === 1, String(records.length));
+	const targets = records[0]?.data?.targets ?? [];
+	check("the doubled boundary names the target once", targets.length === 1, JSON.stringify(targets));
+	const status = String(host.commands.get("clm").handler({ agent, rawInput: "status" }).text);
+	check("the doubled boundary counts one pass", status.includes("1 pass(es)"), status.split("\n").at(-1));
+	host.disposeAll();
+	setHarnessAutoClear({ enabled: false, canary: false, midTurnSuffixTokens: 0 });
 	cleanup(session.id);
 }
 

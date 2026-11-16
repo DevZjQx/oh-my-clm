@@ -4,7 +4,7 @@ Pi extension + DSH/Cordis plugin。DSH 侧默认关闭一条**自动清理**通�
 
 ## 自动清理（DSH，默认关闭）
 
-`autoClear.enabled: true` 时每个 `turn/end` 结算一次：只清被同一目标后续调用取代的块，闸门 1200 token、2 块或死内容占当前 prompt 的 5%，占用 ≥60% 停手交给宿主 compaction，重读率过高会熔断。结算点留在 turn 边界是因为一次断点要摊到整批块上（实测 4.4 块/批 vs 按步 2.3 块/批，同样的内容多付 31% 重算）；`autoClear.midTurnSuffixTokens` 可单独放开“尾部极短且一个请求内回本”的单块例外，而计时器（`completedSteps` / `stepsSinceCleanup` / `stepsOld`）按步数计。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
+`autoClear.enabled: true` 时每个 `turn/end` 结算一次：清被同一目标后续调用取代的块，以及正文**全部可重取**、且已过期 `staleTurns` 个 turn 的块；闸门为 1200 token、2 块或死内容占当前 prompt 的 5%，占用 ≥60% 停手交给宿主 compaction，重读率过高会熔断。计时器按 step 计，结算点留在 turn 边界，让一次断点摊到整批块上；`autoClear.midTurnSuffixTokens` 可单独放开尾部很短的 turn 内清理。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
 
 ## 手动通道：mirror 与 cleanup
 
@@ -74,18 +74,7 @@ cleanup({ list: "3-16" })
 
 ## 行为约束
 
-1. **mirror 只是编辑面。** 原始 session JSONL / DSH session log 是事实来源；只有当前 projection / surface 被替换。
-2. **只改 body。** 保留 `clm-v2`、`CLM_SNAPSHOT`、`CLM_ENTRY` 与 closing marker；body 中形似协议的行保留前导反斜杠。
-3. **ID 是 1-based 编辑序号。** 不改 ID、不重排 block；block 1 在 `cleanup` 和 mirror 编辑两条路径上始终保留。
-4. **user-authored block 只能省略，不能改写。** 其他 block 可缩短或删除。
-5. **所有编辑必须严格缩短上下文。** shrink-only 固定开启；不能安全缩短的编辑整体拒绝，不部分应用。
-6. **截断 preview 不能被改写。** 只能省略该 block 或使用 `cleanup`，否则中间未显示内容会永久丢失。
-7. **tool 配对级联。** 改写/删除带 tool call 的 assistant block 时，配对的 tool result 一起省略；反向删除 tool result 也会删除 owner assistant。
-8. **删除最后一个可编辑 block 时保留 `<!-- CLM_EMPTY -->`。**
-9. **非法编辑整体拒绝。** 缺少 header、stale snapshot、未知/重复 ID、role 变化、协议损坏都会拒绝并给出 reason。
-10. **mirror 自读不回灌。** 读取 `LIVE_CTX_MAIN.md` 的 tool result 会在后续 projection 中替换为短指针。
-11. **turn 外修改会被恢复。** 非 agent turn 内写入 mirror 的内容不会进入 session；下一次同步恢复 canonical projection，并给出一次性 edit notice。
-12. **Pi 的 cleanup 顺序。** 一个 step 最多一次 cleanup，且必须在该 step 的任何 mirror 编辑之前。
+mirror 只是编辑面：原始 session JSONL / DSH session log 是事实来源，只有当前 projection / surface 被替换。编辑只改 body，保留 header、snapshot、marker 与顺序；所有编辑必须严格缩短上下文，非法编辑整体拒绝。block ID 是 1-based 编辑序号，block 1、user-authored 正文、截断 preview 都不能被改写；tool call 与 result 配对级联。细节见 [Live context mirror](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/live-context-mirror.md)。
 
 ## 配置
 
@@ -126,23 +115,23 @@ cleanup({ list: "3-16" })
 | `index.refreshSteps` | `4` | 同一 turn 内最多每几步重渲染一次；`1` 为每步刷新。 |
 | `cleanup.resultMode` | `compact` | DSH 结果模式：`compact` / `full` / `none`。 |
 | `cleanup.cacheDiscountPercent` | `2` | 缓存命中价占全价的百分比（`2` = 1/50），即候选成本公式中的 `r`。 |
-| `cleanup.paybackTurns` | `10` | 断点成本摊到**多少次后续请求**（一次请求 = 一步），即公式中的 `N`。按轮理解会高估成本：一个 turn 实测 11–39 步。 |
+| `cleanup.paybackTurns` | `10` | 断点成本摊到**多少次后续请求**（一次请求 = 一步），即公式中的 `N`。按轮理解会高估成本。 |
 | `cleanup.paybackSteps` | `0` | 显式请求数（horizon），覆盖 `paybackTurns`；`0` = 不设。 |
 | `cleanup.trigger.usagePercent` | `0` | 用量达到窗口百分比时触发候选；`0` 关闭。 |
-| `cleanup.trigger.completedTurns` | `0` | 已完成 turn 数达到该值时触发。turn 太粗（实测 11–39 步），优先用 `completedSteps`。 |
+| `cleanup.trigger.completedTurns` | `0` | 已完成 turn 数达到该值时触发。turn 比 step 粗，优先用 `completedSteps`。 |
 | `cleanup.trigger.completedSteps` | `0` | 已完成 step（请求）数达到该值时触发。 |
 | `cleanup.trigger.toolResultSharePercent` | `0` | toolResult 占可编辑 token 的百分比达到该值时触发。 |
 | `cleanup.trigger.turnsSinceCleanup` | `0` | 距上次成功清理的 turn 数达到该值时触发。 |
 | `cleanup.trigger.stepsSinceCleanup` | `0` | 距上次成功清理的 step 数达到该值时触发。 |
 | `cleanup.trigger.maxCandidates` | `3` | 一次触发最多给出的候选区间数。 |
 | `cleanup.trigger.minSavingsTokens` | `0` | 小于该估算 token 的 turn 不作为候选。 |
-| `autoClear.enabled` | `false` | 真正清理：把被取代的 tool result 换成重取指针。 |
+| `autoClear.enabled` | `false` | 真正清理：把被取代或已老化的可重取 tool result 换成重取指针。 |
 | `autoClear.canary` | `false` | 只记录自动清理决策到 `CANARY.jsonl`，不改模型输入。 |
+| `autoClear.staleTurns` | `3` | 一个正文全可重取的块过期多少 turn 后按 rot 清理，不再要求被取代；`0` 关闭年龄规则。 |
 | `autoClear.minTokens` | `1200` | 一批至少释放的 token；低于它不值得断一次前缀。 |
-| `autoClear.minBlocks` | `2` | 或者至少这么多个死块。 |
-| `autoClear.minSharePercent` | `5` | 或者死块占当前 prompt 的百分比达到该值；`0` = 只按量。这是抗 rot 判据，不是省钱判据。 |
+| `autoClear.minBlocks` | `2` | 或者至少这么多个候选块。 |
+| `autoClear.minSharePercent` | `5` | 或者候选块占当前 prompt 的百分比达到该值；`0` = 只按量。这是抗 rot 判据，不是省钱判据。 |
 | `autoClear.stopPercent` | `60` | 占用达到窗口百分比即停手，交给宿主 compaction。 |
-| `autoClear.maxTokens` | `40000` | 单会话累计清理上限。 |
 | `autoClear.midTurnSuffixTokens` | `0` | 允许在 turn 内清理：死块之后待重算的尾部 ≤ 该 token 数即可，不再要求回本。`0` 关闭。 |
 | `host.pluginRecordModule` | `@deepseek-ai/dsh-session` | 提供 `appendPluginRecord` seam 的宿主模块；高级/测试用。 |
 
@@ -150,16 +139,14 @@ cleanup({ list: "3-16" })
 
 所有触发阈值默认关闭（`0`）。命中后只在该 turn 边界装配一次用量行和候选；候选只取已完成的 turn，按断点后的净收益排序，并固定带 `skipRoles: ["user"]`。Pi 侧另认 `cleanup.trigger.stepsSinceCleanup`（回退 `turnsSinceCleanup`）与 `cleanup.trigger.toolResultSharePercent`，预算 nudge 与 DSH 共用同一套用量行/候选格式。
 
-**计数单位**：陈旧度信号（`completedSteps` / `stepsSinceCleanup` / 候选的 `stepsOld` / 摊销 `N`）按 step 计，因为一个 turn 实测 11–39 步；批次结算、闸门、预算和候选区间仍按 turn，因为一次断点必须摊到多个块上。实测依据见 [自动清理](./docs/features/auto-clear.md#结算点为什么批次价格按-turn-算)。
+**计数单位**：陈旧度信号（`completedSteps` / `stepsSinceCleanup` / 候选的 `stepsOld` / 摊销 `N`）按 step 计；批次结算、闸门和候选区间仍按 turn，因为一次断点必须摊到多个块上。度量依据见 `src/features/live-context/auto-clear.ts` 与 [changelog](./changelog.md)。
 
 ## DSH 适配
 
 - 发现入口：`dsh-plugin.json`；host entry：`dist/dsh/index.js`；官方安装元数据：`package.json` 的 `dsh.bundle.patch` 与 `cordis.patch.yml`。
-- 使用 Cordis 的 `agent/created`、`agent/pre-step`、`session/event`、`systemPrompt.section()`、`systemPrompt.context()`、`tools.register()`；不启动独立 agent loop，不扫描 JSONL。
-- `sessionProjections` 通过 `ctx.get("sessionProjections")` 读取，不进 `inject`；服务缺失时只降级用量行。
-- 删除写入空 `developer/message` omission；assistant 改写写缩短文本的 `developer/message`；tool result 改写保持原 envelope，只替换 `content`。`assistant/message` 不能作为 replacement。
-- 所有 replacement 必须在打开的 turn/step 内执行；没有打开坐标时拒绝 mutation，而不是写入过期事件。
-- 自定义 `source.kind`（`oh-my-clm:model-mirror-edit` / `oh-my-clm:runtime-cleanup`）在真实 DSH profile 上的接受度仍需发版前复核。
+- 使用 Cordis 生命周期注册工具与 system prompt；不启动独立 agent loop，不扫描 JSONL。
+- replacement 只在打开的 turn/step 内执行；`assistant/message` 不能作为 replacement。
+- 生命周期、replacement 语义与未验证边界见 [DSH surface bridge](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/dsh-surface-bridge.md)。
 
 打包：
 
@@ -180,7 +167,7 @@ npm run typecheck
 npm pack --dry-run
 ```
 
-依赖方向固定为 `shared (src/lib) → features (src/features/live-context) → host adapters (extensions, dsh)`。feature 之间不互相导入，host adapter 不承载可复用业务逻辑，不使用 barrel 文件；`npm run check` 会验证这些边界。目录与测试布局见 [项目结构](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/project-structure.md)。
+依赖方向固定为 `shared (src/lib) → features (src/features/live-context) → host adapters (extensions, dsh)`；`npm run check` 验证边界。目录与测试布局见 [项目结构](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/project-structure.md)。
 
 ## 文档
 
