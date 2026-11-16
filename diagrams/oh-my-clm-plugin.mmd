@@ -12,7 +12,7 @@ graph LR
   BRG --> LIB
 
   DSHX --> CAN["auto-clear<br/>peek / retire selector"]
-  CAN --> CANLOG["CANARY.jsonl<br/>one line per dead block"]
+  CAN --> CANLOG["CANARY.jsonl<br/>one line per boundary"]
   CAN --> PROJ["clear-projection<br/>pure message projection"]
   PROJ --> SEAM["sessions service<br/>registerMessage<br/>Projection"]
   DSHX --> REC["plugin-record<br/>ignorable writer"]
