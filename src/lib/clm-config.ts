@@ -21,6 +21,7 @@ import * as path from "node:path";
 
 export type ClmIndexMode = "blocks" | "digest";
 export type ClmCleanupResultMode = "compact" | "full" | "none";
+export type ClmAutoClearChannel = "money" | "rot" | "both";
 
 export interface ClmTriggerConfig {
 	/** Usage percentage at which a cleanup candidate is offered; 0 disables. */
@@ -70,6 +71,14 @@ export interface ClmAutoClearConfig {
 	/** Append decisions to `CANARY.jsonl` without changing model input. */
 	canary: boolean;
 	/**
+	 * Which clearing channel runs. `rot` is the anti-context-rot channel: it
+	 * judges a batch by volume and dead share, and pays the break as the price
+	 * of attention. `money` judges the same batch by its suffix and amortized
+	 * net, and skips a batch that cannot pay for itself. `both` runs `money`
+	 * first and falls back to `rot` for a batch the money test rejects.
+	 */
+	channel: ClmAutoClearChannel;
+	/**
 	 * Turn boundaries after which a block whose visible body is entirely
 	 * re-fetchable is treated as rot and cleared even if nothing fetched it
 	 * again. `0` leaves the other triggers. Keep the default in sync with
@@ -84,6 +93,20 @@ export interface ClmAutoClearConfig {
 	 * this clock. Keep the default in sync with `DEFAULT_STALE_STEPS`.
 	 */
 	staleSteps: number;
+	/**
+	 * Lower bound of the rot age window, in tool results. A block younger than
+	 * this is still in the hot set; clearing it pays the tail while the model is
+	 * still reading it. `0` disables the floor.
+	 */
+	minAgeSteps: number;
+	/**
+	 * Upper bound of the rot age window, in tool results. An unbounded age rule
+	 * selects the backlog, and a batch's suffix is priced from its oldest block,
+	 * so the backlog is the one batch that never pays for itself. `0` leaves the
+	 * age rule unbounded. Keep the defaults in sync with `DEFAULT_MIN_AGE_STEPS`
+	 * / `DEFAULT_MAX_AGE_STEPS` in `auto-clear.ts`.
+	 */
+	maxAgeSteps: number;
 	minTokens: number;
 	minBlocks: number;
 	/**
@@ -94,6 +117,21 @@ export interface ClmAutoClearConfig {
 	 * model reads". `0` disables the share path.
 	 */
 	minSharePercent: number;
+	/**
+	 * Most one-time re-prefill (token) a clearing batch may cost: the tail
+	 * behind its earliest cleared block, minus the bodies the batch removes.
+	 * `0` disables the cap. This is the money channel's shape test; the rot
+	 * channel keeps the tail budget alone (`midTurnSuffixTokens`).
+	 */
+	maxSuffixTokens: number;
+	/**
+	 * Amortized net (token) a batch must clear before the money channel runs
+	 * it: `r·tokens − (1−r)·suffix / N`, with `r` from
+	 * `cleanup.cacheDiscountPercent` and `N` from `cleanup.paybackSteps` /
+	 * `paybackTurns`. `0` admits break-even; a negative value disables the
+	 * test.
+	 */
+	minNetTokens: number;
 	/** Occupancy percentage at which clearing hands off to host compaction. */
 	stopPercent: number;
 	/**
@@ -178,11 +216,16 @@ export const DEFAULT_CLM_CONFIG: ClmConfig = {
 	autoClear: {
 		enabled: false,
 		canary: false,
+		channel: "rot",
 		staleTurns: 3,
 		staleSteps: 0,
+		minAgeSteps: 2,
+		maxAgeSteps: 4,
 		minTokens: 1_200,
 		minBlocks: 2,
 		minSharePercent: 5,
+		maxSuffixTokens: 0,
+		minNetTokens: 0,
 		stopPercent: 60,
 		midTurnSuffixTokens: 0,
 	},
@@ -426,11 +469,16 @@ export function parseClmConfig(
 		removedKey(autoClear, "maxTokens", "clearing has no cumulative token cap", source, "autoClear.maxTokens", warnings);
 		config.autoClear.enabled = readBoolean(autoClear, "enabled", config.autoClear.enabled, source, "autoClear.enabled", warnings);
 		config.autoClear.canary = readBoolean(autoClear, "canary", config.autoClear.canary, source, "autoClear.canary", warnings);
+		config.autoClear.channel = readEnum(autoClear, "channel", ["money", "rot", "both"] as const, config.autoClear.channel, source, "autoClear.channel", warnings);
 		config.autoClear.staleTurns = readNumber(autoClear, "staleTurns", config.autoClear.staleTurns, source, "autoClear.staleTurns", warnings, { min: 0, integer: true });
 		config.autoClear.staleSteps = readNumber(autoClear, "staleSteps", config.autoClear.staleSteps, source, "autoClear.staleSteps", warnings, { min: 0, integer: true });
+		config.autoClear.minAgeSteps = readNumber(autoClear, "minAgeSteps", config.autoClear.minAgeSteps, source, "autoClear.minAgeSteps", warnings, { min: 0, integer: true });
+		config.autoClear.maxAgeSteps = readNumber(autoClear, "maxAgeSteps", config.autoClear.maxAgeSteps, source, "autoClear.maxAgeSteps", warnings, { min: 0, integer: true });
 		config.autoClear.minTokens = readNumber(autoClear, "minTokens", config.autoClear.minTokens, source, "autoClear.minTokens", warnings, { min: 0 });
 		config.autoClear.minBlocks = readNumber(autoClear, "minBlocks", config.autoClear.minBlocks, source, "autoClear.minBlocks", warnings, { min: 1, integer: true });
 		config.autoClear.minSharePercent = readNumber(autoClear, "minSharePercent", config.autoClear.minSharePercent, source, "autoClear.minSharePercent", warnings, { min: 0, max: 100 });
+		config.autoClear.maxSuffixTokens = readNumber(autoClear, "maxSuffixTokens", config.autoClear.maxSuffixTokens, source, "autoClear.maxSuffixTokens", warnings, { min: 0 });
+		config.autoClear.minNetTokens = readNumber(autoClear, "minNetTokens", config.autoClear.minNetTokens, source, "autoClear.minNetTokens", warnings, { min: -1_000_000 });
 		config.autoClear.stopPercent = readNumber(autoClear, "stopPercent", config.autoClear.stopPercent, source, "autoClear.stopPercent", warnings, { min: 0, max: 100 });
 		config.autoClear.midTurnSuffixTokens = readNumber(autoClear, "midTurnSuffixTokens", config.autoClear.midTurnSuffixTokens, source, "autoClear.midTurnSuffixTokens", warnings, { min: 0, integer: true });
 	}

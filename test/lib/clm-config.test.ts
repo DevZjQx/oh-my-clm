@@ -203,3 +203,43 @@ test("the stale rule has a step budget that ships off", () => {
 	assert.equal(bad.config.autoClear.staleSteps, 0);
 	assert.ok(bad.warnings.some((warning) => warning.includes("autoClear.staleSteps")));
 });
+
+/**
+ * The age window is the rot channel's answer to a batch that costs more than it
+ * frees: the floor keeps the hot set out, the ceiling keeps the backlog's
+ * session-long suffix out.
+ */
+test("the rot rule clears inside an age window", () => {
+	assert.equal(DEFAULT_CLM_CONFIG.autoClear.minAgeSteps, 2);
+	assert.equal(DEFAULT_CLM_CONFIG.autoClear.maxAgeSteps, 4);
+	const parsed = parseClmConfig({ autoClear: { minAgeSteps: 3, maxAgeSteps: 8 } }, DEFAULT_CLM_CONFIG, "window.json");
+	assert.deepEqual(parsed.warnings, []);
+	assert.equal(parsed.config.autoClear.minAgeSteps, 3);
+	assert.equal(parsed.config.autoClear.maxAgeSteps, 8);
+	const bad = parseClmConfig({ autoClear: { minAgeSteps: 1.5, maxAgeSteps: -2 } }, DEFAULT_CLM_CONFIG, "bad-window.json");
+	assert.equal(bad.config.autoClear.minAgeSteps, 2);
+	assert.equal(bad.config.autoClear.maxAgeSteps, 4);
+	assert.ok(bad.warnings.some((warning) => warning.includes("autoClear.minAgeSteps")));
+	assert.ok(bad.warnings.some((warning) => warning.includes("autoClear.maxAgeSteps")));
+});
+
+/**
+ * The money channel is opt-in: the rot channel's decisions must not change
+ * until a config names it, and a typo in the channel falls back to `rot`
+ * instead of silently pricing every batch.
+ */
+test("the clearing channel defaults to rot and takes its money keys", () => {
+	assert.equal(DEFAULT_CLM_CONFIG.autoClear.channel, "rot");
+	assert.equal(DEFAULT_CLM_CONFIG.autoClear.maxSuffixTokens, 0);
+	assert.equal(DEFAULT_CLM_CONFIG.autoClear.minNetTokens, 0);
+	const parsed = parseClmConfig({
+		autoClear: { channel: "money", maxSuffixTokens: 2_000, minNetTokens: 50 },
+	}, DEFAULT_CLM_CONFIG, "money.json");
+	assert.deepEqual(parsed.warnings, []);
+	assert.equal(parsed.config.autoClear.channel, "money");
+	assert.equal(parsed.config.autoClear.maxSuffixTokens, 2_000);
+	assert.equal(parsed.config.autoClear.minNetTokens, 50);
+	const bad = parseClmConfig({ autoClear: { channel: "profit" } }, DEFAULT_CLM_CONFIG, "bad-channel.json");
+	assert.equal(bad.config.autoClear.channel, "rot");
+	assert.ok(bad.warnings.some((warning) => warning.includes("autoClear.channel")));
+});

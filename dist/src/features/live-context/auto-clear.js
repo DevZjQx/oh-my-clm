@@ -33,6 +33,13 @@ export const DEFAULT_DEAD_SHARE = 0.95;
 export const DEFAULT_STALE_TURNS = 3;
 /** The step clock ships off: a turn count is the only calibrated age bound. */
 export const DEFAULT_STALE_STEPS = 0;
+/**
+ * The window the rot channel clears inside, once a config opens it. Two results
+ * of margin keeps the block out of the hot set; four keeps the batch's suffix
+ * at the last few results instead of the whole session. Plan §3.1.
+ */
+export const DEFAULT_MIN_AGE_STEPS = 2;
+export const DEFAULT_MAX_AGE_STEPS = 4;
 function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -184,6 +191,8 @@ export class SupersessionTracker {
             deadShare: options.deadShare ?? DEFAULT_DEAD_SHARE,
             staleTurns: options.staleTurns ?? DEFAULT_STALE_TURNS,
             staleSteps: options.staleSteps ?? DEFAULT_STALE_STEPS,
+            minAgeSteps: options.minAgeSteps ?? DEFAULT_MIN_AGE_STEPS,
+            maxAgeSteps: options.maxAgeSteps ?? DEFAULT_MAX_AGE_STEPS,
         };
     }
     /** Register one `tool/result` landing; call ages are counted in results. */
@@ -278,7 +287,18 @@ export class SupersessionTracker {
             return true;
         if (!(this.options.staleSteps > 0) || block.landedAt === undefined)
             return false;
-        return this.resultsLanded - block.landedAt >= this.options.staleSteps;
+        const ageSteps = this.resultsLanded - block.landedAt;
+        // `minAgeSteps` is the hot-set margin: a config that turns the step clock
+        // on at 1 must not clear a result the model may still be reading. The
+        // clock's own floor and the margin both have to pass.
+        const floor = Math.max(this.options.staleSteps, this.options.minAgeSteps);
+        if (ageSteps < floor)
+            return false;
+        // The one-sided floor is the shape that made the replayed session pay for
+        // itself: a batch's oldest block sets the suffix, and an unbounded floor
+        // selects backlog whose suffix is the whole session. The window keeps the
+        // rot channel on the young end, where clearing is cheap.
+        return this.options.maxAgeSteps <= 0 || ageSteps <= this.options.maxAgeSteps;
     }
     /** Tool results since one block landed, when it has landed at all. */
     ageStepsOf(blockId) {
@@ -397,7 +417,7 @@ export function candidateRefused(policy, candidate) {
  * `autoClear.minTokens` / `autoClear.minBlocks` / `autoClear.minSharePercent`
  * from the config file; keep those defaults in sync with this constant.
  */
-export const DEFAULT_BATCH_GATE = { minTokens: 1_200, minBlocks: 2, minShare: 0.05 };
+export const DEFAULT_BATCH_GATE = { minTokens: 1_200, minBlocks: 2, minShare: 0.05, maxSuffixTokens: 0, minNetTokens: 0 };
 export function batchPassesGate(batch, gate = DEFAULT_BATCH_GATE, contextTokens = 0) {
     if (batch.candidates.length === 0)
         return false;
@@ -406,4 +426,17 @@ export function batchPassesGate(batch, gate = DEFAULT_BATCH_GATE, contextTokens 
     if (!(gate.minShare > 0) || !(contextTokens > 0))
         return false;
     return batch.tokens / contextTokens >= gate.minShare;
+}
+/**
+ * The money test the volume gate deliberately does not make.
+ * `suffixTokens` is the one-time cost of the break, `tokens` is what the batch
+ * stops renting on every later request; the discount `r` prices the rent at
+ * the cache-read rate and the break at the full-input rate. A batch that
+ * cannot amortize its own suffix over the horizon is a quality decision, and
+ * has to be labeled as one.
+ */
+export function batchNetTokens(tokens, suffixTokens, cacheDiscount, paybackRequests) {
+    const r = Number.isFinite(cacheDiscount) ? Math.min(1, Math.max(0, cacheDiscount)) : 0;
+    const n = Number.isFinite(paybackRequests) && paybackRequests > 0 ? Math.floor(paybackRequests) : 1;
+    return Math.round(r * Math.max(0, tokens) - ((1 - r) * Math.max(0, suffixTokens)) / n);
 }

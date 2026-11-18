@@ -37,11 +37,16 @@ export const DEFAULT_CLM_CONFIG = {
     autoClear: {
         enabled: false,
         canary: false,
+        channel: "rot",
         staleTurns: 3,
         staleSteps: 0,
+        minAgeSteps: 2,
+        maxAgeSteps: 4,
         minTokens: 1_200,
         minBlocks: 2,
         minSharePercent: 5,
+        maxSuffixTokens: 0,
+        minNetTokens: 0,
         stopPercent: 60,
         midTurnSuffixTokens: 0,
     },
@@ -221,11 +226,16 @@ export function parseClmConfig(document, base = DEFAULT_CLM_CONFIG, source = "<m
         removedKey(autoClear, "maxTokens", "clearing has no cumulative token cap", source, "autoClear.maxTokens", warnings);
         config.autoClear.enabled = readBoolean(autoClear, "enabled", config.autoClear.enabled, source, "autoClear.enabled", warnings);
         config.autoClear.canary = readBoolean(autoClear, "canary", config.autoClear.canary, source, "autoClear.canary", warnings);
+        config.autoClear.channel = readEnum(autoClear, "channel", ["money", "rot", "both"], config.autoClear.channel, source, "autoClear.channel", warnings);
         config.autoClear.staleTurns = readNumber(autoClear, "staleTurns", config.autoClear.staleTurns, source, "autoClear.staleTurns", warnings, { min: 0, integer: true });
         config.autoClear.staleSteps = readNumber(autoClear, "staleSteps", config.autoClear.staleSteps, source, "autoClear.staleSteps", warnings, { min: 0, integer: true });
+        config.autoClear.minAgeSteps = readNumber(autoClear, "minAgeSteps", config.autoClear.minAgeSteps, source, "autoClear.minAgeSteps", warnings, { min: 0, integer: true });
+        config.autoClear.maxAgeSteps = readNumber(autoClear, "maxAgeSteps", config.autoClear.maxAgeSteps, source, "autoClear.maxAgeSteps", warnings, { min: 0, integer: true });
         config.autoClear.minTokens = readNumber(autoClear, "minTokens", config.autoClear.minTokens, source, "autoClear.minTokens", warnings, { min: 0 });
         config.autoClear.minBlocks = readNumber(autoClear, "minBlocks", config.autoClear.minBlocks, source, "autoClear.minBlocks", warnings, { min: 1, integer: true });
         config.autoClear.minSharePercent = readNumber(autoClear, "minSharePercent", config.autoClear.minSharePercent, source, "autoClear.minSharePercent", warnings, { min: 0, max: 100 });
+        config.autoClear.maxSuffixTokens = readNumber(autoClear, "maxSuffixTokens", config.autoClear.maxSuffixTokens, source, "autoClear.maxSuffixTokens", warnings, { min: 0 });
+        config.autoClear.minNetTokens = readNumber(autoClear, "minNetTokens", config.autoClear.minNetTokens, source, "autoClear.minNetTokens", warnings, { min: -1_000_000 });
         config.autoClear.stopPercent = readNumber(autoClear, "stopPercent", config.autoClear.stopPercent, source, "autoClear.stopPercent", warnings, { min: 0, max: 100 });
         config.autoClear.midTurnSuffixTokens = readNumber(autoClear, "midTurnSuffixTokens", config.autoClear.midTurnSuffixTokens, source, "autoClear.midTurnSuffixTokens", warnings, { min: 0, integer: true });
     }

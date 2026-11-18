@@ -1,6 +1,6 @@
 # 自动清理
 
-DSH 侧的可选通道：在 turn 边界把**可重取**的 tool result（`read` / `read_image` / `grep` / `glob` / `web_fetch`）换成一行重取指针。候选来自两条规则：同一目标被后续调用取代，或块正文全部可重取且超过 `staleTurns` 个 turn / `staleSteps` 个 tool result。记录是 log-only 的 `ignorable` plugin record，消息投影只改模型可见副本；会话日志、surface 与人类 transcript 保持原文。默认关闭。
+DSH 侧的可选通道：在 turn 边界把**可重取**的 tool result（`read` / `read_image` / `grep` / `glob` / `web_fetch`）换成一行重取指针。候选来自两条规则：同一目标被后续调用取代，或块正文全部可重取且年龄落在 `minAgeSteps`–`maxAgeSteps` 个 tool result（或超过 `staleTurns` 个 turn）的窗口内。记录是 log-only 的 `ignorable` plugin record，消息投影只改模型可见副本；会话日志、surface 与人类 transcript 保持原文。默认关闭。
 
 行为由 `src/features/live-context/auto-clear.ts`（选择器、闸门、账本类型）、`clear-projection.ts`（投影）、`plugin-record.ts`（宿主 seam）拥有；本文只写契约摘要与入口。配置文件的读取顺序见根 [README](../../README.md#配置)。
 
@@ -18,7 +18,7 @@ DSH 侧的可选通道：在 turn 边界把**可重取**的 tool result（`read`
 
 - 可重取工具是 `read` / `read_image` / `grep` / `glob` / `web_fetch`。`grep` / `glob` 参数规范化后相同即同一目标，`read_image` 按文件路径，`web_fetch` 按 URL；`read` 要求新行区间覆盖旧区间。
 - **被取代**：块内可重取输出 ≥95% 被后续调用取代。
-- **老化**：块的结果落在至少 `staleTurns` 个 turn 或 `staleSteps` 个 tool result 之前（见 [README](../../README.md#配置)）；只贡献“没人回头取”的那部分 rot。两个时钟任一到点即算老化，`0` 关闭对应时钟。
+- **老化**：块的结果落在至少 `staleTurns` 个 turn 之前，或年龄（tool result 数）落在 `minAgeSteps`–`maxAgeSteps` 的窗口内（见 [README](../../README.md#配置)）；只贡献“没人回头取”的那部分 rot。窗口的下限把热区挡在外面，上限把积压旧块挡在外面——一批的重算成本从最早的块算起，无上界的年龄规则选中的积压批，其尾部就是整个会话。`0` 关闭对应时钟或边界。
 - 两条规则都要求块正文几乎全部可重取（同一 95% 口径）。清理替换的是整块可见正文，PTC 程序里混着现场输出时不清，避免用一行指针换掉还要用的分析。
 - 候选按 turn 组装，被跳过的批次不消费，留到下一个边界。
 
@@ -55,10 +55,13 @@ DSH 侧的可选通道：在 turn 边界把**可重取**的 tool result（`read`
 | `autoClear.minTokens` | `1200` | 一批至少释放的 token；量的下限，不是目标 |
 | `autoClear.minBlocks` | `2` | 或者至少这么多个候选块 |
 | `autoClear.minSharePercent` | `5` | 或者候选块占当前 prompt 的百分比达到该值；`0` = 只按量 |
+| `autoClear.maxSuffixTokens` | `0` | money 通道：一批的一次性重算成本超过该值即拒；`0` 关闭 |
+| `autoClear.minNetTokens` | `0` | money 通道：摊销净收益 `r·ΔL − (1−r)·S / N` 的下限；`0` 允许恰好回本，负值关闭 |
 | `autoClear.stopPercent` | `60` | 占用达到窗口百分比即停手，交给宿主 compaction |
 | `autoClear.midTurnSuffixTokens` | `0` | 允许 turn 内清理的尾部预算；`0` 关闭 |
 
 - 量闸门回答“这次断点值不值”；`minSharePercent` 回答“可清的旧内容是否已占模型读到内容的一大块”，是抗 rot 判据。
+- `autoClear.channel` 选判据：`rot`（默认）只看量与死内容占比；`money` 再要求一批的一次性重算成本 ≤ `maxSuffixTokens` 且摊销净收益 ≥ `minNetTokens`（`r` 取 `cleanup.cacheDiscountPercent`，`N` 取 `cleanup.paybackSteps`，否则 `paybackTurns`）；`both` 让被 money 拒的批仍走 rot。默认 `rot` 保持现有判定不变，money 显式开启。
 - 没有累计清理上限：`autoClear.enabled` 期间只有熔断、seam/投影缺失和 `stopPercent` 占用线能让本会话停手。
 - **计时器按 step，执行点按 turn**：`completedSteps` / `stepsSinceCleanup` / `stepsOld` / 摊销 `N` 按请求计，批次、候选区间与结算点按 turn。计价的完整公式见 `clm-config.ts` 与 `context-trigger.ts`。
 - `midTurnSuffixTokens > 0` 时每 turn 最多一次 turn 内清理：候选块之后待重算的尾部不超过该值即可，闸门绕过，`stop` / 投影就绪 / 熔断仍生效。
@@ -80,13 +83,13 @@ DSH 侧的可选通道：在 turn 边界把**可重取**的 tool result（`read`
 
 ## 账本
 
-`autoClear.canary: true` 时每个 turn 边界写一行到 `<会话临时目录>/CANARY.jsonl`，包括候选为空的一次：候选、`gate`、`outcome`、`suffixTokens`，以及 `quality`（`rereads` / `errors` / `errorRereads` / `contextTokens`，分 turn 增量与 session 累计）。`suffixTokens` 是一批的一次性重算成本（最早被清块之后的模型可见 token，减去同批一起删掉的正文），只记录不参与判定：闸门是抗 rot 判据，不按钱计价；有了它，重放才能把“清掉多少”和“重算多少”放在一起读。`outcome` 说明这次结算为何执行或跳过（`cleared` / `gate` / `occupancy` / `breaker` / `no-candidate` 等）。字段定义见 `auto-clear.ts` 的 `CanaryRecord` / `CanaryQuality`。空边界也落盘，所以 `0 pass(es)` 能与“选择器没看到死块”区分开。
+`autoClear.canary: true` 时每个 turn 边界写一行到 `<会话临时目录>/CANARY.jsonl`，包括候选为空的一次：候选、`gate`、`outcome`、`suffixTokens`，以及 `quality`（`rereads` / `errors` / `errorRereads` / `contextTokens`，分 turn 增量与 session 累计）。`suffixTokens` 是一批的一次性重算成本（最早被清块之后的模型可见 token，减去同批一起删掉的正文）。`rot` 通道只记录不判定；`money` 通道用它判定。有了它，重放才能把“清掉多少”和“重算多少”放在一起读。`outcome` 说明这次结算为何执行或跳过（`cleared` / `gate` / `occupancy` / `breaker` / `no-candidate` 等）。字段定义见 `auto-clear.ts` 的 `CanaryRecord` / `CanaryQuality`。空边界也落盘，所以 `0 pass(es)` 能与“选择器没看到死块”区分开。
 
 ## 恢复与离线重放
 
 - 加载时用 `session.snapshotEvents()` 重放 `tool/call` / `tool/result` / `tool/ptc-dispatch`，并 retire 历史 clear 记录；历史 `turn/end` 不重放。
 - 历史 clear 记录里的 `keys` 会在日志中的原位置放回重读窗口，所以恢复后模型对同一目标的重读仍然计数、仍然能拒收该 key；否则恢复会重清一个已经被证明还活着的目标。
-- `npm run build:dsh && npm run canary:replay`，或 `node scripts/canary-replay.mjs <log>`；会话目录默认 `~/.dsh/sessions`，`--sessions-root` 覆盖。需要 PATH 上的 `zstd`。
+- `npm run build:dsh && npm run canary:replay`，或 `node scripts/canary-replay.mjs <log>`；会话目录默认 `~/.dsh/sessions`，`--sessions-root` 覆盖。`--max-age-steps` 覆盖 rot 窗口上界，`--discount` / `--payback` 定价净收益。需要 PATH 上的 `zstd`。
 
 ## 索引
 

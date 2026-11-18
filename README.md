@@ -4,7 +4,7 @@ Pi extension + DSH/Cordis plugin。DSH 侧默认关闭一条**自动清理**通�
 
 ## 自动清理（DSH，默认关闭）
 
-`autoClear.enabled: true` 时每个 `turn/end` 结算一次：清被同一目标后续调用取代的块，以及正文**全部可重取**、且已过期 `staleTurns` 个 turn 或 `staleSteps` 个 tool result 的块；闸门为 1200 token、2 块或死内容占当前 prompt 的 5%，占用 ≥60% 停手交给宿主 compaction；同一个目标被重读 2 次即拒收该 key，全局重读率过高才熔断。计时器按 step 计（老化另有 `staleSteps` 时钟），结算点留在 turn 边界，让一次断点摊到整批块上；`autoClear.midTurnSuffixTokens` 可单独放开尾部很短的 turn 内清理。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
+`autoClear.enabled: true` 时每个 `turn/end` 结算一次：清被同一目标后续调用取代的块，以及正文**全部可重取**、且已过期 `staleTurns` 个 turn 或年龄落在 `minAgeSteps`–`maxAgeSteps` 个 tool result 窗口内的块；闸门为 1200 token、2 块或死内容占当前 prompt 的 5%，占用 ≥60% 停手交给宿主 compaction；同一个目标被重读 2 次即拒收该 key，全局重读率过高才熔断。计时器按 step 计（老化另有 `staleSteps` 时钟），结算点留在 turn 边界，让一次断点摊到整批块上；`autoClear.midTurnSuffixTokens` 可单独放开尾部很短的 turn 内清理。`autoClear.channel` 选判据：默认 `rot` 只看量与占比，`money` 额外要求一批的一次性重算成本与摊销净收益付得起，`both` 让被拒的批仍走 rot。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
 
 ## 手动通道：mirror 与 cleanup
 
@@ -129,9 +129,14 @@ mirror 只是编辑面：原始 session JSONL / DSH session log 是事实来源�
 | `autoClear.canary` | `false` | 只记录自动清理决策到 `CANARY.jsonl`，不改模型输入。 |
 | `autoClear.staleTurns` | `3` | 一个正文全可重取的块过期多少 turn 后按 rot 清理，不再要求被取代；`0` 关闭 turn 时钟。 |
 | `autoClear.staleSteps` | `0` | 同一个块过期多少个 tool result（约等于 step）后按 rot 清理。一个 turn 有 11–39 个 step，所以 turn 时钟管不到单个长 turn 内部；`0` 关闭该时钟。 |
+| `autoClear.channel` | `rot` | 清理通道：`rot` 按量与死内容占比判（抗腐烂，断点算注意力成本）；`money` 按一批的一次性重算成本与摊销净收益判，付不起的批直接跳过；`both` 先走 `money`，被拒的批再由 `rot` 接手。 |
+| `autoClear.minAgeSteps` | `2` | rot 通道的年龄窗口下限（tool result 数）：比这更新的块还在热区，不清。`0` 关闭下限。 |
+| `autoClear.maxAgeSteps` | `4` | rot 通道的年龄窗口上限：一批的重算成本从最早的块算起，无上界的年龄规则会把积压旧块一并选中，其尾部就是整个会话。`0` = 无上界（旧行为）。 |
 | `autoClear.minTokens` | `1200` | 一批至少释放的 token；低于它不值得断一次前缀。 |
 | `autoClear.minBlocks` | `2` | 或者至少这么多个候选块。 |
 | `autoClear.minSharePercent` | `5` | 或者候选块占当前 prompt 的百分比达到该值；`0` = 只按量。这是抗 rot 判据，不是省钱判据。 |
+| `autoClear.maxSuffixTokens` | `0` | money 通道：一批的一次性重算成本（最早被清块之后的模型可见 token，减同批删除的正文）超过该值即拒；`0` 关闭。 |
+| `autoClear.minNetTokens` | `0` | money 通道：摊销净收益 `r·ΔL − (1−r)·S / N` 的下限，`r` 取 `cleanup.cacheDiscountPercent`，`N` 取 `cleanup.paybackSteps`（否则 `paybackTurns`）；`0` 允许恰好回本，负值关闭该测试。 |
 | `autoClear.stopPercent` | `60` | 占用达到窗口百分比即停手，交给宿主 compaction。 |
 | `autoClear.midTurnSuffixTokens` | `0` | 允许在 turn 内清理：死块之后待重算的尾部 ≤ 该 token 数即可，不再要求回本。`0` 关闭。 |
 | `host.pluginRecordModule` | `@deepseek-ai/dsh-session` | 提供 `appendPluginRecord` seam 的宿主模块；高级/测试用。 |

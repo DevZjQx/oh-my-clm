@@ -1737,6 +1737,66 @@ test("the request estimate deducts the bodies the model no longer reads", async 
  * selector's target keys: without them the re-read window is empty, and a target
  * the model already proved live is cleared a second time.
  */
+/**
+ * The money channel refuses a batch whose one-time suffix cannot amortize;
+ * the same batch is exactly what `both` is for: the money test rejects it, the
+ * rot channel still clears it, and the ledger line says which channel ran.
+ */
+test("the money channel skips a batch its suffix cannot pay for, and both clears it", async () => {
+	const money = await startAutoClearHost("dsh-money-refuse", {
+		autoClear: {
+			enabled: true,
+			canary: true,
+			staleTurns: 0,
+			minTokens: 0,
+			minBlocks: 1,
+			minSharePercent: 0,
+			stopPercent: 90,
+			channel: "money",
+			maxSuffixTokens: 2_000,
+			minNetTokens: 0,
+		},
+		cleanup: { cacheDiscountPercent: 2, paybackSteps: 10 },
+	});
+	try {
+		appendRead(money.session, "call-a", "First read of the file, a long output that will be superseded.");
+		appendRead(money.session, "call-b", "Second read of the same file, a long tail behind the cleared block.");
+		money.session.record("turn/end", { turn: 1 });
+		await settle();
+		assert.equal(money.clearRecords().length, 0, "the money channel refuses an unamortizable batch");
+		const lines = money.canaryLines();
+		const refused = lines.filter((line) => line.outcome === "gate");
+		assert.equal(refused.length, 1, "the refusal is a gate decision, not a silent skip");
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(money.session.id))), { recursive: true, force: true });
+	}
+
+	const both = await startAutoClearHost("dsh-both-fallback", {
+		autoClear: {
+			enabled: true,
+			canary: true,
+			staleTurns: 0,
+			minTokens: 0,
+			minBlocks: 1,
+			minSharePercent: 0,
+			stopPercent: 90,
+			channel: "both",
+			maxSuffixTokens: 2_000,
+			minNetTokens: 0,
+		},
+		cleanup: { cacheDiscountPercent: 2, paybackSteps: 10 },
+	});
+	try {
+		appendRead(both.session, "call-a", "First read of the file, a long output that will be superseded.");
+		appendRead(both.session, "call-b", "Second read of the same file, a long tail behind the cleared block.");
+		both.session.record("turn/end", { turn: 1 });
+		await settle();
+		assert.equal(both.clearRecords().length, 1, "the rot channel still clears what the money test rejected");
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(both.session.id))), { recursive: true, force: true });
+	}
+});
+
 test("a resumed session keeps the re-read evidence of an earlier clear", async () => {
 	const target = { node: -1 };
 	const host = await startAutoClearHost("dsh-seed-keys", {}, (session) => {

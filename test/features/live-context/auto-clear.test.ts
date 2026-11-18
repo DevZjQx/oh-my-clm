@@ -4,6 +4,7 @@ import {
 	DEFAULT_BATCH_GATE,
 	SupersessionTracker,
 	batchPassesGate,
+	batchNetTokens,
 	candidateRefused,
 	createRereadPolicy,
 	describeCall,
@@ -251,7 +252,7 @@ test("the gate needs enough tokens, enough blocks, or enough rot to matter", () 
 	};
 	assert.equal(batchPassesGate(one), false);
 	assert.equal(batchPassesGate(two), true);
-	assert.equal(batchPassesGate(one, { minTokens: 200, minBlocks: 5, minShare: 0 }), true);
+	assert.equal(batchPassesGate(one, { minTokens: 200, minBlocks: 5, minShare: 0, maxSuffixTokens: 0, minNetTokens: 0 }), true);
 	assert.equal(batchPassesGate({ candidates: [], tokens: 0 }), false);
 	assert.equal(DEFAULT_BATCH_GATE.minTokens, 1_200);
 	assert.equal(DEFAULT_BATCH_GATE.minShare, 0.05);
@@ -265,12 +266,34 @@ test("dead share of the live prompt opens the gate without crossing the volume f
 		tokens: 800,
 	};
 	const gate = { minTokens: 1_200, minBlocks: 5, minShare: 0.05 };
-	assert.equal(batchPassesGate(batch, gate, 16_000), true);
-	assert.equal(batchPassesGate(batch, gate, 100_000), false);
+	const rotGate = { ...gate, maxSuffixTokens: 0, minNetTokens: 0 };
+	assert.equal(batchPassesGate(batch, rotGate, 16_000), true);
+	assert.equal(batchPassesGate(batch, rotGate, 100_000), false);
 	// Unknown prompt size disables the share path instead of guessing.
-	assert.equal(batchPassesGate(batch, gate, 0), false);
+	assert.equal(batchPassesGate(batch, rotGate, 0), false);
 	// A zero share is how the money-shaped gate is restored, for anyone who wants it.
-	assert.equal(batchPassesGate(batch, { ...gate, minShare: 0 }, 16_000), false);
+	assert.equal(batchPassesGate(batch, { ...rotGate, minShare: 0 }, 16_000), false);
+});
+
+/**
+ * The money test the volume gate deliberately does not make. A batch's suffix
+ * is paid once at the full input rate; its freed tokens stop renting at the
+ * cached rate. The replayed session's first batch freed 73k tokens behind a
+ * 463k suffix — 308 steps of payback on a 139-step session.
+ */
+test("the money gates price a batch's suffix and amortized net", () => {
+	// The break-even horizon of the plan's first batch: r=0.02, so
+	// net = 0.02·ΔL − 0.98·S/N is negative until N ≈ 308 requests.
+	assert.equal(batchNetTokens(73_646, 463_204, 0.02, 300), -40);
+	assert.equal(batchNetTokens(73_646, 463_204, 0.02, 400), 338);
+	// A tail cheap enough to break even inside ten requests passes at minNet 0.
+	assert.equal(batchNetTokens(2_000, 2_000, 0.02, 10), -156, "a 2k tail behind 2k freed needs ~100 requests");
+	// Out-of-range inputs degrade to the documented defaults, not NaN.
+	assert.equal(batchNetTokens(1_000, 1_000, 12, 10), batchNetTokens(1_000, 1_000, 1, 10));
+	assert.equal(batchNetTokens(1_000, 1_000, 0.02, 0), -960, "N floors at 1 instead of dividing by zero");
+	// Defaults ship with both money knobs off: the anti-rot channel keeps its shape.
+	assert.equal(DEFAULT_BATCH_GATE.maxSuffixTokens, 0);
+	assert.equal(DEFAULT_BATCH_GATE.minNetTokens, 0);
 });
 
 test("arguments arrive as raw JSON on tool/call and as objects on PTC sub-calls", () => {
@@ -358,6 +381,51 @@ test("the step clock is off by default and can be disabled on its own", () => {
 	for (let index = 0; index < 50; index += 1) turnOnly.noteBlockLanding();
 	assert.deepEqual(turnOnly.peekBatch(1).candidates, [], "steps alone must not age it");
 	assert.equal(turnOnly.peekBatch(2).candidates[0]?.reason, "stale");
+});
+
+/**
+ * The one-sided floor is the shape that priced the replayed session out: a
+ * batch's suffix is measured from its oldest block, so the backlog's suffix is
+ * the whole session. The rot window keeps the selector on the young end.
+ */
+test("the step clock clears inside an age window, not past it", () => {
+	const tracker = new SupersessionTracker({ staleTurns: 0, staleSteps: 2, minAgeSteps: 2, maxAgeSteps: 4 });
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "old", 1));
+	tracker.noteOutput(1, 2_000);
+	tracker.noteBlockLanding();
+	tracker.noteBlockTokens("old", 2_000, 42, 1);
+	// One result later it is still in the hot set, even though the old floor of 2
+	// would not have fired yet either; the window's floor is the same floor.
+	tracker.noteBlockLanding();
+	assert.deepEqual(tracker.peekBatch(1).candidates, []);
+	tracker.noteBlockLanding();
+	assert.equal(tracker.peekBatch(1).candidates[0]?.reason, "stale");
+	// Past the window's upper bound the block is backlog: it stays, because the
+	// suffix it would cost is the whole session behind it.
+	for (let index = 0; index < 3; index += 1) tracker.noteBlockLanding();
+	assert.deepEqual(tracker.peekBatch(1).candidates, [], "an unbounded age rule selects the backlog");
+	// `maxAgeSteps: 0` is the unbounded rule of today, for a config that wants it.
+	const unbounded = new SupersessionTracker({ staleTurns: 0, staleSteps: 2, minAgeSteps: 0, maxAgeSteps: 0 });
+	unbounded.noteCall(call("read", { file_path: "/a.ts" }, "old", 1));
+	unbounded.noteOutput(1, 2_000);
+	unbounded.noteBlockLanding();
+	unbounded.noteBlockTokens("old", 2_000, 42, 1);
+	for (let index = 0; index < 8; index += 1) unbounded.noteBlockLanding();
+	assert.equal(unbounded.peekBatch(1).candidates[0]?.reason, "stale");
+});
+
+test("the hot-set margin holds even when the step clock is set below it", () => {
+	// A step clock at 1 with the default margin still waits two results: clearing
+	// a result the model may read next step is the tail bill with no rot behind it.
+	const tracker = new SupersessionTracker({ staleTurns: 0, staleSteps: 1 });
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "old", 1));
+	tracker.noteOutput(1, 2_000);
+	tracker.noteBlockLanding();
+	tracker.noteBlockTokens("old", 2_000, 42, 1);
+	tracker.noteBlockLanding();
+	assert.deepEqual(tracker.peekBatch(1).candidates, []);
+	tracker.noteBlockLanding();
+	assert.equal(tracker.peekBatch(1).candidates[0]?.reason, "stale");
 });
 
 /**

@@ -12,6 +12,7 @@ import {
 	REFETCH_TOOL_NAMES,
 	SupersessionTracker,
 	batchPassesGate,
+	batchNetTokens,
 	candidateRefused,
 	createRereadPolicy,
 	noteKeyReread,
@@ -334,7 +335,40 @@ function canaryGate(config: ClmConfig): BatchGate {
 		minTokens: config.autoClear.minTokens,
 		minBlocks: config.autoClear.minBlocks,
 		minShare: config.autoClear.minSharePercent / 100,
+		maxSuffixTokens: config.autoClear.maxSuffixTokens,
+		minNetTokens: config.autoClear.minNetTokens,
 	};
+}
+
+/**
+ * The money channel's verdict on one priced batch.
+ * The suffix cap is the shape test: a batch whose one-time re-prefill is
+ * thousands of tokens cannot amortize over any plausible horizon. The net
+ * test is the same arithmetic `context-trigger.ts` prices a candidate range
+ * with, lifted to the batch: the freed tokens stop renting at the cached rate,
+ * the break is paid once at the full rate. Either failing rejects the batch
+ * for the money channel; `rot` ignores both.
+ */
+function moneyVerdict(
+	config: ClmConfig,
+	batch: CanaryBatch,
+	suffixTokens: number | undefined,
+): boolean {
+	if (config.autoClear.channel === "rot") return true;
+	if (suffixTokens === undefined) return true;
+	const gate = canaryGate(config);
+	if (gate.maxSuffixTokens > 0 && suffixTokens > gate.maxSuffixTokens) return false;
+	if (gate.minNetTokens < 0) return true;
+	const payback = config.cleanup.paybackSteps > 0
+		? config.cleanup.paybackSteps
+		: config.cleanup.paybackTurns;
+	const net = batchNetTokens(
+		batch.tokens,
+		suffixTokens,
+		config.cleanup.cacheDiscountPercent / 100,
+		payback,
+	);
+	return net >= gate.minNetTokens;
 }
 
 /**
@@ -446,6 +480,7 @@ function feedCanary(
 	const boundary = typeof turn === "number" && Number.isSafeInteger(turn) ? turn : undefined;
 	const batch = state.tracker.peekBatch(boundary);
 	const usage = hostUsageFor(session, state.config);
+	const suffixTokens = dshBatchSuffixTokens(session, batch.candidates);
 	if (batch.candidates.length === 0) {
 		// An empty batch is a decision too: the selector looked and found nothing.
 		// Recording it is what separates "no rot yet" from a gate that never opens.
@@ -458,13 +493,21 @@ function feedCanary(
 	}
 	// Snapshot before scheduling: the turn counters belong to the turn that just
 	// ended, and the host may append the next turn before the deferred pass runs.
+	// The channel decides together with the volume gate: `rot` is today's shape,
+	// `money` additionally refuses a batch whose suffix cannot amortize, and
+	// `both` falls back to rot for exactly those batches.
+	const volume = batchPassesGate(batch, state.gate, usage?.tokens ?? 0);
+	const money = moneyVerdict(state.config, batch, suffixTokens);
+	const gate = state.config.autoClear.channel === "both"
+		? volume || money
+		: volume && money;
 	const settlement = settlementOf(
 		state,
 		{ turn },
 		batch,
-		batchPassesGate(batch, state.gate, usage?.tokens ?? 0),
+		gate,
 		usage,
-		dshBatchSuffixTokens(session, batch.candidates),
+		suffixTokens,
 	);
 	resetTurnQuality(state);
 	scheduleSettlement(ctx, session, state, settlement);
@@ -525,13 +568,15 @@ function maybeMidTurnPass(
 	// The volume gate is deliberately bypassed: it exists to amortise one break
 	// over many blocks, and this break is already free (or priced above).
 	const usage = hostUsageFor(session, state.config);
+	const suffix = batchSuffixTokens(cheap, tails);
+	if (!moneyVerdict(state.config, { candidates: cheap, tokens: freed }, suffix)) return;
 	const settlement = settlementOf(
 		state,
 		{ turn: turnNumber, step: stepNumber },
 		{ candidates: cheap, tokens: freed },
 		true,
 		usage,
-		batchSuffixTokens(cheap, tails),
+		suffix,
 	);
 	// The ration is spent only by a pass that actually wrote its record: a skip for
 	// a transient reason (occupancy, projection not registered) must get another
@@ -986,6 +1031,8 @@ function seedCanary(
 		tracker: new SupersessionTracker({
 			staleTurns: config.autoClear.staleTurns,
 			staleSteps: config.autoClear.staleSteps,
+			minAgeSteps: config.autoClear.minAgeSteps,
+			maxAgeSteps: config.autoClear.maxAgeSteps,
 		}),
 		callSeqs: new Map(),
 		callKeys: new Map(),
