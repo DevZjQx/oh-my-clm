@@ -2,7 +2,16 @@
 
 版本号同时记录在 [`package.json`](./package.json) 和 [`dsh-plugin.json`](./dsh-plugin.json) 中。以下按版本倒序列出使用者可见的变更；实现细节见 git 提交记录与对应版本的源码注释。
 
-## 0.1.20（当前版本）
+## 0.1.21（当前版本）
+
+自动清理的选块从“年龄 ≥ 阈值”的单边地板改成有界窗口，并新增一条按成本判定批次的 money 通道；默认判定不变，只有显式配置才换账本。`npm test` 222/222、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
+
+- 新增 `autoClear.minAgeSteps` / `autoClear.maxAgeSteps`（默认 `2` / `4`）：老化规则按 tool result 年龄落在窗口内才算候选，下限挡热区、上限挡积压。一批的重算成本从最早的块算起，无上界的年龄规则会把积压旧块一并选中，其尾部就是整个会话；被后续调用取代的块不受窗口限制，重取已经证明内容死了。`0` 关闭对应边界，`maxAgeSteps: 0` 即无上界。
+- 新增 `autoClear.channel`（`rot` / `money` / `both`，默认 `rot`）：`rot` 只看释放量与死内容占比，断点算注意力成本；`money` 额外要求一批的一次性重算成本 ≤ `autoClear.maxSuffixTokens`，且摊销净收益 `r·ΔL − (1−r)·S / N` ≥ `autoClear.minNetTokens`（`r` 取 `cleanup.cacheDiscountPercent`，`N` 取 `cleanup.paybackSteps`，否则 `paybackTurns`）；`both` 先走 `money`，被拒的批仍由 `rot` 接手。
+- 配置自相矛盾时写一条 warning，而不是静默失效：`autoClear.maxAgeSteps` 低于 step 时钟的地板（`max(staleSteps, minAgeSteps)`）时该时钟永不触发，解析会点名两个 key 并给出两条出路（抬高上限，或置 `0` 无上界）。把 `staleSteps` 写在 `5` 以上的配置会落到这一档，看 warning 即可判断是否要改。
+- `scripts/canary-replay.mjs` 的汇总行新增每批的 `S`、`net` 与亏损批数，把“清掉多少”和“重算多少”放在一起读；后缀在断点处度量，不再按整份日志算。`--max-age-steps` 覆盖窗口上界，`--discount` / `--payback` 设定净收益的定价。
+
+## 0.1.20
 
 两处自动清理的统计口径修正：熔断的重读窗口按目标 key 记，`/clm status` 的 request 估算不再给已清正文计价。`npm test` 216/216、`npm run check`、`npm run typecheck`、`npm pack --dry-run` 全通过。
 
