@@ -191,14 +191,22 @@ test("step clocks and the request horizon are their own keys, defaulting off", (
 });
 
 /**
- * The step clock is a second aging trigger, not a replacement, so its default
- * has to leave every existing config's decisions untouched.
+ * The step clock is a second aging trigger, not a replacement, so its own
+ * default ships off. A clock set past the window's ceiling has no age to fire
+ * at, and says so instead of going quiet.
  */
 test("the stale rule has a step budget that ships off", () => {
 	assert.equal(DEFAULT_CLM_CONFIG.autoClear.staleSteps, 0);
 	const parsed = parseClmConfig({ autoClear: { staleSteps: 12 } }, DEFAULT_CLM_CONFIG, "steps.json");
-	assert.deepEqual(parsed.warnings, []);
 	assert.equal(parsed.config.autoClear.staleSteps, 12);
+	assert.ok(
+		parsed.warnings.some((warning) => warning.includes("autoClear.maxAgeSteps")),
+		"a clock set past the default ceiling is reported, not silently capped",
+	);
+	const unbounded = parseClmConfig({ autoClear: { staleSteps: 12, maxAgeSteps: 0 } }, DEFAULT_CLM_CONFIG, "unbounded-steps.json");
+	assert.deepEqual(unbounded.warnings, [], "0 leaves the age rule unbounded, so the clock still fires at 12");
+	const inside = parseClmConfig({ autoClear: { staleSteps: 3 } }, DEFAULT_CLM_CONFIG, "inside-steps.json");
+	assert.deepEqual(inside.warnings, [], "a clock inside the window is the intended shape");
 	const bad = parseClmConfig({ autoClear: { staleSteps: -1 } }, DEFAULT_CLM_CONFIG, "bad-steps.json");
 	assert.equal(bad.config.autoClear.staleSteps, 0);
 	assert.ok(bad.warnings.some((warning) => warning.includes("autoClear.staleSteps")));
@@ -243,3 +251,4 @@ test("the clearing channel defaults to rot and takes its money keys", () => {
 	assert.equal(bad.config.autoClear.channel, "rot");
 	assert.ok(bad.warnings.some((warning) => warning.includes("autoClear.channel")));
 });
+

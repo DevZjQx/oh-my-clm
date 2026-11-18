@@ -131,10 +131,10 @@ export interface SelectorOptions {
 	 */
 	readonly minAgeSteps?: number;
 	/**
-	 * Upper bound of the stale-rule age window, in tool results. The plan's point
-	 * against a one-sided floor: everything past the bound is backlog, and the
-	 * backlog's suffix is the whole session. `0` (the default) leaves the age
-	 * rule unbounded, which is today's behavior.
+	 * Upper bound of the stale-rule age window, in tool results: everything past
+	 * the bound is backlog, and the backlog's suffix is the whole session. `0`
+	 * leaves the age rule unbounded. A bound below the step clock's floor makes
+	 * the clock unreachable, so the config parser warns instead of going quiet.
 	 */
 	readonly maxAgeSteps?: number;
 }

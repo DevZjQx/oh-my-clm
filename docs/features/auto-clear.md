@@ -18,7 +18,7 @@ DSH 侧的可选通道：在 turn 边界把**可重取**的 tool result（`read`
 
 - 可重取工具是 `read` / `read_image` / `grep` / `glob` / `web_fetch`。`grep` / `glob` 参数规范化后相同即同一目标，`read_image` 按文件路径，`web_fetch` 按 URL；`read` 要求新行区间覆盖旧区间。
 - **被取代**：块内可重取输出 ≥95% 被后续调用取代。
-- **老化**：块的结果落在至少 `staleTurns` 个 turn 之前，或年龄（tool result 数）落在 `minAgeSteps`–`maxAgeSteps` 的窗口内（见 [README](../../README.md#配置)）；只贡献“没人回头取”的那部分 rot。窗口的下限把热区挡在外面，上限把积压旧块挡在外面——一批的重算成本从最早的块算起，无上界的年龄规则选中的积压批，其尾部就是整个会话。`0` 关闭对应时钟或边界。
+- **老化**：块的结果落在至少 `staleTurns` 个 turn 之前，或年龄（tool result 数）落在 `minAgeSteps`–`maxAgeSteps` 的窗口内（见 [README](../../README.md#配置)）；只贡献“没人回头取”的那部分 rot。窗口的下限把热区挡在外面，上限把积压旧块挡在外面——一批的重算成本从最早的块算起，无上界的年龄规则选中的积压批，其尾部就是整个会话。`0` 关闭对应时钟或边界。窗口的上限低于 step 时钟的下限（`max(staleSteps, minAgeSteps)`）时该时钟永不触发，配置解析会写一条 warning，而不是静默失效。
 - 两条规则都要求块正文几乎全部可重取（同一 95% 口径）。清理替换的是整块可见正文，PTC 程序里混着现场输出时不清，避免用一行指针换掉还要用的分析。
 - 候选按 turn 组装，被跳过的批次不消费，留到下一个边界。
 

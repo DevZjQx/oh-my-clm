@@ -238,6 +238,13 @@ export function parseClmConfig(document, base = DEFAULT_CLM_CONFIG, source = "<m
         config.autoClear.minNetTokens = readNumber(autoClear, "minNetTokens", config.autoClear.minNetTokens, source, "autoClear.minNetTokens", warnings, { min: -1_000_000 });
         config.autoClear.stopPercent = readNumber(autoClear, "stopPercent", config.autoClear.stopPercent, source, "autoClear.stopPercent", warnings, { min: 0, max: 100 });
         config.autoClear.midTurnSuffixTokens = readNumber(autoClear, "midTurnSuffixTokens", config.autoClear.midTurnSuffixTokens, source, "autoClear.midTurnSuffixTokens", warnings, { min: 0, integer: true });
+        // The step clock and the window bound the same rule, so a ceiling under the
+        // clock's floor leaves that clock no age to fire at. An explicit
+        // `staleSteps` must not go quiet because a newer key defaults under it.
+        const clockFloor = Math.max(config.autoClear.staleSteps, config.autoClear.minAgeSteps);
+        if (config.autoClear.staleSteps > 0 && config.autoClear.maxAgeSteps > 0 && clockFloor > config.autoClear.maxAgeSteps) {
+            warnings.push(`${source}: "autoClear.maxAgeSteps" (${config.autoClear.maxAgeSteps}) is below the step clock's floor (${clockFloor}); that clock never fires. Raise maxAgeSteps above it, or set it 0 for an unbounded age rule`);
+        }
     }
     const host = group(document, "host", source, warnings);
     if (host) {
