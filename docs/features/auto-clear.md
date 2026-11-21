@@ -37,11 +37,13 @@ DSH 侧的可选通道：在 turn 边界把**可重取**的 tool result（`read`
 投影保留目标的 `id` / `role` / `toolCallId` / `isError`，只把 `content` 换成：
 
 ```text
-[cleared 3.4k tok · read src/x.ts:120-260 · re-read if needed]
+[cleared 3.4k tok · read src/x.ts:120-260 · re-read before editing]
 ```
 
+- 占位符是一条清理回执，不是被动的邀请：模型对目标的读取已从它的副本里消失，编辑前必须重读，凭记忆编辑要么浪费一次往返、要么写在对旧内容上。它在每块下面只携带绑定到该块目标的那一条指令；「什么还在」对所有块是同一个事实，由每 turn 一次的 block index 表头（`the user still sees the original`）持有。
+
 - `keys` 是选择器的目标身份，只供重放使用：投影不读它，占位符与不带 `keys` 的记录逐字节相同，版本号也不因此变化。
-- 记录 envelope 损坏（非对象、版本未知、空 `targets`）抛错；目标已被 compaction 移出或已被先前记录清过则跳过；目标适用但畸形抛错。回放必须收敛。
+- 记录 envelope 损坏（非对象、版本未知、空 `targets`、重复 `seq`）抛错；目标已被 compaction 移出、已被先前记录清过、或正文不比占位符长（替换会让模型读到更多字）则跳过；目标适用但畸形抛错。回放必须收敛。
 - 写入必须走宿主的 `appendPluginRecord`，不能退回 `Session.append()`：后者写不出 `ignorable`，重启后整份会话会被宿主拒绝。宿主没有该 seam 时会话锁存为 `stopped (unrecordable)`，canary 不受影响。
 - 结算发生在 `turn/end`（或 `step/end`）通知之后的一个 microtask：宿主在通知 `session/event` 时仍持有该 append，`appendPluginRecord` 会拒绝嵌套写入。批次、闸门与 turn 计数在边界处快照，延迟执行的只有判定与写入；见 `dsh/index.ts` 的 `scheduleSettlement`。
 - 解析顺序、模块身份校验与 `host.pluginRecordModule` 的语义见 `plugin-record.ts`。
@@ -70,16 +72,16 @@ DSH 侧的可选通道：在 turn 边界把**可重取**的 tool result（`read`
 
 | 信号 | 条件 | 动作 |
 | --- | --- | --- |
-| 单目标重读 | 同一目标 key 被重读 2 次 | 只拒收该 key，永不再清它；显示 `N key(s) refused after re-reads` |
-| 重读率 | 被清目标在 3 个 tool result 内被重取，累计 ≥3 次且占已清目标一半以上 | 本会话停止清理，显示 `stopped (breaker)` |
+| 单目标重读 | 同一目标 key 被重读 2 次（第一次就是占位符要求的编辑前重读） | 只拒收该 key，永不再清它；显示 `N key(s) refused after re-reads` |
+| 拒收率 | 累计 ≥3 个不同目标被拒收，且占已清目标一半以上 | 本会话停止清理，显示 `stopped (breaker)` |
 | 记录缝缺失 | 宿主没有 `appendPluginRecord`，或解析不到同一份模块 | 锁存 `stopped (unrecordable)`，不退回 `append()` |
 | 投影缺失 | `sessions.registerMessageProjection` 尚未可用 | 跳过本轮，不锁存；候选留到下一个边界 |
 | 占用 | ≥ `autoClear.stopPercent` | 跳过本轮，不锁存；占用降下来后恢复 |
 | 写法失败 | writer 抛错 | 记 warn，本轮不算清理，不 retire 候选 |
 
-重读本身不算误判，占位符就是请模型按需重读；熔断看的是比例。一批两个块各自被重读一次是一次正常往返，不足以锁存会话。窗口保留最近 3 个 tool result 内的目标 key，同一目标被清掉多个副本也只占一条，账本不随会话长度增长。
+重读本身不算误判：占位符就要求模型在编辑前重读，所以第一次重读是遵守指令，不是选错了块。证据从同一 key 的第二次重读开始——那是模型拿到它要的重读之后又回来了。全局熔断因此数被拒收的目标，而不是重读次数：重读次数只进账本（canary 的 `rereads` 与 `/clm status`），数它会让会话在模型听话时自毁。窗口保留最近 3 个 tool result 内的目标 key，同一目标被清掉多个副本也只占一条，账本不随会话长度增长。
 
-单目标拒收先于全局熔断：一个反复被重读的 key 说明那个目标还活着，而不是选择器坏了。拒收后该 key 的证据同时被丢弃，因此它不会再推高全局重读率，其余候选照常清理——一个热点文件不会关掉整条通道。候选的 `keys` 中只要有一个被拒收，整块都不清：清理替换的是整块正文。
+单目标拒收先于全局熔断：一个反复被重读的 key 说明那个目标还活着，而不是选择器坏了。拒收后该 key 从重读窗口里移除，其余候选照常清理——一个热点文件不会关掉整条通道。候选的 `keys` 中只要有一个被拒收，整块都不清：清理替换的是整块正文。
 
 ## 账本
 

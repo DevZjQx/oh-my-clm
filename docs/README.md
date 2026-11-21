@@ -14,5 +14,3 @@
 ## 工程
 
 - [项目结构](./project-structure.md)：分层、单向依赖、测试布局与生成物。
-
-版本说明见根目录 [changelog.md](../changelog.md)。

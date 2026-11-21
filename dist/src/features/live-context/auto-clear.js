@@ -380,9 +380,11 @@ export class SupersessionTracker {
     }
 }
 /**
- * Re-reads after which one key is refused. Lower than the session-wide
- * `BREAKER_MIN_REREADS` on purpose: the per-key answer is cheaper and should win
- * before the global latch is a decision.
+ * Re-reads after which one key is refused. The first re-read of a key is the one
+ * the placeholder ordered before an edit; the second is a target that came back
+ * anyway. Lower than the session-wide `BREAKER_MIN_REFUSED` on purpose: the
+ * per-key answer is cheaper and should win before the global latch is a
+ * decision.
  */
 export const BREAKER_KEY_REREADS = 2;
 export function createRereadPolicy() {

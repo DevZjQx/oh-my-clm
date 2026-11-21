@@ -25,14 +25,13 @@ oh-my-clm
 │   ├── adapters
 │   ├── package                  # manifest / 发布元数据契约
 │   └── harness                  # 手动 mock-host 检查，不进入 npm 包
-├── scripts                      # 构建、包检查、依赖边界检查、会话重放
+├── scripts                      # 包检查、依赖边界检查、会话重放
 ├── docs
 │   ├── README.md
 │   ├── features                 # 功能契约
 │   └── project-structure.md
 ├── diagrams                     # 架构图源文件（.mmd / .excalidraw）与渲染结果，不随 npm 包发布
 ├── dist                         # tsc 构建产物，随仓库提交
-└── artifacts                    # DSH tgz 输出，gitignore
 ```
 
 ## 分层与导入规则
@@ -75,6 +74,6 @@ oh-my-clm
 - `test/harness/*.mjs`：需要构建产物 `dist/` 的手动 mock-host 检查。
 - `scripts/canary-replay.mjs`：把已存会话日志重放进自动清理选择器（`npm run canary:replay`），需要 `dist/` 与 PATH 上的 `zstd`；随包发布，所以安装后也能跑。
 
-`npm test` 只发现 `*.test.ts`，不会把 `test/harness/` 当测试运行。`dist/` 提交，`artifacts/` 与 `/tmp/clm-<sessionId>/` 不提交。
+`npm test` 只发现 `*.test.ts`，不会把 `test/harness/` 当测试运行。`dist/` 提交，`/tmp/clm-<sessionId>/` 不提交。
 
 `npm run check` 首先运行 `scripts/check-boundaries.mjs`，检查：shared 不导入 feature/host adapter；feature 不跨 feature、不导入 host adapter 或测试；host adapter 不导入测试；`src` 中无 barrel。新增目录后应在 `layerOf()` 中补充层级，不要放宽规则。

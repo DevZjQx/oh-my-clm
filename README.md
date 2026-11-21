@@ -4,7 +4,7 @@ Pi extension + DSH/Cordis plugin。DSH 侧默认关闭一条**自动清理**通�
 
 ## 自动清理（DSH，默认关闭）
 
-`autoClear.enabled: true` 时每个 `turn/end` 结算一次：清被同一目标后续调用取代的块，以及正文**全部可重取**、且已过期 `staleTurns` 个 turn 或年龄落在 `minAgeSteps`–`maxAgeSteps` 个 tool result 窗口内的块；闸门为 1200 token、2 块或死内容占当前 prompt 的 5%，占用 ≥60% 停手交给宿主 compaction；同一个目标被重读 2 次即拒收该 key，全局重读率过高才熔断。计时器按 step 计（老化另有 `staleSteps` 时钟），结算点留在 turn 边界，让一次断点摊到整批块上；`autoClear.midTurnSuffixTokens` 可单独放开尾部很短的 turn 内清理。`autoClear.channel` 选判据：默认 `rot` 只看量与占比，`money` 额外要求一批的一次性重算成本与摊销净收益付得起，`both` 让被拒的批仍走 rot。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
+`autoClear.enabled: true` 时每个 `turn/end` 结算一次：清被同一目标后续调用取代的块，以及正文**全部可重取**、且已过期 `staleTurns` 个 turn 或年龄落在 `minAgeSteps`–`maxAgeSteps` 个 tool result 窗口内的块；闸门为 1200 token、2 块或死内容占当前 prompt 的 5%，占用 ≥60% 停手交给宿主 compaction；同一个目标被重读 2 次即拒收该 key，被拒收的目标占已清目标一半以上才熔断。计时器按 step 计（老化另有 `staleSteps` 时钟），结算点留在 turn 边界，让一次断点摊到整批块上；`autoClear.midTurnSuffixTokens` 可单独放开尾部很短的 turn 内清理。`autoClear.channel` 选判据：默认 `rot` 只看量与占比，`money` 额外要求一批的一次性重算成本与摊销净收益付得起，`both` 让被拒的批仍走 rot。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
 
 ## 手动通道：mirror 与 cleanup
 
@@ -22,7 +22,7 @@ Pi projection ──► /tmp/clm-${sessionId}/LIVE_CTX_MAIN.md ◄── 模型 
 - **DSH**：通过 `Session.append()` 的 `surfaceOp: { op: "replace" }` 改写当前 active surface；append-only session log 保留原始事件。
 - **cleanup**：在 host 侧按 1-based editable block ID 直接删除或软卸载，不读取 block body，不受 preview 截断影响。
 - **block index**：DSH 把可操作的 ID 区间放进 runtime context；默认 `digest`，每个已完成 turn 一行。
-- **自动清理**（DSH，默认关）：turn 边界把被后续调用取代的 tool result 换成 `[cleared … re-read if needed]` 指针，通过宿主消息投影实现——会话日志与人类 transcript 都保留原文。需要宿主提供 `appendPluginRecord` seam（`dsh-session` ≥ 0.2.2-rc.1），否则该通道保持关闭。
+- **自动清理**（DSH，默认关）：turn 边界把被后续调用取代的 tool result 换成 `[cleared … re-read before editing]` 回执，通过宿主消息投影实现——会话日志与人类 transcript 都保留原文。需要宿主提供 `appendPluginRecord` seam（`dsh-session` ≥ 0.2.2-rc.1），否则该通道保持关闭。
 
 ## 安装
 
@@ -145,7 +145,7 @@ mirror 只是编辑面：原始 session JSONL / DSH session log 是事实来源�
 
 所有触发阈值默认关闭（`0`）。命中后只在该 turn 边界装配一次用量行和候选；候选只取已完成的 turn，按断点后的净收益排序，并固定带 `skipRoles: ["user"]`。Pi 侧另认 `cleanup.trigger.stepsSinceCleanup`（回退 `turnsSinceCleanup`）与 `cleanup.trigger.toolResultSharePercent`，预算 nudge 与 DSH 共用同一套用量行/候选格式。
 
-**计数单位**：陈旧度信号（`completedSteps` / `stepsSinceCleanup` / 候选的 `stepsOld` / 摊销 `N`）按 step 计；批次结算、闸门和候选区间仍按 turn，因为一次断点必须摊到多个块上。度量依据见 `src/features/live-context/auto-clear.ts` 与 [changelog](./changelog.md)。
+**计数单位**：陈旧度信号（`completedSteps` / `stepsSinceCleanup` / 候选的 `stepsOld` / 摊销 `N`）按 step 计；批次结算、闸门和候选区间仍按 turn，因为一次断点必须摊到多个块上。度量依据见 `src/features/live-context/auto-clear.ts`。
 
 ## DSH 适配
 
@@ -154,15 +154,7 @@ mirror 只是编辑面：原始 session JSONL / DSH session log 是事实来源�
 - replacement 只在打开的 turn/step 内执行；`assistant/message` 不能作为 replacement。
 - 生命周期、replacement 语义与未验证边界见 [DSH surface bridge](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/dsh-surface-bridge.md)。
 
-打包：
-
-```bash
-npm run build:dsh:plugin
-# 默认输出 artifacts/oh-my-clm-<version>.tgz
-node scripts/build-dsh-plugin.mjs --output ./out/oh-my-clm.tgz
-```
-
-专用包只含 DSH host、`dist`、manifest、bundle patch、locale、icon；普通 `npm pack` 仍生成 Pi + DSH 完整包。
+打包：普通 `npm pack` 生成 Pi + DSH 完整包，含 DSH host、`dist`、manifest、bundle patch、locale、icon。
 
 ## 开发
 
@@ -183,7 +175,6 @@ npm pack --dry-run
 - [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)：`autoClear.canary` / `autoClear.enabled`、选择器口径、投影契约、闸门与熔断、离线重放。
 - [项目结构](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/project-structure.md)：分层、导入规则、测试与生成物。
 - [架构图](https://github.com/DevZjQx/oh-my-clm/blob/main/diagrams/oh-my-clm-plugin.svg)：两个宿主、feature 分层与自动清理链路（源文件在 `diagrams/`）。
-- [更新日志](https://github.com/DevZjQx/oh-my-clm/blob/main/changelog.md)。
 
 ## 边界
 

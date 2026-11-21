@@ -502,11 +502,12 @@ export class SupersessionTracker {
 /**
  * Re-read accounting for cleared targets.
  *
- * A re-read is not by itself a mistake: the placeholder invites one, and a file
- * that changed after the clear legitimately needs it again. What must not
- * continue is a *key* that keeps coming back — that target was live, not dead,
- * and clearing it again manufactures tool calls. Refusing one key is surgical;
- * the session-wide breaker stays for a rate spread across several keys.
+ * A re-read is not by itself a mistake: the placeholder asks for one before an
+ * edit, and a file that changed after the clear legitimately needs it again.
+ * What must not continue is a *key* that keeps coming back — that target was
+ * live, not dead, and clearing it again manufactures tool calls. Refusing one
+ * key is surgical; the session-wide breaker stays for a rate spread across
+ * several keys.
  */
 export interface RereadPolicy {
 	/** Re-reads seen per target key. */
@@ -516,9 +517,11 @@ export interface RereadPolicy {
 }
 
 /**
- * Re-reads after which one key is refused. Lower than the session-wide
- * `BREAKER_MIN_REREADS` on purpose: the per-key answer is cheaper and should win
- * before the global latch is a decision.
+ * Re-reads after which one key is refused. The first re-read of a key is the one
+ * the placeholder ordered before an edit; the second is a target that came back
+ * anyway. Lower than the session-wide `BREAKER_MIN_REFUSED` on purpose: the
+ * per-key answer is cheaper and should win before the global latch is a
+ * decision.
  */
 export const BREAKER_KEY_REREADS = 2;
 

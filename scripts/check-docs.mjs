@@ -5,8 +5,8 @@
  * Docs rot when they accumulate history and rationale that already live
  * somewhere else. The rules are:
  *
- *   1. Release history belongs to `changelog.md` (and `git log`). A feature doc
- *      or the README must not narrate an old version or a previous design.
+ *   1. Release history belongs to `git log`. A feature doc or the README must
+ *      not narrate an old version or a previous design.
  *   2. Design rationale belongs to the source comment that owns the behavior.
  *      Docs point at that file instead of copying its prose.
  *
@@ -52,13 +52,12 @@ function relativeId(file) {
 	return path.relative(root, file).split(path.sep).join("/");
 }
 
+// The only version a doc may not name is the one being shipped, so the version
+// list comes from package.json (the release itself). History has no file to
+// read: `git log` is the record.
 function releaseVersions() {
-	const versions = new Set();
-	const changelog = fs.readFileSync(path.join(root, "changelog.md"), "utf8");
-	for (const match of changelog.matchAll(/^##\s+(?:\[)?v?(\d+\.\d+\.\d+)/gm)) versions.add(match[1]);
 	const packageVersion = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version;
-	if (typeof packageVersion === "string") versions.add(packageVersion);
-	return [...versions].sort((a, b) => b.length - a.length);
+	return typeof packageVersion === "string" ? [packageVersion] : [];
 }
 
 function escapeRegExp(value) {
@@ -105,16 +104,16 @@ for (const file of docs) {
 	const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
 	for (const { line: lineNumber, text } of docProse(lines)) {
 		if (RATIONALE_HEADING_PATTERN.test(text)) {
-			problems.push(`${id}:${lineNumber}: rationale/revision heading; keep "why" in the source comment or changelog`);
+			problems.push(`${id}:${lineNumber}: rationale/revision heading; keep "why" in the source comment or git log`);
 		}
 		if (versionPattern === undefined) continue;
 		const version = versionPattern.exec(text);
 		if (version !== null) {
-			problems.push(`${id}:${lineNumber}: release version "${version[0]}"; history belongs to changelog.md`);
+			problems.push(`${id}:${lineNumber}: release version "${version[0]}"; history belongs to git log`);
 		}
 		const history = HISTORY_PATTERN.exec(text);
 		if (history !== null) {
-			problems.push(`${id}:${lineNumber}: retrospective wording "${history[0]}"; history belongs to changelog.md`);
+			problems.push(`${id}:${lineNumber}: retrospective wording "${history[0]}"; history belongs to git log`);
 		}
 	}
 	for (const { line: lineNumber, text } of docProse(lines)) {

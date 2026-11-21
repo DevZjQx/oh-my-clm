@@ -46,9 +46,18 @@ export function compactTokens(tokens) {
         return `${(tokens / 1_000).toFixed(1)}k tok`;
     return `${Math.round(tokens / 1_000)}k tok`;
 }
-/** The exact text the model sees in place of a cleared body. */
+/**
+ * The exact text the model sees in place of a cleared body.
+ *
+ * A clearing receipt, not an invitation: its read of the target is gone from the
+ * model's copy, so it must re-read before editing — editing from a forgotten
+ * read wastes a round trip or writes against stale content. What the clear left
+ * behind (the session log, and the transcript the user reads) is one fact for
+ * every cleared block, so the per-turn index header carries it once instead of
+ * repeating it under each block the model has to skim.
+ */
 export function clearPlaceholder(label, tokens) {
-    return `${CLEAR_PLACEHOLDER_PREFIX} ${compactTokens(tokens)} · ${label} · re-read if needed]`;
+    return `${CLEAR_PLACEHOLDER_PREFIX} ${compactTokens(tokens)} · ${label} · re-read before editing]`;
 }
 function messageText(content) {
     if (!Array.isArray(content))
@@ -85,6 +94,10 @@ export const clearProjection = {
         }
         const nodes = new Set(context.nodes);
         const updates = new Map();
+        // Envelope validity is decided before the projection decision: a target that
+        // is skipped because its pointer would not shrink it is still a duplicate of
+        // one the record already named.
+        const seen = new Set();
         for (const target of targets) {
             if (!isRecord(target))
                 throw new Error(`${CLEAR_EVENT_TYPE}: each target must be an object`);
@@ -98,13 +111,14 @@ export const clearProjection = {
             // of the target, because that is exactly the case that must not throw.
             if (!nodes.has(seq))
                 continue;
+            if (seen.has(seq))
+                throw new Error(`${CLEAR_EVENT_TYPE}: duplicate target seq ${seq}`);
+            seen.add(seq);
             if (typeof label !== "string" || label.length === 0 || label.length > CLEAR_LABEL_MAX_CHARS) {
                 throw new Error(`${CLEAR_EVENT_TYPE}: target label must be 1..${CLEAR_LABEL_MAX_CHARS} characters`);
             }
             if (!isIndex(tokens))
                 throw new Error(`${CLEAR_EVENT_TYPE}: target tokens must be a non-negative integer`);
-            if (updates.has(seq))
-                throw new Error(`${CLEAR_EVENT_TYPE}: duplicate target seq ${seq}`);
             const source = context.events[seq - context.baseSeq];
             if (!isRecord(source) || source.type !== "tool/result") {
                 throw new Error(`${CLEAR_EVENT_TYPE}: target seq ${seq} must be a tool/result`);
@@ -121,9 +135,16 @@ export const clearProjection = {
                 throw new Error(`${CLEAR_EVENT_TYPE}: target seq ${seq} has an empty body`);
             if (currentText.startsWith(CLEAR_PLACEHOLDER_PREFIX))
                 continue;
+            // A clear must strictly shrink what the model reads. A body no longer than
+            // the pointer that would replace it is not dead weight: rewriting it would
+            // grow every later request. Checked here because a replayed record carries
+            // the decision, not the body it was written against.
+            const placeholder = clearPlaceholder(label, tokens);
+            if (placeholder.length >= currentText.length)
+                continue;
             updates.set(seq, {
                 ...current,
-                content: [{ type: "text", text: clearPlaceholder(label, tokens) }],
+                content: [{ type: "text", text: placeholder }],
             });
         }
         return updates;

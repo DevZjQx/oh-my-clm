@@ -22,7 +22,7 @@ Docs are read by users and by agents that copy the nearest example. Keep them to
 
 | Rule | Enforced by |
 | --- | --- |
-| Docs describe current behavior only; release versions, earlier designs, measurements, and “why it used to be” go to `changelog.md` and `git log`. | `scripts/check-docs.mjs` rejects release versions, retrospective wording, and “why/history” headings in `README.md` and `docs/**`. |
+| Docs describe current behavior only; release versions, earlier designs, measurements, and “why it used to be” go to `git log`. | `scripts/check-docs.mjs` rejects release versions, retrospective wording, and “why/history” headings in `README.md` and `docs/**`. |
 | Point at the file whose module comment owns the detail; link instead of writing when a source comment or `git diff` already says it. | `scripts/check-docs.mjs` rejects a long sentence copied from `src/**`, `extensions/**`, or `dsh/**` comments; the rest is review judgment. |
 | One fact has one owner: `README.md` for install, config, and the full config table; `docs/features/` for behavior contracts; `docs/project-structure.md` for layout. | Review judgment. |
 

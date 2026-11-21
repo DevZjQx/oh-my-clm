@@ -9,13 +9,19 @@ import {
 	compactTokens,
 } from "../../../src/features/live-context/clear-projection.ts";
 
+/**
+ * A body the pointer has to be able to shrink. The projection refuses a clear
+ * that would leave the model reading more text than it read before.
+ */
+const bodyText = Array.from({ length: 12 }, (_, index) => `line ${index + 1} of the tool result body`).join("\n");
+
 const originalMessage = {
 	id: "m-7",
 	role: "tool",
 	toolCallId: "call_7",
 	isError: false,
 	source: { kind: "tool", callId: "call_7" },
-	content: [{ type: "text", text: "line 1\nline 2\nline 3" }],
+	content: [{ type: "text", text: bodyText }],
 };
 
 const BASE_SEQ = 3;
@@ -42,9 +48,46 @@ const event = { seq: 12, type: CLEAR_EVENT_TYPE, data: { v: CLEAR_VERSION, targe
 
 test("placeholder is one line, names the pointer, and starts with the marker", () => {
 	const text = clearPlaceholder("read /a.ts:1-3", 3_400);
-	assert.equal(text, "[cleared 3.4k tok · read /a.ts:1-3 · re-read if needed]");
+	assert.equal(text, "[cleared 3.4k tok · read /a.ts:1-3 · re-read before editing]");
 	assert.equal(text.includes("\n"), false);
 	assert.equal(text.startsWith(CLEAR_PLACEHOLDER_PREFIX), true);
+});
+
+/**
+ * gnosh's pop receipt tells the model what to do next ("view a file before you
+ * edit it"), not whether it feels like it. The placeholder is this project's
+ * receipt: the instruction belongs under every cleared block because it binds to
+ * the block's own target, while what the clear left behind is the same fact for
+ * all of them and belongs in the per-turn index header, written once instead of
+ * repeated under every block the model has to skim.
+ */
+test("the placeholder carries the clearing receipt, not just an invitation", () => {
+	const text = clearPlaceholder("read /a.ts:1-3", 3_400);
+	assert.match(text, /re-read before editing/);
+	assert.doesNotMatch(text, /re-read if needed/);
+	assert.doesNotMatch(text, /the user still sees/, "a per-turn fact is not repeated per block");
+	assert.equal(text.includes("\n"), false);
+});
+
+/**
+ * Every path that rewrites the model-visible copy has to strictly shrink it. A
+ * body no longer than the pointer that would replace it is not dead weight —
+ * replacing it would add text the model pays for on every later request. The
+ * projection owns the check because a replayed record carries the decision, not
+ * the body it was originally written against.
+ */
+test("a body the pointer would not shrink is left visible", () => {
+	const pointer = clearPlaceholder("read /a.ts:1-3", 3_400);
+	const bodyOf = (text: string) => ({
+		...originalMessage,
+		content: [{ type: "text", text }],
+	});
+	const window = (text: string) =>
+		context({ events: { 7: { type: "tool/result", seq: 7, data: { message: bodyOf(text) } } } });
+
+	assert.equal(clearProjection.project(event, window("x".repeat(pointer.length))).size, 0, "an equal body does not shrink");
+	assert.equal(clearProjection.project(event, window("x".repeat(pointer.length - 1))).size, 0, "a shorter body would grow");
+	assert.equal(clearProjection.project(event, window("x".repeat(pointer.length + 1))).size, 1, "a longer body still shrinks");
 });
 
 test("compactTokens keeps three significant digits and never invents precision", () => {
@@ -69,7 +112,7 @@ test("a valid decision replaces the body and preserves message identity", () => 
 });
 
 test("the projection rewrites the current message, not the original event body", () => {
-	const previouslyProjected = { ...originalMessage, content: [{ type: "text", text: "already shortened by another projection" }] };
+	const previouslyProjected = { ...originalMessage, content: [{ type: "text", text: `already shortened by another projection\n${bodyText}` }] };
 	const updates = clearProjection.project(event, context({ messages: new Map([[7, previouslyProjected]]) }));
 	const message = updates.get(7) as Record<string, unknown>;
 	assert.deepEqual(message.content, [{ type: "text", text: clearPlaceholder("read /a.ts:1-3", 3_400) }]);

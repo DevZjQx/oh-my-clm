@@ -642,7 +642,7 @@ export function renderBlockIndex(
 		appendOmittedRun(headEnd + 1, editable.length);
 	}
 	const header = options.autoClear
-		? "Editable blocks by cleanup ID; [cleared] blocks hold a re-read pointer, not the body. Ranges are inclusive; cleanup remains for manual removal."
+		? "Editable blocks by cleanup ID; [cleared] blocks hold a re-read pointer, not the body: re-read before editing, and the user still sees the original. Ranges are inclusive; cleanup remains for manual removal."
 		: "Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them, cleanup({ list: \"A-B\" }) to read a range's rows.";
 	return blockIndexDocument(header, lines);
 }
@@ -911,7 +911,7 @@ export function renderBlockDigest(
 	}
 
 	const header = options.autoClear
-		? "Editable blocks by cleanup ID; one line per turn. [cleared] blocks hold a re-read pointer, not the body; cleanup remains for manual removal."
+		? "Editable blocks by cleanup ID; one line per turn. [cleared] blocks hold a re-read pointer, not the body: re-read before editing, and the user still sees the original; cleanup remains for manual removal."
 		: "Editable blocks by cleanup ID; ranges are inclusive. One line per turn; call cleanup({ ranges: [\"A-B\"] }) to omit a turn, cleanup({ list: \"A-B\" }) to read its rows.";
 	return blockIndexDocument(header, lines);
 }

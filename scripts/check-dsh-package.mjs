@@ -18,11 +18,9 @@ const entry = manifest.facets?.host?.entry;
 if (typeof entry !== "string" || entry.startsWith("/") || entry.includes("..")) throw new Error("invalid DSH host entry");
 if (!fs.existsSync(path.join(root, entry))) throw new Error(`DSH host entry is missing: ${entry}`);
 
-// Walk every relative import from the host entry. The DSH-only tarball is built
-// by copying a file list, and that list drifted once: the entry imported
-// auto-clear / clear-projection / plugin-record / context-prompt /
-// context-trigger / clm-config while the package shipped none of them. A static
-// closure check catches that before a tarball exists.
+// Walk every relative import from the host entry. A relative import that
+// resolves in the repository but not in the shipped tree breaks the plugin; a
+// static closure check catches that before a package exists.
 const importPattern = /(?:from\s*|import\s*\(\s*)["'](\.{1,2}\/[^"']+)["']/g;
 const visited = new Set();
 function walkImports(file) {
@@ -41,8 +39,7 @@ walkImports(path.join(root, entry));
 if (packageJson.dsh?.bundle?.patch !== "./cordis.patch.yml") throw new Error("package.json must expose the official DSH bundle patch");
 if (packageJson.devDependencies?.["@deepseek-ai/dsh-tools"] !== "0.2.0-rc.2") throw new Error("package.json must pin the DSH tool schema runtime for builds");
 if (packageJson.icon !== "./icon.svg") throw new Error("package.json must declare ./icon.svg as its display icon");
-// Keywords drive npm search for both the Pi package and the DSH tarball that
-// scripts/build-dsh-plugin.mjs derives from them; guard the shape here so a typo
+// Keywords drive npm search for the Pi package; guard the shape here so a typo
 // surfaces before a release instead of after a publish nobody can edit.
 if (!Array.isArray(packageJson.keywords) || packageJson.keywords.length === 0) {
   throw new Error("package.json must declare search keywords");

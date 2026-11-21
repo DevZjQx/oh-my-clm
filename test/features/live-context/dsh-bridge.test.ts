@@ -1651,6 +1651,77 @@ test("a key that keeps coming back is refused without closing the channel", asyn
 });
 
 /**
+ * The placeholder orders a re-read before an edit, so a cleared target that
+ * comes back once is the model following the pointer — compliance, not evidence
+ * that the clear was wrong. A channel that latched on that rate would switch
+ * itself off exactly when the model does what it was told.
+ */
+test("the re-read the pointer ordered does not close the channel", async () => {
+	const host = await startAutoClearHost("dsh-reread-compliance");
+	const files = ["src/a.ts", "src/b.ts", "src/c.ts"];
+	try {
+		for (const file of files) appendRead(host.session, `call-${file}-1`, `First read of ${file}, superseded below by a fresh read of the same file.`, file);
+		for (const file of files) appendRead(host.session, `call-${file}-2`, `Second read of ${file}, the live copy the model still has in front of it.`, file);
+		host.session.record("turn/end", { turn: 1 });
+		await settle();
+
+		const targets = (host.clearRecords()[0]?.targets ?? []) as unknown[];
+		assert.equal(targets.length, 3, "three dead reads are one batch");
+
+		// Exactly what the placeholder asks for: one re-read per cleared target.
+		for (const [index, file] of files.entries()) {
+			host.session.record("tool/call", {
+				callId: `reread-${index}`,
+				name: "read",
+				arguments: JSON.stringify({ path: file }),
+			});
+		}
+
+		const status = await host.status();
+		assert.match(status, /3 re-read\(s\)/, "every ordered re-read is still counted for the ledger");
+		assert.doesNotMatch(status, /refused after re-reads/, "one re-read per key is not a key that keeps coming back");
+		assert.doesNotMatch(status, /stopped \(breaker\)/, "following the pointer must not stop the channel");
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(host.session.id))), { recursive: true, force: true });
+	}
+});
+
+/**
+ * A key is refused only after the model came back to it a second time — the one
+ * re-read the pointer paid for, plus one it did not. So refused keys, not plain
+ * re-reads, are what a broken selector looks like: when most of a session's
+ * cleared targets had to be refused, clearing is manufacturing tool calls.
+ */
+test("the session stops when most cleared targets had to be refused", async () => {
+	const host = await startAutoClearHost("dsh-reread-latch");
+	const files = ["src/a.ts", "src/b.ts", "src/c.ts"];
+	try {
+		for (const file of files) appendRead(host.session, `call-${file}-1`, `First read of ${file}, superseded below by a fresh read of the same file.`, file);
+		for (const file of files) appendRead(host.session, `call-${file}-2`, `Second read of ${file}, the live copy the model still has in front of it.`, file);
+		host.session.record("turn/end", { turn: 1 });
+		await settle();
+		assert.equal(host.clearRecords().length, 1, "the first pass must clear");
+
+		// Two re-reads of every cleared target: the ordered one, then a comeback.
+		for (const round of [0, 1]) {
+			for (const [index, file] of files.entries()) {
+				host.session.record("tool/call", {
+					callId: `reread-${round}-${index}`,
+					name: "read",
+					arguments: JSON.stringify({ path: file }),
+				});
+			}
+		}
+
+		const status = await host.status();
+		assert.match(status, /3 key\(s\) refused after re-reads/);
+		assert.match(status, /stopped \(breaker\)/, "every cleared target was refused, so the selector is clearing live content");
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(host.session.id))), { recursive: true, force: true });
+	}
+});
+
+/**
  * The numerator is targets, not cleared copies. One target can be dead in two
  * blocks at once (two reads of one file), and the batch clears both; a single
  * re-fetch of that target is still one re-read. Counting it per cleared block

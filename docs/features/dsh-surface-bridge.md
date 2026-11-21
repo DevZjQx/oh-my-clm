@@ -35,13 +35,7 @@
 
 ## 打包
 
-```bash
-npm run build:dsh:plugin
-# 默认输出 artifacts/oh-my-clm-<version>.tgz
-node scripts/build-dsh-plugin.mjs --output ./out/oh-my-clm.tgz
-```
-
-专用包只含 DSH host、运行时 `dist`、manifest、bundle patch、locale、icon；Pi extension、TypeScript 源码、测试与开发依赖不进入。`@deepseek-ai/dsh-tools` 只是可选 peer，用于兼容性检查，不产生运行时依赖。普通 `npm pack` 生成 Pi + DSH 完整包。
+普通 `npm pack` 生成 Pi + DSH 完整包：DSH host、运行时 `dist`、manifest、bundle patch、locale、icon 随包发布。`@deepseek-ai/dsh-tools` 只是可选 peer，用于兼容性检查，不产生运行时依赖。
 
 ## 配置
 

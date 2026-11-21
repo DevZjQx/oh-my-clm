@@ -797,13 +797,19 @@ section("11. clearing canary");
 		JSON.stringify(qualityRecord.quality ?? null),
 	);
 
-	// Two more re-fetches of the same cleared target trip the breaker. A subrange
-	// read does not supersede the live full read, so no new candidate is created.
+	// Two more re-fetches of the same cleared target are the model coming back to
+	// a target it already re-read: the key is refused, and the channel stays open
+	// for every other block. A subrange read does not supersede the live full
+	// read, so no new candidate is created.
 	for (const step of [2, 3]) {
 		await clearFeed("tool/call", { turn: 2, step, callId: `call_retry_${step}`, name: "read", arguments: JSON.stringify({ file_path: "/a.ts", offset: 200, limit: 60 }) });
 	}
 	const status = clearBoot.host.commands.get("clm").handler({ agent: clearBoot.agent, rawInput: "status" });
-	check("the breaker stops clearing after a re-read", String(status.text).includes("stopped (breaker)"), String(status.text).split("\n").at(-1));
+	check(
+		"a target that keeps coming back is refused without closing the channel",
+		/1 key\(s\) refused after re-reads/.test(String(status.text)) && !String(status.text).includes("stopped (breaker)"),
+		String(status.text).split("\n").at(-1),
+	);
 	check("the status line reports error re-reads", /error re-read\(s\)/.test(String(status.text)), String(status.text).split("\n").at(-1));
 	clearBoot.host.disposeAll();
 	setHarnessAutoClear({ enabled: false });

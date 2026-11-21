@@ -45,11 +45,14 @@ function triggerOptions(config) {
 /** Tool results a cleared target may come back within and still count as a miss. */
 const BREAKER_WINDOW_RESULTS = 3;
 /**
- * Cleared targets a session must have before a re-read rate can latch the
- * breaker. A batch of two blocks re-read once each is one normal round trip,
- * not evidence that the selector cleared live content.
+ * Distinct targets a session must have had to refuse before the channel stops.
+ *
+ * A key is refused only after the model came back to it twice, and the first
+ * re-read is the one the placeholder ordered before an edit. So this counts
+ * targets the clear genuinely mis-priced, not clears the model followed the
+ * pointer on — the rate this divides is the one the instruction cannot inflate.
  */
-const BREAKER_MIN_REREADS = 3;
+const BREAKER_MIN_REFUSED = 3;
 /** `autoClear.canary` arms the clearing canary. Off by default. */
 function canaryEnabled(config) {
     return config.autoClear.canary;
@@ -617,12 +620,15 @@ function rememberClearedKey(state, key, at) {
 /**
  * Count a cleared target the model asked for again, and trip the breaker.
  *
- * A re-read is *not* by itself a mistake: the placeholder invites one, and a
- * file that changed after the clear legitimately needs re-reading. What the
- * breaker watches is the rate — when most cleared targets come straight back,
- * clearing is manufacturing tool calls instead of removing dead weight, and the
- * session stops clearing. A sample below {@link BREAKER_MIN_REREADS} is one
- * normal round trip, not a rate, so it cannot latch the session.
+ * A re-read is *not* by itself a mistake: the placeholder orders one before an
+ * edit, and a file that changed after the clear legitimately needs re-reading.
+ * So a plain re-read only moves the ledger. What the breaker watches is refused
+ * targets — a key the model came back to a second time, after the re-read it was
+ * told to make — and their rate against everything this session cleared. When
+ * most cleared targets had to be refused, clearing is manufacturing tool calls
+ * instead of removing dead weight, and the session stops clearing. A sample
+ * below {@link BREAKER_MIN_REFUSED} is one hot file, not a rate, so it can only
+ * refuse itself.
  */
 function noteRefetch(ctx, state, name, args) {
     if (state.auto.stop !== undefined)
@@ -641,19 +647,22 @@ function noteRefetch(ctx, state, name, args) {
         state.auto.qualityDirty = true;
         // One target that keeps coming back is a mispriced target, not a broken
         // selector. Refuse that key, drop its evidence, and leave the channel open
-        // for every other block; the session-wide latch below is for a rate spread
-        // across several keys.
+        // for every other block; the session-wide latch is for a rate spread across
+        // several keys.
         if (noteKeyReread(state.auto.reread, key)) {
             state.auto.recent = state.auto.recent.filter((entry) => entry.key !== key);
             ctx.logger?.warn?.(`oh-my-clm: not clearing ${key} again this session: it came back ${BREAKER_KEY_REREADS}× after being cleared`);
+            // Refused keys are counted here rather than added up from the re-read
+            // ledger: `rereads` includes the one re-read the placeholder ordered, so
+            // a rate over it fires on compliance. `refused` cannot.
+            const total = Math.max(state.auto.clearedTotal, 1);
+            const refused = state.auto.reread.refused.size;
+            if (refused < BREAKER_MIN_REFUSED || refused * 2 < total)
+                return;
+            state.auto.stop = "breaker";
+            ctx.logger?.warn?.(`oh-my-clm: clearing stopped for this session: ${refused} of ${total} cleared target(s) had to be refused after re-reads`);
             return;
         }
-        const total = Math.max(state.auto.clearedTotal, 1);
-        if (state.auto.rereads < BREAKER_MIN_REREADS || state.auto.rereads * 2 < total)
-            continue;
-        state.auto.stop = "breaker";
-        ctx.logger?.warn?.(`oh-my-clm: clearing stopped for this session: ${state.auto.rereads} of ${total} cleared target(s) were re-read within ${BREAKER_WINDOW_RESULTS} tool results`);
-        return;
     }
 }
 /**

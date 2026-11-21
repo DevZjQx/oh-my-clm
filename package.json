@@ -1,6 +1,6 @@
 {
   "name": "oh-my-clm",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "description": "Pi extension + DSH plugin: manual live-context cleanup and automatic, replay-safe tool-result clearing.",
   "icon": "./icon.svg",
   "repository": {
@@ -14,7 +14,6 @@
   "type": "module",
   "files": [
     "README.md",
-    "changelog.md",
     "docs/README.md",
     "docs/features",
     "docs/project-structure.md",
@@ -61,8 +60,7 @@
   "scripts": {
     "test": "node --experimental-strip-types --test \"test/**/*.test.ts\"",
     "build:dsh": "tsc -p tsconfig.dsh.json",
-    "build:dsh:plugin": "node scripts/build-dsh-plugin.mjs",
-    "check": "node scripts/check-docs.mjs && node scripts/check-boundaries.mjs && npm run build:dsh && node --experimental-strip-types --check extensions/clm.ts && node --experimental-strip-types --check src/features/live-context/context-format.ts && node --experimental-strip-types --check src/features/live-context/dsh-bridge.ts && node --check dist/dsh/index.js && node --check scripts/build-dsh-plugin.mjs && node --check scripts/canary-replay.mjs && node scripts/check-dsh-package.mjs",
+    "check": "node scripts/check-docs.mjs && node scripts/check-boundaries.mjs && npm run build:dsh && node --experimental-strip-types --check extensions/clm.ts && node --experimental-strip-types --check src/features/live-context/context-format.ts && node --experimental-strip-types --check src/features/live-context/dsh-bridge.ts && node --check dist/dsh/index.js && node --check scripts/canary-replay.mjs && node scripts/check-dsh-package.mjs",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.dsh.json --noEmit",
     "canary:replay": "node scripts/canary-replay.mjs --all",
     "prepack": "npm run build:dsh"
