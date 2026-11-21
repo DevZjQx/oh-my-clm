@@ -1,6 +1,6 @@
 {
   "name": "oh-my-clm",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "description": "Pi extension + DSH plugin: manual live-context cleanup and automatic, replay-safe tool-result clearing.",
   "icon": "./icon.svg",
   "repository": {
