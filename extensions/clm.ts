@@ -19,6 +19,7 @@ import {
 	mirrorSignature,
 	parseMirror,
 	planContextEdits,
+	renderBlockIndex,
 	renderMirror,
 	rewriteMirrorBlocks,
 	type EditPlanOptions,
@@ -32,7 +33,10 @@ import {
 	formatCleanupToolResult,
 	parseCleanupArgs,
 	parseCleanupMirror,
+	parseCleanupResultCopy,
 	planCleanup,
+	type CleanupPlan,
+	type CleanupResultCopy,
 	type CleanupToolResult,
 } from "../src/features/live-context/context-cleanup.ts";
 import {
@@ -43,7 +47,7 @@ import {
 	renderCleanupCandidates,
 	type CleanupTriggerPlan,
 } from "../src/features/live-context/context-trigger.ts";
-import { loadClmConfig } from "../src/lib/clm-config.ts";
+import { loadClmConfig, projectConfigPath, userConfigPath } from "../src/lib/clm-config.ts";
 import { writePrivateText } from "../src/lib/clm-files.ts";
 import { sessionMirrorPath } from "../src/lib/clm-paths.ts";
 const PROMPT_MARKER = "<pi-clm-live-context>";
@@ -59,8 +63,12 @@ const MAX_NUDGE_ROUNDS = 2;
 
 interface Config {
 	budgetTokens: number;
+	/** Window fallback when the host usage carries no window; 0 = unknown. */
+	windowTokens: number;
 	maxBlockChars: number;
 	maxMirrorChars: number;
+	/** How much of the cleanup result the model reads. */
+	resultMode: CleanupResultCopy;
 	/** `r` in `r·L + (1−r)·B`, as a fraction: the cached-read price ratio. */
 	cacheDiscount: number;
 	/** Future requests (steps) the one-time prefix-break cost is amortised over. */
@@ -71,6 +79,12 @@ interface Config {
 	triggerSince: number;
 	/** toolResult share (0..1) of editable tokens that triggers a nudge. 0 disables. */
 	triggerToolShare: number;
+	/** Usage percentage that fires the nudge; 0 keeps the built-in default. */
+	triggerUsagePercent: number;
+	/** Maximum candidate ranges offered in one nudge payload. */
+	triggerMaxCandidates: number;
+	/** Candidates below this estimated token size are never offered. */
+	triggerMinSavingsTokens: number;
 }
 
 interface MirrorSnapshot {
@@ -91,8 +105,10 @@ function config(ctx: ExtensionContext): Config {
 	const loaded = loadClmConfig(ctx.cwd);
 	return {
 		budgetTokens: loaded.config.context.budgetTokens,
+		windowTokens: loaded.config.context.windowTokens,
 		maxBlockChars: loaded.config.context.maxBlockChars,
 		maxMirrorChars: loaded.config.context.maxMirrorChars,
+		resultMode: parseCleanupResultCopy(loaded.config.cleanup.resultMode),
 		// A percentage in the file, a fraction in the cleanup math. Measured on
 		// deepseek-flash through Pi's own cost table (2026-11-09): input $0.30/M
 		// vs cacheRead $0.006/M. Lower is the fail-safe direction.
@@ -105,7 +121,77 @@ function config(ctx: ExtensionContext): Config {
 		triggerSince: loaded.config.cleanup.trigger.stepsSinceCleanup
 			|| loaded.config.cleanup.trigger.turnsSinceCleanup,
 		triggerToolShare: loaded.config.cleanup.trigger.toolResultSharePercent / 100,
+		triggerUsagePercent: loaded.config.cleanup.trigger.usagePercent,
+		triggerMaxCandidates: loaded.config.cleanup.trigger.maxCandidates,
+		triggerMinSavingsTokens: loaded.config.cleanup.trigger.minSavingsTokens,
 	};
+}
+
+/**
+ * Keys the shared loader parses but this adapter never reads. The loader treats
+ * them as valid, so its own warning channel stays quiet, and a user who sets
+ * `autoClear.enabled: true` sees no change on Pi at all. Until the Pi-side
+ * features land, a session must say so instead of ignoring the keys silently.
+ */
+const PI_IGNORED_CONFIG_KEYS: readonly string[] = [
+	"index.mode",
+	"index.previewChars",
+	"index.headBlocks",
+	"index.tailBlocks",
+	"index.maxLines",
+	"index.refreshSteps",
+	"context.fixedTokens",
+	"cleanup.trigger.completedTurns",
+	"cleanup.trigger.completedSteps",
+	"autoClear.enabled",
+	"autoClear.canary",
+	"autoClear.channel",
+	"autoClear.staleTurns",
+	"autoClear.staleSteps",
+	"autoClear.minAgeSteps",
+	"autoClear.maxAgeSteps",
+	"autoClear.minTokens",
+	"autoClear.minBlocks",
+	"autoClear.minSharePercent",
+	"autoClear.maxSuffixTokens",
+	"autoClear.minNetTokens",
+	"autoClear.stopPercent",
+	"autoClear.midTurnSuffixTokens",
+	"host.pluginRecordModule",
+];
+
+function readConfigDocument(filePath: string): Record<string, unknown> | undefined {
+	const text = readText(filePath);
+	if (text === undefined) return undefined;
+	try {
+		const parsed: unknown = JSON.parse(text);
+		return isRecord(parsed) ? parsed : undefined;
+	} catch {
+		// Invalid JSON is the loader's warning to give; this walk only reports
+		// keys that are both present and parsed.
+		return undefined;
+	}
+}
+
+function hasKeyPath(document: Record<string, unknown> | undefined, parts: readonly string[]): boolean {
+	let node: unknown = document;
+	for (const part of parts) {
+		if (!isRecord(node) || !(part in node)) return false;
+		node = node[part];
+	}
+	return true;
+}
+
+/**
+ * Ignored keys actually set in a config file, in list order. The project file
+ * wins for values, so it is consulted first; either file counts as "set".
+ */
+function ignoredConfigKeys(cwd: string): string[] {
+	const files = [projectConfigPath(cwd), userConfigPath()];
+	return PI_IGNORED_CONFIG_KEYS.filter((key) => {
+		const parts = key.split(".");
+		return files.some((file) => hasKeyPath(readConfigDocument(file), parts));
+	});
 }
 
 function mirrorPath(ctx: ExtensionContext): string {
@@ -135,12 +221,17 @@ function fixedRequestTokens(ctx: ExtensionContext): number {
 /**
  * Exact usage from the Pi host for the estimate + host-cap double check (P1-2).
  * `getContextUsage().tokens` is the whole current request, not an estimate of
- * the editable mirror; fall back to the model's window when the host omits it.
+ * the editable mirror; the window falls back to the configured
+ * `context.windowTokens` and then the model's window when the host omits it.
  */
 function hostUsageOfContext(ctx: ExtensionContext): HostUsage | undefined {
 	const usage = ctx.getContextUsage?.();
 	if (!usage) return undefined;
-	return hostUsageOf({ tokens: usage.tokens, contextWindow: usage.contextWindow ?? ctx.model?.contextWindow });
+	const configuredWindow = config(ctx).windowTokens;
+	const contextWindow = usage.contextWindow
+		?? (configuredWindow > 0 ? configuredWindow : undefined)
+		?? ctx.model?.contextWindow;
+	return hostUsageOf({ tokens: usage.tokens, contextWindow });
 }
 
 function editPlanOptions(ctx: ExtensionContext): EditPlanOptions {
@@ -382,6 +473,26 @@ function rejectedCleanupResult(requestedBlockIds: readonly number[], reason: str
 }
 
 /**
+ * The block index the model should see after this cleanup: removed records are
+ * gone and offloaded bodies are swapped, so the 1-based IDs renumber exactly as
+ * the next canonical render will show them. Pi has no runtime block index, so
+ * a `full` result copy is the only place the model sees the new numbering
+ * without opening the mirror.
+ */
+function refreshedBlockIndex(records: readonly MirrorRecord[], plan: CleanupPlan): string | undefined {
+	if (plan.status !== "applied") return undefined;
+	const omitted = new Set(plan.omittedIds);
+	const bodies = new Map(plan.offloads.map((offload) => [offload.recordId, offload.body] as const));
+	const next = records
+		.filter((record) => !omitted.has(record.id))
+		.map((record) => {
+			const body = bodies.get(record.id);
+			return body === undefined ? record : { ...record, text: body };
+		});
+	return renderBlockIndex(next);
+}
+
+/**
  * The declared output is the tool's model-visible contract, so `details` carries
  * the full result while `structuredContent` carries only declared fields.
  */
@@ -445,6 +556,12 @@ function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolRe
 		parsedArgs.args,
 		{ fixedTokens: fixedRequestTokens(ctx), hostUsage: hostUsageOfContext(ctx) },
 	);
+	// `full` copies the index into the result; `compact`/`none` rely on the next
+	// request's mirror render. The copy mode only shapes the model-visible text,
+	// never the structured record.
+	const copy = settings.resultMode;
+	const indexCopy = (current: readonly MirrorRecord[]): string | undefined =>
+		copy === "full" ? renderBlockIndex(current) : undefined;
 	if (plan.status !== "applied") {
 		if (changedThisStep && /snapshot is stale/.test(plan.reason ?? "")) {
 			return rejectedCleanupResult(
@@ -452,7 +569,7 @@ function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolRe
 				"The mirror was already changed earlier in this step, so it no longer matches the live projection. Do at most one cleanup per step, and run it before any mirror edit.",
 			);
 		}
-		return cleanupToolResult(plan);
+		return cleanupToolResult(plan, indexCopy(records), copy);
 	}
 
 	try {
@@ -480,7 +597,11 @@ function executePiCleanup(params: unknown, ctx: ExtensionContext): CleanupToolRe
 			`Cleanup could not write the live mirror: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
-	return cleanupToolResult(plan);
+	return cleanupToolResult(
+		plan,
+		copy === "full" ? refreshedBlockIndex(records, plan) : undefined,
+		copy,
+	);
 }
 
 /**
@@ -503,18 +624,23 @@ function contextBudgetNudge(
 ): string | undefined {
 	const settings = config(ctx);
 	const hostUsage = hostUsageOfContext(ctx);
-	const hostWindow = hostUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+	const configuredWindow = settings.windowTokens;
+	const hostWindow = hostUsage?.contextWindow
+		?? (configuredWindow > 0 ? configuredWindow : undefined)
+		?? ctx.model?.contextWindow
+		?? 0;
 	if (messages.some((message) => messageText(message).includes(CONTEXT_NUDGE_MARKER))) return undefined;
 	const estimated = fixedRequestTokens(ctx) + messages.reduce<number>((total, message) => total + estimateMessageTokens(message), 0);
 	// Host-exact usage wins over the 3.5 chars/token estimate (P1-2), so the
 	// decision and the rendered line agree.
 	const tokens = hostUsage?.tokens ?? estimated;
-	// The host window is **not** a trigger. Measured on deepseek-flash
+	// The host window is **not** a trigger by default. Measured on deepseek-flash
 	// (2026-11-09): a 1,000,000-token window means "75% of the window" is
 	// unreachable — the session sat at 12% after 84 requests — and a break that
 	// late has already lost the cache game. Pressure is priced only against an
 	// explicit budget; otherwise the trigger is a candidate that pays for its
-	// own prefix break, or the host-independent step/tool-share thresholds.
+	// own prefix break, the host-independent step/tool-share thresholds, or an
+	// explicit `cleanup.trigger.usagePercent`.
 	const budget = settings.budgetTokens;
 	const plan = planCleanupTrigger(records, {
 		usageTokens: tokens,
@@ -528,9 +654,15 @@ function contextBudgetNudge(
 		...(state.lastCleanupStep !== undefined ? { lastCleanupStep: state.lastCleanupStep } : {}),
 		currentStep: state.completedSteps + 1,
 	}, {
-		...(budget > 0 ? { usagePercent: CONTEXT_NUDGE_FRACTION * 100 } : {}),
+		// An explicit config percentage replaces the built-in 75%-of-budget
+		// default; against no budget it prices the host window like DSH does.
+		...(settings.triggerUsagePercent > 0
+			? { usagePercent: settings.triggerUsagePercent }
+			: budget > 0 ? { usagePercent: CONTEXT_NUDGE_FRACTION * 100 } : {}),
 		stepsSinceCleanup: settings.triggerSince,
 		toolResultShare: settings.triggerToolShare,
+		maxCandidates: settings.triggerMaxCandidates,
+		minSavingsTokens: settings.triggerMinSavingsTokens,
 		cacheDiscount: settings.cacheDiscount,
 		paybackTurns: settings.paybackTurns,
 		paybackSteps: settings.paybackSteps,
@@ -540,6 +672,8 @@ function contextBudgetNudge(
 		// No threshold fired, but the candidate half is a trigger of its own: if a
 		// range can pay for the prefix break it causes, that is worth one line.
 		const assembled = assembleCleanupCandidates(records, {
+			maxCandidates: settings.triggerMaxCandidates,
+			minSavingsTokens: settings.triggerMinSavingsTokens,
 			cacheDiscount: settings.cacheDiscount,
 			paybackTurns: settings.paybackTurns,
 			paybackSteps: settings.paybackSteps,
@@ -608,6 +742,12 @@ export default function (pi: ExtensionAPI) {
 		// default, and the user needs to know which line was ignored.
 		for (const warning of loadClmConfig(ctx.cwd).warnings) {
 			notify(ctx, `oh-my-clm config: ${warning}`, "warning");
+		}
+		// The loader cannot warn about these: they are valid keys. Report the set
+		// once per session so "configured on Pi, no effect" is never silent.
+		const ignored = ignoredConfigKeys(ctx.cwd);
+		if (ignored.length > 0) {
+			notify(ctx, `oh-my-clm config: parsed but ignored on Pi (DSH-only): ${ignored.join(", ")}`, "warning");
 		}
 		// A session switch (including `/resume`) does not necessarily trigger a
 		// model request immediately. Rebuild the external mirror here, after Pi

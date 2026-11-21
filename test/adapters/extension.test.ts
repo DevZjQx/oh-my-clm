@@ -1321,6 +1321,432 @@ test("plan §5.6 (calibration): a 1M window with no paying range stays silent", 
 // Case 13: the Pi landing path is the same relay as
 // omission — cleanup rewrites the mirror, then turn_end commits one
 // `context_edit` with replacement content instead of `null`.
+test("cleanup.resultMode none suppresses the success confirmation but not rejections", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-result-mode-none-"));
+	writeConfig(cwd, { cleanup: { resultMode: "none" } });
+	const sessionId = "result-mode-none-session";
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "anchor", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "Anchor block." }] }] },
+			{ sourceEntry: { id: "noise", type: "message" }, messages: [{ role: "user", content: "Stale tool noise." }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const tools = new Map<string, any>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerTool(tool: any) { tools.set(tool.name, tool); },
+		registerCommand: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: false,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: () => undefined },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => sessionId,
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+	const tool = tools.get("cleanup");
+
+	// A rejection must stay actionable in every mode: the model needs the reason
+	// to take a next step, so `none` only suppresses success confirmations.
+	const rejected = await tool.execute("result-mode-none-reject", { blockIds: [99] }, undefined, undefined, ctx);
+	assert.equal(rejected.structuredContent?.status, "rejected");
+	assert.match(rejected.content?.[0]?.text ?? "", /cleanup rejected; Unknown cleanup block ID: 99/);
+
+	const applied = await tool.execute("result-mode-none-apply", { blockIds: [2] }, undefined, undefined, ctx);
+	assert.equal(applied.structuredContent?.status, "applied", "the copy mode must not touch the structured record");
+	assert.deepEqual(applied.structuredContent?.removedBlockIds, [2]);
+	assert.equal(applied.isError, false);
+	assert.equal(applied.content?.[0]?.text, "", "none suppresses the success confirmation");
+	assert.equal(applied.structuredContent?.blockIndex, undefined, "blockIndex is not a declared output field");
+});
+
+test("cleanup.resultMode full attaches the refreshed block index with renumbered IDs", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-result-mode-full-"));
+	writeConfig(cwd, { cleanup: { resultMode: "full" } });
+	const sessionId = "result-mode-full-session";
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "anchor", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "Anchor block." }] }] },
+			{ sourceEntry: { id: "noise-a", type: "message" }, messages: [{ role: "user", content: "First stale noise." }] },
+			{ sourceEntry: { id: "noise-b", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "Second stale noise." }] }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const tools = new Map<string, any>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerTool(tool: any) { tools.set(tool.name, tool); },
+		registerCommand: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: false,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: () => undefined },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => sessionId,
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+
+	const result = await tools.get("cleanup").execute("result-mode-full-1", { blockIds: [2] }, undefined, undefined, ctx);
+	assert.equal(result.structuredContent?.status, "applied");
+	const text = result.content?.[0]?.text ?? "";
+	assert.match(text, /cleanup applied; removed 1 block\(s\): 2\./);
+	assert.match(text, /<oh-my-clm-block-index>/, "full attaches the refreshed index");
+	// IDs renumber after the removal: the survivor of block 3 is now block 2.
+	assert.match(text, /2\. assistant: Second stale noise\./);
+	assert.doesNotMatch(text, /First stale noise/);
+	assert.equal(result.structuredContent?.blockIndex, undefined, "blockIndex is not a declared output field");
+});
+
+test("context.windowTokens fills in the window the Pi host omits", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-window-tokens-"));
+	writeConfig(cwd, { context: { windowTokens: 1_000_000 } });
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "u1", type: "message" }, messages: [{ role: "user", content: "First request." }] },
+			{ sourceEntry: { id: "a1", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: `First answer: ${"A".repeat(4_000)}` }] }] },
+			{ sourceEntry: { id: "u2", type: "message" }, messages: [{ role: "user", content: "Second request." }] },
+			{ sourceEntry: { id: "a2", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: `Second answer: ${"B".repeat(4_000)}` }] }] },
+			{ sourceEntry: { id: "u3", type: "message" }, messages: [{ role: "user", content: "The current request." }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerCommand: () => undefined,
+		registerTool: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: false,
+		mode: "print",
+		model: undefined,
+		// The host reports exact tokens but no window; the config supplies it.
+		getContextUsage: () => ({ tokens: 119_494 }),
+		ui: { notify: () => undefined },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => "window-tokens-nudge",
+		},
+	};
+	await handlers.get("session_start")?.({}, ctx);
+	const messages = [
+		{ role: "user", content: "First request." },
+		{ role: "assistant", content: `First answer: ${"A".repeat(4_000)}` },
+		{ role: "user", content: "Second request." },
+		{ role: "assistant", content: `Second answer: ${"B".repeat(4_000)}` },
+		{ role: "user", content: "The current request." },
+	];
+	const result = await handlers.get("context")?.({ messages }, ctx) as
+		{ messages?: Array<{ role: string; content: string }> } | undefined;
+	const nudgeText = result?.messages?.at(-1)?.content ?? "";
+	assert.match(nudgeText, /<pi-clm-budget-nudge>/);
+	// The usage line shows the configured window instead of "window unknown".
+	assert.match(nudgeText, /119k\/1000k tokens \(12%\)/);
+	assert.doesNotMatch(nudgeText, /window unknown/);
+});
+
+test("context.windowTokens reaches the shrink gate's host calibration", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-window-gate-"));
+	writeConfig(cwd, { context: { windowTokens: 1_000 } });
+	const sessionId = "window-gate-session";
+	const anchorBody = "A".repeat(700);
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "anchor", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: anchorBody }] }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const notifications: Array<{ message: string; type?: string }> = [];
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerCommand: () => undefined,
+		registerTool: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: true,
+		mode: "print",
+		model: undefined,
+		// Exact tokens, no window: without the configured window the host
+		// calibration is dropped and the edit is judged by the estimate alone.
+		getContextUsage: () => ({ tokens: 1_000 }),
+		ui: { notify: (message: string, type?: string) => { notifications.push({ message, type }); } },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => sessionId,
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+	const mirrorPath = sessionMirrorPath(sessionId);
+	const mirror = fs.readFileSync(mirrorPath, "utf8");
+	// Shrink by ~23 tokens: past the strict-shrink gate, but still inside the
+	// 5% headroom band, where the host-calibrated gate warns instead of passing
+	// silently.
+	fs.writeFileSync(mirrorPath, mirror.replace(anchorBody, "A".repeat(620)), "utf8");
+
+	const turnEnd = await handlers.get("turn_end")?.({ entries: [] }, ctx) as { entries: Array<Record<string, unknown>> };
+	assert.ok(turnEnd.entries.some((entry) => entry.type === "context_edit" && entry.targetId === "anchor"));
+	// The calibrated baseline is the host's exact usage against the configured
+	// window; a shrink that lands inside the headroom band is accepted but warns.
+	const warning = notifications.map((entry) => entry.message).join("\n");
+	assert.match(warning, /~1000\/1000 tokens, already at the window/);
+});
+
+test("cleanup.trigger.usagePercent sets the Pi budget-nudge threshold", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-trigger-usage-"));
+	writeConfig(cwd, { context: { budgetTokens: 1_000 }, cleanup: { trigger: { usagePercent: 50 } } });
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "answer", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "An answer." }] }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerCommand: () => undefined,
+		registerTool: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: false,
+		mode: "print",
+		model: { contextWindow: 100_000 },
+		// 60% of the 1k budget: under the built-in 75%, over the configured 50%.
+		getContextUsage: () => ({ tokens: 600, contextWindow: 100_000, percent: 0.6 }),
+		ui: { notify: () => undefined },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => "trigger-usage-session",
+		},
+	};
+	await handlers.get("session_start")?.({}, ctx);
+	const result = await handlers.get("context")?.({ messages: [{ role: "user", content: "hello" }] }, ctx) as
+		{ messages?: Array<{ role: string; content: string }> } | undefined;
+	const nudgeText = result?.messages?.at(-1)?.content ?? "";
+	assert.match(nudgeText, /<pi-clm-budget-nudge>/, "the configured usage threshold must fire the nudge");
+	// The budget is the operative target, so the line is priced against it.
+	assert.match(nudgeText, /600\/1k tokens \(60%\)/);
+});
+
+test("cleanup.trigger.maxCandidates caps the Pi nudge payload", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-trigger-candidates-"));
+	writeConfig(cwd, { cleanup: { trigger: { maxCandidates: 1 } } });
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "u1", type: "message" }, messages: [{ role: "user", content: "First request." }] },
+			{ sourceEntry: { id: "a1", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: `First answer: ${"A".repeat(4_000)}` }] }] },
+			{ sourceEntry: { id: "u2", type: "message" }, messages: [{ role: "user", content: "Second request." }] },
+			{ sourceEntry: { id: "a2", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: `Second answer: ${"B".repeat(40_000)}` }] }] },
+			{ sourceEntry: { id: "u3", type: "message" }, messages: [{ role: "user", content: "Third request." }] },
+			{ sourceEntry: { id: "a3", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: `Third answer: ${"C".repeat(4_000)}` }] }] },
+			{ sourceEntry: { id: "u4", type: "message" }, messages: [{ role: "user", content: "The current request." }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerCommand: () => undefined,
+		registerTool: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: false,
+		mode: "print",
+		model: { contextWindow: 1_000_000 },
+		getContextUsage: () => ({ tokens: 119_494, contextWindow: 1_000_000, percent: 12 }),
+		ui: { notify: () => undefined },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => "trigger-candidates-session",
+		},
+	};
+	await handlers.get("session_start")?.({}, ctx);
+	const result = await handlers.get("context")?.({ messages: [{ role: "user", content: "hello" }] }, ctx) as
+		{ messages?: Array<{ role: string; content: string }> } | undefined;
+	const nudgeText = result?.messages?.at(-1)?.content ?? "";
+	assert.match(nudgeText, /<pi-clm-budget-nudge>/);
+	assert.match(nudgeText, /cleanup\(\{ ranges: \["\d+-\d+"\], skipRoles: \["user"\] \}\)/, "at most one candidate range");
+	assert.doesNotMatch(nudgeText, /ranges: \["\d+-\d+", "/);
+});
+
+test("cleanup.trigger.minSavingsTokens drops small candidates from the Pi nudge", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-trigger-savings-"));
+	writeConfig(cwd, { cleanup: { trigger: { minSavingsTokens: 100_000 } } });
+	const projection = {
+		entries: [
+			{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the task." }] },
+			{ sourceEntry: { id: "u1", type: "message" }, messages: [{ role: "user", content: "First request." }] },
+			{ sourceEntry: { id: "a1", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: `First answer: ${"A".repeat(4_000)}` }] }] },
+			{ sourceEntry: { id: "u2", type: "message" }, messages: [{ role: "user", content: "Second request." }] },
+			{ sourceEntry: { id: "a2", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: `Second answer: ${"B".repeat(4_000)}` }] }] },
+			{ sourceEntry: { id: "u3", type: "message" }, messages: [{ role: "user", content: "The current request." }] },
+		],
+		messages: [],
+	};
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerCommand: () => undefined,
+		registerTool: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: false,
+		mode: "print",
+		model: { contextWindow: 1_000_000 },
+		getContextUsage: () => ({ tokens: 119_494, contextWindow: 1_000_000, percent: 12 }),
+		ui: { notify: () => undefined },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => projection.entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => "trigger-savings-session",
+		},
+	};
+	await handlers.get("session_start")?.({}, ctx);
+	const result = await handlers.get("context")?.({ messages: [{ role: "user", content: "hello" }] }, ctx) as
+		{ messages?: Array<{ role: string; content: string }> } | undefined;
+	assert.equal(result, undefined, "a candidate below the savings floor means nothing to confirm");
+});
+
+test("session_start warns about config keys Pi parses but ignores", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-ignored-keys-"));
+	writeConfig(cwd, {
+		autoClear: { enabled: true, canary: true },
+		index: { mode: "blocks" },
+		context: { fixedTokens: 10 },
+	});
+	const notifications: Array<{ message: string; type?: string }> = [];
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerCommand: () => undefined,
+		registerTool: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: true,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: (message: string, type?: string) => { notifications.push({ message, type }); } },
+		sessionManager: {
+			buildSessionProjection: () => ({ entries: [], messages: [] }),
+			getBranch: () => [],
+			getSessionId: () => "ignored-keys-session",
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	const warnings = notifications.filter((entry) => entry.type === "warning" && /ignored on Pi/.test(entry.message));
+	assert.equal(warnings.length, 1, "one grouped warning, not one per key");
+	const message = warnings[0]?.message ?? "";
+	for (const key of ["autoClear.enabled", "autoClear.canary", "index.mode", "context.fixedTokens"]) {
+		assert.ok(message.includes(key), `the warning must name ${key}: ${message}`);
+	}
+	assert.doesNotMatch(message, /budgetTokens/, "keys Pi reads are not reported");
+});
+
+test("a config Pi fully reads raises no ignored-key warning", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-read-keys-"));
+	writeConfig(cwd, { context: { budgetTokens: 500 }, cleanup: { trigger: { usagePercent: 40 } } });
+	const notifications: Array<{ message: string; type?: string }> = [];
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerCommand: () => undefined,
+		registerTool: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: true,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: (message: string, type?: string) => { notifications.push({ message, type }); } },
+		sessionManager: {
+			buildSessionProjection: () => ({ entries: [], messages: [] }),
+			getBranch: () => [],
+			getSessionId: () => "read-keys-session",
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	assert.equal(notifications.length, 0, "no warning when every set key is read");
+});
+
 test("plan §5.4 (case 13, Pi): offload rewrites the mirror body and commits a replace edit", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-offload-"));
 	const sessionId = "offload-session";

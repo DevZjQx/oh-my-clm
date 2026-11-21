@@ -69,7 +69,7 @@ DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程切换索引形状并清
 
 ## 结果模式
 
-`cleanup.resultMode` 只在 DSH host bridge 中读取；Pi 侧固定 `compact` 语义。
+`cleanup.resultMode` 由两个宿主共享：Pi 在 `cleanupToolResponse` 上应用同一个 `parseCleanupResultCopy`，DSH 在 host bridge 里读同一个配置值。
 
 | 值 | 行为 |
 | --- | --- |
@@ -81,9 +81,9 @@ DSH 的 `/clm mode [blocks|digest|auto]` 在当前进程切换索引形状并清
 
 ## 配置
 
-索引开关 `index.mode` / `previewChars` / `headBlocks` / `tailBlocks` / `maxLines` / `refreshSteps`、`cleanup.resultMode` 与清理触发阈值的默认值统一列在根 [README](../../README.md#配置)。Pi 侧没有 block index。
+索引开关 `index.mode` / `previewChars` / `headBlocks` / `tailBlocks` / `maxLines` / `refreshSteps`、`cleanup.resultMode` 与清理触发阈值的默认值统一列在根 [README](../../README.md#配置)。Pi 侧没有运行时 block index；`cleanup.resultMode: full` 会把刷新后的索引附在工具结果里。
 
 ## 宿主差异
 
-- **Pi**：通过 `registerTool` 注册；参数校验与删除计划用共享 `parseCleanupArgs` / `planCleanup`。工具执行时写 mirror，持久化仍由随后的 `turn_end` 生成 branch-local `context_edit`。若磁盘内容仍等于上次渲染文本，工具后会重新同步；存在未提交编辑时保持 stale 拒绝。
+- **Pi**：通过 `registerTool` 注册；参数校验与删除计划用共享 `parseCleanupArgs` / `planCleanup`；结果文本按 `cleanup.resultMode` 裁剪。工具执行时写 mirror，持久化仍由随后的 `turn_end` 生成 branch-local `context_edit`。若磁盘内容仍等于上次渲染文本，工具后会重新同步；存在未提交编辑时保持 stale 拒绝。
 - **DSH**：直接基于当前 `Session` 的 canonical records 按 ID 执行，不读 mirror；删除通过 `Session.append()` 的 surface replacement 落入 active surface，并在工具返回前写完新的 canonical mirror。细节见 [dsh-surface-bridge.md](./dsh-surface-bridge.md)。

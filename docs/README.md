@@ -11,6 +11,10 @@
 - [DSH surface bridge](./features/dsh-surface-bridge.md)：Cordis 生命周期、`Session.append()` replacement、打包与未验证边界。
 - [自动清理](./features/auto-clear.md)：`autoClear.canary` / `autoClear.enabled`、选择器与闸门摘要、熔断、离线重放。
 
+## 评估
+
+- [Pi 插件功能差距](./pi-extension-gaps.md)：Pi 侧缺哪些功能、哪些可以补、明确不补的边界。
+
 ## 工程
 
 - [项目结构](./project-structure.md)：分层、单向依赖、测试布局与生成物。

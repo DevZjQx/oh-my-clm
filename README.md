@@ -113,18 +113,18 @@ mirror 只是编辑面：原始 session JSONL / DSH session log 是事实来源�
 | `index.tailBlocks` | `40` | 列表尾部窗口宽度。 |
 | `index.maxLines` | `40` | `digest` 模式最多列出的 turn 数。 |
 | `index.refreshSteps` | `4` | 同一 turn 内最多每几步重渲染一次；`1` 为每步刷新。 |
-| `cleanup.resultMode` | `compact` | DSH 结果模式：`compact` / `full` / `none`。 |
+| `cleanup.resultMode` | `compact` | 结果模式：`compact` / `full` / `none`；两个宿主都读，`full` 把刷新后的 block index 附在工具结果里。 |
 | `cleanup.cacheDiscountPercent` | `2` | 缓存命中价占全价的百分比（`2` = 1/50），即候选成本公式中的 `r`。 |
 | `cleanup.paybackTurns` | `10` | 断点成本摊到**多少次后续请求**（一次请求 = 一步），即公式中的 `N`。按轮理解会高估成本。 |
 | `cleanup.paybackSteps` | `0` | 显式请求数（horizon），覆盖 `paybackTurns`；`0` = 不设。 |
-| `cleanup.trigger.usagePercent` | `0` | 用量达到窗口百分比时触发候选；`0` 关闭。 |
-| `cleanup.trigger.completedTurns` | `0` | 已完成 turn 数达到该值时触发。turn 比 step 粗，优先用 `completedSteps`。 |
-| `cleanup.trigger.completedSteps` | `0` | 已完成 step（请求）数达到该值时触发。 |
+| `cleanup.trigger.usagePercent` | `0` | 用量达到窗口百分比时触发候选；`0` 关闭。Pi 用它覆盖 budget nudge 内置的 75% 阈值。 |
+| `cleanup.trigger.completedTurns` | `0` | 已完成 turn 数达到该值时触发（仅 DSH）。turn 比 step 粗，优先用 `completedSteps`。 |
+| `cleanup.trigger.completedSteps` | `0` | 已完成 step（请求）数达到该值时触发（仅 DSH）。 |
 | `cleanup.trigger.toolResultSharePercent` | `0` | toolResult 占可编辑 token 的百分比达到该值时触发。 |
 | `cleanup.trigger.turnsSinceCleanup` | `0` | 距上次成功清理的 turn 数达到该值时触发。 |
 | `cleanup.trigger.stepsSinceCleanup` | `0` | 距上次成功清理的 step 数达到该值时触发。 |
-| `cleanup.trigger.maxCandidates` | `3` | 一次触发最多给出的候选区间数。 |
-| `cleanup.trigger.minSavingsTokens` | `0` | 小于该估算 token 的 turn 不作为候选。 |
+| `cleanup.trigger.maxCandidates` | `3` | 一次触发最多给出的候选区间数；Pi 的 budget nudge 同样遵守。 |
+| `cleanup.trigger.minSavingsTokens` | `0` | 小于该估算 token 的 turn 不作为候选；Pi 的 budget nudge 同样遵守。 |
 | `autoClear.enabled` | `false` | 真正清理：把被取代或已老化的可重取 tool result 换成重取指针。 |
 | `autoClear.canary` | `false` | 只记录自动清理决策到 `CANARY.jsonl`，不改模型输入。 |
 | `autoClear.staleTurns` | `3` | 一个正文全可重取的块过期多少 turn 后按 rot 清理，不再要求被取代；`0` 关闭 turn 时钟。 |
@@ -143,7 +143,9 @@ mirror 只是编辑面：原始 session JSONL / DSH session log 是事实来源�
 
 自动清理的记录必须是宿主可忽略的 plugin record，所以它需要宿主提供 `appendPluginRecord`（`@deepseek-ai/dsh-session` ≥ 0.2.2-rc.1）。插件目录解析不到宿主包，所以解析器会再从宿主入口（`process.argv[1]`，即 `dsh/lib/bin.js`）和全局模块根兜底；解析出的模块必须是会话所用的同一份 `dsh-session`（否则私有字段写入会失败），导出 `Session` 时会在写入前比对原型。仍然解析不到时插件不会退回 `session.append()`（那会让含记录的会话在重启后被宿主拒绝恢复），而是保持关闭：会话创建时 warn 一次，`/clm` 显示 `stopped (unrecordable)`。`autoClear.canary` 只写 `/tmp/clm-<session>/CANARY.jsonl`，不需要该 seam。
 
-所有触发阈值默认关闭（`0`）。命中后只在该 turn 边界装配一次用量行和候选；候选只取已完成的 turn，按断点后的净收益排序，并固定带 `skipRoles: ["user"]`。Pi 侧另认 `cleanup.trigger.stepsSinceCleanup`（回退 `turnsSinceCleanup`）与 `cleanup.trigger.toolResultSharePercent`，预算 nudge 与 DSH 共用同一套用量行/候选格式。
+所有触发阈值默认关闭（`0`）。命中后只在该 turn 边界装配一次用量行和候选；候选只取已完成的 turn，按断点后的净收益排序，并固定带 `skipRoles: ["user"]`。Pi 侧另认 `cleanup.trigger.stepsSinceCleanup`（回退 `turnsSinceCleanup`）、`toolResultSharePercent`、`usagePercent`（覆盖 budget nudge 内置的 75%）、`maxCandidates` 与 `minSavingsTokens`，预算 nudge 与 DSH 共用同一套用量行/候选格式；`completedTurns` / `completedSteps` 两个阈值仅 DSH 读取。
+
+Pi 会话启动时会对 Pi 不读的 key（`index.*`、`autoClear.*`、`context.fixedTokens`、`host.pluginRecordModule` 及上述两个阈值）发一条 warning；这些 key 在 DSH 侧照常生效。
 
 **计数单位**：陈旧度信号（`completedSteps` / `stepsSinceCleanup` / 候选的 `stepsOld` / 摊销 `N`）按 step 计；批次结算、闸门和候选区间仍按 turn，因为一次断点必须摊到多个块上。度量依据见 `src/features/live-context/auto-clear.ts`。
 
