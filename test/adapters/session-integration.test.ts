@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import extension from "../../extensions/clm.ts";
+
+// The loader also reads a user-level config from the ambient home directory, and
+// these tests turn the clearing channel on from their own project config. Pin
+// that root before any test runs: the suite's outcome must not depend on the
+// machine it runs on. (This is a file-location seam, not a plugin switch.)
+process.env.XDG_CONFIG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-user-config-"));
 
 function user(content: string): Record<string, unknown> {
 	return { role: "user", content, timestamp: Date.now() };
@@ -48,7 +57,10 @@ function assistantWithToolCall(text: string, toolCallId: string, toolPath: strin
  * replayed boundary clears nothing again.
  */
 test("Pi auto-clear replaces a superseded read in the projection and keeps the log's original", async () => {
-	const session = SessionManager.inMemory("/tmp/oh-my-clm-autoclear");
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-autoclear-"));
+	// The channel ships off; this session turns it on where the loader looks.
+	fs.writeFileSync(path.join(cwd, ".oh-my-clm.json"), JSON.stringify({ autoClear: { enabled: true } }), "utf8");
+	const session = SessionManager.inMemory(cwd);
 	const heavy = (fill: string) => `const data = "${fill.repeat(6000)}";`;
 	const taskId = session.appendMessage(user("Keep the task constraints.") as any);
 	const assistantId = session.appendMessage(assistantWithToolCall("Inspecting.", "call-1", "src/big.ts") as any);
@@ -64,7 +76,7 @@ test("Pi auto-clear replaces a superseded read in the projection and keeps the l
 		registerTool: () => undefined,
 	} as any);
 	const ctx = {
-		cwd: "/tmp/oh-my-clm-autoclear",
+		cwd,
 		hasUI: false,
 		mode: "print",
 		model: undefined,
