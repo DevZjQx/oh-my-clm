@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { sessionMirrorPath } from "../../src/lib/clm-paths.ts";
+import { sessionCanaryPath, sessionMirrorPath } from "../../src/lib/clm-paths.ts";
 import extension from "../../extensions/clm.ts";
 
 /** Write the project config the extension reads for this session's cwd. */
@@ -1676,9 +1676,10 @@ test("cleanup.trigger.minSavingsTokens drops small candidates from the Pi nudge"
 test("session_start warns about config keys Pi parses but ignores", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-ignored-keys-"));
 	writeConfig(cwd, {
-		autoClear: { enabled: true, canary: true },
+		autoClear: { enabled: true, canary: true, midTurnSuffixTokens: 500 },
 		index: { mode: "blocks" },
 		context: { fixedTokens: 10 },
+		host: { pluginRecordModule: "@deepseek-ai/dsh-session" },
 	});
 	const notifications: Array<{ message: string; type?: string }> = [];
 	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
@@ -1709,15 +1710,21 @@ test("session_start warns about config keys Pi parses but ignores", async () => 
 	const warnings = notifications.filter((entry) => entry.type === "warning" && /ignored on Pi/.test(entry.message));
 	assert.equal(warnings.length, 1, "one grouped warning, not one per key");
 	const message = warnings[0]?.message ?? "";
-	for (const key of ["autoClear.enabled", "autoClear.canary", "index.mode", "context.fixedTokens"]) {
+	for (const key of ["autoClear.midTurnSuffixTokens", "index.mode", "context.fixedTokens", "host.pluginRecordModule"]) {
 		assert.ok(message.includes(key), `the warning must name ${key}: ${message}`);
 	}
-	assert.doesNotMatch(message, /budgetTokens/, "keys Pi reads are not reported");
+	for (const key of ["autoClear.enabled", "autoClear.canary", "budgetTokens"]) {
+		assert.doesNotMatch(message, new RegExp(key.replace(/\./g, "\\.")), "keys Pi reads are not reported");
+	}
 });
 
 test("a config Pi fully reads raises no ignored-key warning", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-read-keys-"));
-	writeConfig(cwd, { context: { budgetTokens: 500 }, cleanup: { trigger: { usagePercent: 40 } } });
+	writeConfig(cwd, {
+		context: { budgetTokens: 500 },
+		cleanup: { trigger: { usagePercent: 40 } },
+		autoClear: { enabled: true, canary: true, staleTurns: 3, stopPercent: 60 },
+	});
 	const notifications: Array<{ message: string; type?: string }> = [];
 	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
 	const api = {
@@ -1803,4 +1810,330 @@ test("plan §5.4 (case 13, Pi): offload rewrites the mirror body and commits a r
 	const edit = turnEnd.entries.find((entry) => entry.type === "context_edit" && entry.targetId === "noise");
 	assert.ok(edit, "an offload must commit a context edit, not leave the mirror only");
 	assert.deepEqual(edit?.replacement, { content: [{ type: "text", text: "[offloaded: Old failure: fixed in 0.1.13.]" }] });
+});
+
+/** A tool result body heavy enough to pass the volume gate on its own (~1.7k tokens). */
+function heavyToolBody(fill: string): string {
+	return `const data = "${fill.repeat(6000)}";`;
+}
+
+interface AutoReadEntry {
+	sourceEntry: { id: string; type: string };
+	messages: Array<Record<string, unknown>>;
+}
+
+/** task → assistant(call) → result → anchor → assistant(call) → result, in mirror order. */
+function supersededReadEntries(body1: string, body2: string): AutoReadEntry[] {
+	return [
+		{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the repository task." }] },
+		{
+			sourceEntry: { id: "assistant-1", type: "message" },
+			messages: [{
+				role: "assistant",
+				content: [
+					{ type: "text", text: "Inspecting the file." },
+					{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "src/big.ts" } },
+				],
+			}],
+		},
+		{
+			sourceEntry: { id: "tool-1", type: "message" },
+			messages: [{ role: "toolResult", toolCallId: "call-1", content: [{ type: "text", text: body1 }], isError: false }],
+		},
+		{ sourceEntry: { id: "anchor", type: "message" }, messages: [{ role: "assistant", content: [{ type: "text", text: "Anchor body." }] }] },
+		{
+			sourceEntry: { id: "assistant-2", type: "message" },
+			messages: [{
+				role: "assistant",
+				content: [
+					{ type: "text", text: "Reading it again." },
+					{ type: "toolCall", id: "call-2", name: "read", arguments: { path: "src/big.ts" } },
+				],
+			}],
+		},
+		{
+			sourceEntry: { id: "tool-2", type: "message" },
+			messages: [{ role: "toolResult", toolCallId: "call-2", content: [{ type: "text", text: body2 }], isError: false }],
+		},
+	];
+}
+
+interface AutoClearHarness {
+	handlers: Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>;
+	ctx: any;
+	entries: AutoReadEntry[];
+	notifications: Array<{ message: string; type?: string }>;
+}
+
+function autoClearHarness(cwd: string, sessionId: string, entries: AutoReadEntry[], usage?: unknown): AutoClearHarness {
+	const projection = { entries, messages: [] as unknown[] };
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const notifications: Array<{ message: string; type?: string }> = [];
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerCommand: () => undefined,
+		registerTool: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: true,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => usage ?? { tokens: 4_000, contextWindow: 100_000, percent: 4 },
+		ui: { notify: (message: string, type?: string) => { notifications.push({ message, type }); } },
+		sessionManager: {
+			buildSessionProjection: () => projection,
+			getBranch: () => entries.map((entry) => entry.sourceEntry),
+			getSessionId: () => sessionId,
+		},
+	};
+	return { handlers, ctx, entries, notifications };
+}
+
+/** The step whose assistant message re-read the target and carried its result. */
+function reReadEvent(entries: AutoReadEntry[], assistantId: string, resultEntryId: string): Record<string, unknown> {
+	const assistant = entries.find((entry) => entry.sourceEntry.id === assistantId);
+	const result = entries.find((entry) => entry.sourceEntry.id === resultEntryId);
+	return {
+		entries: [],
+		turnIndex: 0,
+		message: assistant?.messages[0],
+		toolResults: [result?.messages[0]],
+		messageEntryId: assistantId,
+		toolResultEntryIds: [resultEntryId],
+	};
+}
+
+test("autoClear.enabled replaces a superseded read result with a re-read pointer at turn_end", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-autoclear-"));
+	writeConfig(cwd, { autoClear: { enabled: true } });
+	const body1 = heavyToolBody("x");
+	const body2 = heavyToolBody("y");
+	const entries = supersededReadEntries(body1, body2);
+	const h = autoClearHarness(cwd, path.basename(cwd), entries);
+	await h.handlers.get("session_start")?.({}, h.ctx);
+	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+
+	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	const event = reReadEvent(entries, "assistant-2", "tool-2");
+	const result = await h.handlers.get("turn_end")?.(event, h.ctx) as { entries: Array<Record<string, unknown>> } | undefined;
+	assert.ok(result, "the boundary returns entries");
+	const edits = result.entries.filter((entry) => entry.type === "context_edit");
+	assert.equal(edits.length, 1, "only the dead read result is cleared");
+	const edit = edits[0];
+	assert.equal(edit.targetId, "tool-1");
+	const pointer = (edit.replacement as { content: Array<{ text: string }> }).content[0]?.text ?? "";
+	assert.match(pointer, /^\[cleared \d[\d.]*k? tok · read src\/big\.ts · re-read before editing\]$/);
+	assert.ok(pointer.length < body1.length, "the pointer is shorter than the body it replaces");
+	assert.equal(result.entries.some((entry) => entry.targetId === "tool-2"), false, "the live read result stays");
+});
+
+test("autoClear.canary records the decision without changing model input", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-autoclear-canary-"));
+	writeConfig(cwd, { autoClear: { canary: true } });
+	const entries = supersededReadEntries(heavyToolBody("x"), heavyToolBody("y"));
+	const h = autoClearHarness(cwd, path.basename(cwd), entries);
+	await h.handlers.get("session_start")?.({}, h.ctx);
+	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+	const mirrorPath = sessionMirrorPath(path.basename(cwd));
+	const before = fs.readFileSync(mirrorPath, "utf8");
+
+	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	const event = reReadEvent(entries, "assistant-2", "tool-2");
+	const result = await h.handlers.get("turn_end")?.(event, h.ctx);
+	assert.equal(result, undefined, "canary mode emits no boundary entries");
+	assert.equal(fs.readFileSync(mirrorPath, "utf8"), before, "the model-visible mirror is byte-identical");
+
+	const lines = fs.readFileSync(sessionCanaryPath(path.basename(cwd)), "utf8").trim().split("\n");
+	assert.equal(lines.length, 2, "one ledger line per boundary, including the empty one");
+	assert.equal(JSON.parse(lines[0]).outcome, "no-candidate", "an empty boundary is a decision too");
+	const record = JSON.parse(lines[1]);
+	assert.equal(record.outcome, "canary");
+	assert.equal(record.gate, true);
+	assert.equal(record.candidates.length, 1);
+	assert.equal(record.candidates[0].blockId, "tool-1");
+	assert.equal(record.candidates[0].reason, "superseded");
+	assert.equal(record.candidates[0].keys[0], "read\u0000src/big.ts");
+});
+
+test("a replayed boundary does not clear an already-cleared block again", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-autoclear-replay-"));
+	writeConfig(cwd, { autoClear: { enabled: true } });
+	const entries = supersededReadEntries(heavyToolBody("x"), heavyToolBody("y"));
+	const h = autoClearHarness(cwd, path.basename(cwd), entries);
+	await h.handlers.get("session_start")?.({}, h.ctx);
+	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+
+	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	const event = reReadEvent(entries, "assistant-2", "tool-2");
+	const first = await h.handlers.get("turn_end")?.(event, h.ctx) as { entries: Array<Record<string, unknown>> };
+	const edit = first.entries.find((entry) => entry.type === "context_edit" && entry.targetId === "tool-1");
+	assert.ok(edit, "the first boundary clears the dead read");
+	const pointer = (edit.replacement as { content: Array<{ text: string }> }).content[0]?.text ?? "";
+
+	// The host applies the draft to the projection; the next request re-syncs the
+	// mirror from it. Replaying the same boundary must then be a no-op.
+	(entries[2].messages[0].content as unknown[]) = [{ type: "text", text: pointer }];
+	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+	assert.match(fs.readFileSync(sessionMirrorPath(path.basename(cwd)), "utf8"), /\[cleared /);
+
+	// The next boundary carries no new traffic: the retired block must stay
+	// retired and the pointer must stay in the mirror.
+	const second = await h.handlers.get("turn_end")?.({ entries: [] }, h.ctx) as { entries: Array<Record<string, unknown>> } | undefined;
+	assert.equal((second?.entries ?? []).length, 0, "the second boundary must not clear the block again");
+	assert.match(fs.readFileSync(sessionMirrorPath(path.basename(cwd)), "utf8"), /\[cleared /);
+});
+
+test("an uncommitted mirror edit defers auto-clear to the next boundary", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-autoclear-manual-"));
+	writeConfig(cwd, { autoClear: { enabled: true } });
+	const entries = supersededReadEntries(heavyToolBody("x"), heavyToolBody("y"));
+	const h = autoClearHarness(cwd, path.basename(cwd), entries);
+	await h.handlers.get("session_start")?.({}, h.ctx);
+	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+	const mirrorPath = sessionMirrorPath(path.basename(cwd));
+	const mirror = fs.readFileSync(mirrorPath, "utf8");
+	fs.writeFileSync(mirrorPath, mirror.replace("Anchor body.", "Anchor."));
+
+	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	const event = reReadEvent(entries, "assistant-2", "tool-2");
+	const result = await h.handlers.get("turn_end")?.(event, h.ctx) as { entries: Array<Record<string, unknown>> };
+	assert.ok(result.entries.some((entry) => entry.type === "context_edit" && entry.targetId === "anchor"), "the manual edit still commits");
+	assert.equal(
+		result.entries.some((entry) => entry.targetId === "tool-1"),
+		false,
+		"a boundary with an uncommitted manual edit does not clear anything",
+	);
+	assert.doesNotMatch(fs.readFileSync(mirrorPath, "utf8"), /\[cleared /);
+});
+
+test("autoClear.enabled clears an old all-refetchable block without a superseder", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-autoclear-stale-"));
+	writeConfig(cwd, { autoClear: { enabled: true } });
+	const body = heavyToolBody("x");
+	const entries: AutoReadEntry[] = [
+		{ sourceEntry: { id: "task", type: "message" }, messages: [{ role: "user", content: "Keep the repository task." }] },
+		{
+			sourceEntry: { id: "assistant-1", type: "message" },
+			messages: [{
+				role: "assistant",
+				content: [
+					{ type: "text", text: "Inspecting the file." },
+					{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "src/old.ts" } },
+				],
+			}],
+		},
+		{ sourceEntry: { id: "tool-1", type: "message" }, messages: [{ role: "toolResult", toolCallId: "call-1", content: [{ type: "text", text: body }], isError: false }] },
+	];
+	const h = autoClearHarness(cwd, path.basename(cwd), entries);
+	await h.handlers.get("session_start")?.({}, h.ctx);
+	await h.handlers.get("agent_start")?.({}, h.ctx);
+	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+	const landed = await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	assert.equal(landed, undefined, "a fresh block is not rot yet");
+
+	await h.handlers.get("agent_start")?.({}, h.ctx);
+	await h.handlers.get("agent_start")?.({}, h.ctx);
+	await h.handlers.get("agent_start")?.({}, h.ctx);
+	const result = await h.handlers.get("turn_end")?.({ entries: [] }, h.ctx) as { entries: Array<Record<string, unknown>> } | undefined;
+	assert.ok(result, "the aged boundary returns entries");
+	const edits = result.entries.filter((entry) => entry.type === "context_edit");
+	assert.equal(edits.length, 1, "the old all-refetchable block is cleared without a superseder");
+	assert.equal(edits[0].targetId, "tool-1");
+	const pointer = (edits[0].replacement as { content: Array<{ text: string }> }).content[0]?.text ?? "";
+	assert.match(pointer, /^\[cleared .* · read src\/old\.ts · re-read before editing\]$/);
+});
+
+test("autoClear stops at the occupancy line and leaves the batch for compaction", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-autoclear-occupancy-"));
+	writeConfig(cwd, { autoClear: { enabled: true, canary: true, stopPercent: 60 } });
+	const entries = supersededReadEntries(heavyToolBody("x"), heavyToolBody("y"));
+	const h = autoClearHarness(cwd, path.basename(cwd), entries, { tokens: 650, contextWindow: 1_000, percent: 65 });
+	await h.handlers.get("session_start")?.({}, h.ctx);
+	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+
+	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	const event = reReadEvent(entries, "assistant-2", "tool-2");
+	const result = await h.handlers.get("turn_end")?.(event, h.ctx);
+	assert.equal(result, undefined, "an occupied session does not clear");
+	const lines = fs.readFileSync(sessionCanaryPath(path.basename(cwd)), "utf8").trim().split("\n");
+	const record = JSON.parse(lines[lines.length - 1]);
+	assert.equal(record.outcome, "occupancy");
+	assert.equal(record.candidates.length, 1, "the candidate is recorded, not consumed");
+});
+
+test("a re-read of a cleared target is counted in the canary ledger", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-autoclear-reread-"));
+	writeConfig(cwd, { autoClear: { enabled: true, canary: true } });
+	const entries = supersededReadEntries(heavyToolBody("x"), heavyToolBody("y"));
+	const h = autoClearHarness(cwd, path.basename(cwd), entries);
+	await h.handlers.get("session_start")?.({}, h.ctx);
+	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-2", "tool-2"), h.ctx);
+
+	// The model comes back to the cleared target: one more read of the same path,
+	// whose result supersedes the second read's block.
+	entries.push(
+		{
+			sourceEntry: { id: "assistant-3", type: "message" },
+			messages: [{
+				role: "assistant",
+				content: [
+					{ type: "text", text: "Checking it once more." },
+					{ type: "toolCall", id: "call-3", name: "read", arguments: { path: "src/big.ts" } },
+				],
+			}],
+		},
+		{
+			sourceEntry: { id: "tool-3", type: "message" },
+			messages: [{ role: "toolResult", toolCallId: "call-3", content: [{ type: "text", text: heavyToolBody("z") }], isError: false }],
+		},
+	);
+	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+	const second = await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-3", "tool-3"), h.ctx) as { entries: Array<Record<string, unknown>> };
+	assert.ok(
+		second.entries.some((entry) => entry.type === "context_edit" && entry.targetId === "tool-2"),
+		"the block the re-read superseded is dead and gets cleared",
+	);
+	const lines = fs.readFileSync(sessionCanaryPath(path.basename(cwd)), "utf8").trim().split("\n");
+	const record = JSON.parse(lines[lines.length - 1]);
+	assert.equal(record.quality.turn.rereads, 1, "the re-read of the cleared target is on the ledger");
+});
+
+test("a config with only autoClear keys raises no ignored-key warning", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-autoclear-keys-"));
+	writeConfig(cwd, {
+		autoClear: { enabled: true, canary: true, staleTurns: 5, staleSteps: 4, channel: "both", stopPercent: 70 },
+	});
+	const notifications: Array<{ message: string; type?: string }> = [];
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	const api = {
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerCommand: () => undefined,
+		registerTool: () => undefined,
+	};
+	extension(api as any);
+	const ctx = {
+		cwd,
+		hasUI: true,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => undefined,
+		ui: { notify: (message: string, type?: string) => { notifications.push({ message, type }); } },
+		sessionManager: {
+			buildSessionProjection: () => ({ entries: [], messages: [] }),
+			getBranch: () => [],
+			getSessionId: () => "autoclear-keys-session",
+		},
+	};
+	await handlers.get("session_start")?.({}, ctx);
+	assert.equal(notifications.length, 0, "every set autoClear key is read on Pi now");
 });

@@ -1,10 +1,10 @@
 # oh-my-clm
 
-Pi extension + DSH/Cordis plugin。DSH 侧默认关闭一条**自动清理**通道：`turn/end` 把已被同一目标取代的 `read`/`grep`/`glob` 结果换成一行重取指针，记录是 log-only 的 `ignorable` plugin record，消息投影只改模型可见副本；会话日志、surface 和人类 transcript 都不动。手动路径仍保留 mirror + `cleanup`。
+Pi extension + DSH/Cordis plugin。两个宿主都默认关闭一条**自动清理**通道：turn 边界把已被同一目标取代或已老化的可重取 tool result 换成一行重取指针——DSH 用 log-only 的 `ignorable` plugin record 加消息投影，Pi 用 branch-local 的 `context_edit`。只改模型可见副本；会话日志、surface 和人类 transcript 都不动。手动路径仍保留 mirror + `cleanup`。
 
-## 自动清理（DSH，默认关闭）
+## 自动清理（默认关闭）
 
-`autoClear.enabled: true` 时每个 `turn/end` 结算一次：清被同一目标后续调用取代的块，以及正文**全部可重取**、且已过期 `staleTurns` 个 turn 或年龄落在 `minAgeSteps`–`maxAgeSteps` 个 tool result 窗口内的块；闸门为 1200 token、2 块或死内容占当前 prompt 的 5%，占用 ≥60% 停手交给宿主 compaction；同一个目标被重读 2 次即拒收该 key，被拒收的目标占已清目标一半以上才熔断。计时器按 step 计（老化另有 `staleSteps` 时钟），结算点留在 turn 边界，让一次断点摊到整批块上；`autoClear.midTurnSuffixTokens` 可单独放开尾部很短的 turn 内清理。`autoClear.channel` 选判据：默认 `rot` 只看量与占比，`money` 额外要求一批的一次性重算成本与摊销净收益付得起，`both` 让被拒的批仍走 rot。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
+`autoClear.enabled: true` 时每个 turn 边界结算一次：清被同一目标后续调用取代的块，以及正文**全部可重取**、且已过期 `staleTurns` 个 turn 或年龄落在 `minAgeSteps`–`maxAgeSteps` 个 tool result 窗口内的块；闸门为 1200 token、2 块或死内容占当前 prompt 的 5%，占用 ≥60% 停手交给宿主 compaction；同一个目标被重读 2 次即拒收该 key，被拒收的目标占已清目标一半以上才熔断。计时器按 step 计（老化另有 `staleSteps` 时钟），结算点留在 turn 边界，让一次断点摊到整批块上；`autoClear.midTurnSuffixTokens` 可单独放开尾部很短的 turn 内清理（仅 DSH，Pi 的 step 没有 turn 内结算点）。`autoClear.channel` 选判据：默认 `rot` 只看量与占比，`money` 额外要求一批的一次性重算成本与摊销净收益付得起，`both` 让被拒的批仍走 rot。`autoClear.canary: true` 只记账不执行；`npm run canary:replay` 可离线跑已存 DSH 会话。详见 [自动清理](https://github.com/DevZjQx/oh-my-clm/blob/main/docs/features/auto-clear.md)。
 
 ## 手动通道：mirror 与 cleanup
 
@@ -22,7 +22,7 @@ Pi projection ──► /tmp/clm-${sessionId}/LIVE_CTX_MAIN.md ◄── 模型 
 - **DSH**：通过 `Session.append()` 的 `surfaceOp: { op: "replace" }` 改写当前 active surface；append-only session log 保留原始事件。
 - **cleanup**：在 host 侧按 1-based editable block ID 直接删除或软卸载，不读取 block body，不受 preview 截断影响。
 - **block index**：DSH 把可操作的 ID 区间放进 runtime context；默认 `digest`，每个已完成 turn 一行。
-- **自动清理**（DSH，默认关）：turn 边界把被后续调用取代的 tool result 换成 `[cleared … re-read before editing]` 回执，通过宿主消息投影实现——会话日志与人类 transcript 都保留原文。需要宿主提供 `appendPluginRecord` seam（`dsh-session` ≥ 0.2.2-rc.1），否则该通道保持关闭。
+- **自动清理**（默认关）：turn 边界把被同一目标取代或已老化的可重取 tool result 换成 `[cleared … re-read before editing]` 回执——会话日志与人类 transcript 都保留原文。DSH 通过消息投影与 `appendPluginRecord` seam 提交（缺 seam 时通道保持关闭）；Pi 在 `turn_end` 提交 branch-local `context_edit`，与手动 mirror 编辑共用同一条边界提案。
 
 ## 安装
 
@@ -138,14 +138,14 @@ mirror 只是编辑面：原始 session JSONL / DSH session log 是事实来源�
 | `autoClear.maxSuffixTokens` | `0` | money 通道：一批的一次性重算成本（最早被清块之后的模型可见 token，减同批删除的正文）超过该值即拒；`0` 关闭。 |
 | `autoClear.minNetTokens` | `0` | money 通道：摊销净收益 `r·ΔL − (1−r)·S / N` 的下限，`r` 取 `cleanup.cacheDiscountPercent`，`N` 取 `cleanup.paybackSteps`（否则 `paybackTurns`）；`0` 允许恰好回本，负值关闭该测试。 |
 | `autoClear.stopPercent` | `60` | 占用达到窗口百分比即停手，交给宿主 compaction。 |
-| `autoClear.midTurnSuffixTokens` | `0` | 允许在 turn 内清理：死块之后待重算的尾部 ≤ 该 token 数即可，不再要求回本。`0` 关闭。 |
-| `host.pluginRecordModule` | `@deepseek-ai/dsh-session` | 提供 `appendPluginRecord` seam 的宿主模块；高级/测试用。 |
+| `autoClear.midTurnSuffixTokens` | `0` | 允许在 turn 内清理：死块之后待重算的尾部 ≤ 该 token 数即可，不再要求回本。`0` 关闭。（仅 DSH。） |
+| `host.pluginRecordModule` | `@deepseek-ai/dsh-session` | 提供 `appendPluginRecord` seam 的宿主模块（仅 DSH）；高级/测试用。 |
 
-自动清理的记录必须是宿主可忽略的 plugin record，所以它需要宿主提供 `appendPluginRecord`（`@deepseek-ai/dsh-session` ≥ 0.2.2-rc.1）。插件目录解析不到宿主包，所以解析器会再从宿主入口（`process.argv[1]`，即 `dsh/lib/bin.js`）和全局模块根兜底；解析出的模块必须是会话所用的同一份 `dsh-session`（否则私有字段写入会失败），导出 `Session` 时会在写入前比对原型。仍然解析不到时插件不会退回 `session.append()`（那会让含记录的会话在重启后被宿主拒绝恢复），而是保持关闭：会话创建时 warn 一次，`/clm` 显示 `stopped (unrecordable)`。`autoClear.canary` 只写 `/tmp/clm-<session>/CANARY.jsonl`，不需要该 seam。
+自动清理的记录在 DSH 侧必须是宿主可忽略的 plugin record，所以它需要宿主提供 `appendPluginRecord`（`@deepseek-ai/dsh-session` ≥ 0.2.2-rc.1）。插件目录解析不到宿主包，所以解析器会再从宿主入口（`process.argv[1]`，即 `dsh/lib/bin.js`）和全局模块根兜底；解析出的模块必须是会话所用的同一份 `dsh-session`（否则私有字段写入会失败），导出 `Session` 时会在写入前比对原型。仍然解析不到时插件不会退回 `session.append()`（那会让含记录的会话在重启后被宿主拒绝恢复），而是保持关闭：会话创建时 warn 一次，`/clm` 显示 `stopped (unrecordable)`。Pi 不需要该 seam：自动清理在 `turn_end` 提交 branch-local `context_edit`，宿主重放即恢复。`autoClear.canary` 两个宿主都只写 `/tmp/clm-<session>/CANARY.jsonl`，不需要任何 seam。
 
 所有触发阈值默认关闭（`0`）。命中后只在该 turn 边界装配一次用量行和候选；候选只取已完成的 turn，按断点后的净收益排序，并固定带 `skipRoles: ["user"]`。Pi 侧另认 `cleanup.trigger.stepsSinceCleanup`（回退 `turnsSinceCleanup`）、`toolResultSharePercent`、`usagePercent`（覆盖 budget nudge 内置的 75%）、`maxCandidates` 与 `minSavingsTokens`，预算 nudge 与 DSH 共用同一套用量行/候选格式；`completedTurns` / `completedSteps` 两个阈值仅 DSH 读取。
 
-Pi 会话启动时会对 Pi 不读的 key（`index.*`、`autoClear.*`、`context.fixedTokens`、`host.pluginRecordModule` 及上述两个阈值）发一条 warning；这些 key 在 DSH 侧照常生效。
+Pi 会话启动时会对 Pi 不读的 key（`index.*`、`context.fixedTokens`、`host.pluginRecordModule`、`autoClear.midTurnSuffixTokens` 及上述两个阈值）发一条 warning；这些 key 在 DSH 侧照常生效。
 
 **计数单位**：陈旧度信号（`completedSteps` / `stepsSinceCleanup` / 候选的 `stepsOld` / 摊销 `N`）按 step 计；批次结算、闸门和候选区间仍按 turn，因为一次断点必须摊到多个块上。度量依据见 `src/features/live-context/auto-clear.ts`。
 

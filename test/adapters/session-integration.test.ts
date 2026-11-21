@@ -1,10 +1,125 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import extension from "../../extensions/clm.ts";
 
 function user(content: string): Record<string, unknown> {
 	return { role: "user", content, timestamp: Date.now() };
 }
+
+function toolResult(toolCallId: string, text: string): Record<string, unknown> {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName: "read",
+		content: [{ type: "text", text }],
+		isError: false,
+		timestamp: Date.now(),
+	};
+}
+
+function assistantWithToolCall(text: string, toolCallId: string, toolPath: string): Record<string, unknown> {
+	return {
+		role: "assistant",
+		content: [
+			{ type: "text", text },
+			{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: toolPath } },
+		],
+		api: "test",
+		provider: "test",
+		model: "test-model",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+}
+
+/**
+ * The whole auto-clear contract on the real host seam: the extension's draft is
+ * a `context_edit`, so applying it the way Pi does leaves the original event in
+ * the session log, shows the pointer only in the active projection, and a
+ * replayed boundary clears nothing again.
+ */
+test("Pi auto-clear replaces a superseded read in the projection and keeps the log's original", async () => {
+	const session = SessionManager.inMemory("/tmp/oh-my-clm-autoclear");
+	const heavy = (fill: string) => `const data = "${fill.repeat(6000)}";`;
+	const taskId = session.appendMessage(user("Keep the task constraints.") as any);
+	const assistantId = session.appendMessage(assistantWithToolCall("Inspecting.", "call-1", "src/big.ts") as any);
+	const firstResultId = session.appendMessage(toolResult("call-1", heavy("x")) as any);
+
+	const handlers = new Map<string, (event: any, ctx: any) => Promise<unknown> | unknown>();
+	extension({
+		on(name: string, handler: (event: any, ctx: any) => Promise<unknown> | unknown) {
+			handlers.set(name, handler);
+			return () => undefined;
+		},
+		registerCommand: () => undefined,
+		registerTool: () => undefined,
+	} as any);
+	const ctx = {
+		cwd: "/tmp/oh-my-clm-autoclear",
+		hasUI: false,
+		mode: "print",
+		model: undefined,
+		getContextUsage: () => ({ tokens: 4_000, contextWindow: 100_000, percent: 4 }),
+		ui: { notify: () => undefined },
+		sessionManager: session,
+	};
+	await handlers.get("session_start")?.({}, ctx);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+
+	const firstAssistant = (session.getEntry(assistantId) as any).message;
+	const firstResult = (session.getEntry(firstResultId) as any).message;
+	await handlers.get("turn_end")?.({
+		entries: [],
+		turnIndex: 0,
+		message: firstAssistant,
+		toolResults: [firstResult],
+		messageEntryId: assistantId,
+		toolResultEntryIds: [firstResultId],
+	}, ctx);
+
+	const secondAssistantId = session.appendMessage(assistantWithToolCall("Reading again.", "call-2", "src/big.ts") as any);
+	const secondResultId = session.appendMessage(toolResult("call-2", heavy("y")) as any);
+	await handlers.get("context")?.({ messages: [] }, ctx);
+
+	const original = (session.getEntry(firstResultId) as any).message;
+	const secondAssistant = (session.getEntry(secondAssistantId) as any).message;
+	const secondResult = (session.getEntry(secondResultId) as any).message;
+	const result = await handlers.get("turn_end")?.({
+		entries: [],
+		turnIndex: 0,
+		message: secondAssistant,
+		toolResults: [secondResult],
+		messageEntryId: secondAssistantId,
+		toolResultEntryIds: [secondResultId],
+	}, ctx) as { entries: Array<Record<string, unknown>> } | undefined;
+	assert.ok(result, "the boundary returns entries");
+	const edit = result.entries.find((entry) => entry.type === "context_edit" && entry.targetId === firstResultId);
+	assert.ok(edit, "the superseded read result is cleared");
+	assert.match((edit.replacement as { content: Array<{ text: string }> }).content[0]?.text ?? "", /^\[cleared /);
+
+	session.appendContextEdit(firstResultId, edit.replacement as any);
+	const stored = (session.getEntry(firstResultId) as any).message;
+	assert.equal((stored.content as Array<{ text: string }>)[0]?.text, (original.content as Array<{ text: string }>)[0]?.text,
+		"the session log keeps the original tool result");
+	const projected = session.buildSessionProjection();
+	const projectedMessage = projected.entries.find((entry: any) => entry.sourceEntry.id === firstResultId)?.messages[0] as any;
+	assert.match((projectedMessage.content as Array<{ text: string }>)[0]?.text ?? "", /^\[cleared .* re-read before editing\]$/);
+	assert.ok(projected.entries.some((entry: any) => entry.sourceEntry.id === taskId), "the task entry survives the clear");
+
+	// Replaying the boundary without new traffic must not clear the block again.
+	await handlers.get("context")?.({ messages: [] }, ctx);
+	const replayed = await handlers.get("turn_end")?.({ entries: [] }, ctx) as { entries: Array<Record<string, unknown>> } | undefined;
+	assert.equal((replayed?.entries ?? []).length, 0, "a replayed boundary clears nothing");
+});
 
 function assistant(text: string): Record<string, unknown> {
 	return {

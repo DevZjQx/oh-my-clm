@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "typebox";
 import type {
+	ContextEditEntryDraft,
 	ContextEditableContent,
 	ContextEvent,
 	ContextEventResult,
@@ -47,9 +48,26 @@ import {
 	renderCleanupCandidates,
 	type CleanupTriggerPlan,
 } from "../src/features/live-context/context-trigger.ts";
-import { loadClmConfig, projectConfigPath, userConfigPath } from "../src/lib/clm-config.ts";
-import { writePrivateText } from "../src/lib/clm-files.ts";
-import { sessionMirrorPath } from "../src/lib/clm-paths.ts";
+import {
+	REFETCH_TOOL_NAMES,
+	SupersessionTracker,
+	batchNetTokens,
+	batchPassesGate,
+	candidateRefused,
+	createRereadPolicy,
+	noteKeyReread,
+	parseToolArguments,
+	targetKeyOf,
+	type BatchGate,
+	type CanaryBatch,
+	type CanaryRecord,
+	type ClearCandidate,
+	type RereadPolicy,
+} from "../src/features/live-context/auto-clear.ts";
+import { clearPlaceholder } from "../src/features/live-context/clear-projection.ts";
+import { loadClmConfig, projectConfigPath, userConfigPath, type ClmAutoClearConfig } from "../src/lib/clm-config.ts";
+import { appendPrivateLine, writePrivateText } from "../src/lib/clm-files.ts";
+import { sessionCanaryPath, sessionMirrorPath } from "../src/lib/clm-paths.ts";
 const PROMPT_MARKER = "<pi-clm-live-context>";
 const CONTEXT_NUDGE_MARKER = "<pi-clm-budget-nudge>";
 const CONTEXT_RESERVE_TOKENS = 2_048;
@@ -85,6 +103,8 @@ interface Config {
 	triggerMaxCandidates: number;
 	/** Candidates below this estimated token size are never offered. */
 	triggerMinSavingsTokens: number;
+	/** The whole `autoClear` block; the Pi settlement reads every key but one. */
+	autoClear: ClmAutoClearConfig;
 }
 
 interface MirrorSnapshot {
@@ -124,14 +144,15 @@ function config(ctx: ExtensionContext): Config {
 		triggerUsagePercent: loaded.config.cleanup.trigger.usagePercent,
 		triggerMaxCandidates: loaded.config.cleanup.trigger.maxCandidates,
 		triggerMinSavingsTokens: loaded.config.cleanup.trigger.minSavingsTokens,
+		autoClear: loaded.config.autoClear,
 	};
 }
 
 /**
  * Keys the shared loader parses but this adapter never reads. The loader treats
- * them as valid, so its own warning channel stays quiet, and a user who sets
- * `autoClear.enabled: true` sees no change on Pi at all. Until the Pi-side
- * features land, a session must say so instead of ignoring the keys silently.
+ * them as valid, so its own warning channel stays quiet. `autoClear.*` is read
+ * here since the Pi settlement landed; only the mid-turn tail budget stays on
+ * the list, because a Pi step has no settlement point inside it.
  */
 const PI_IGNORED_CONFIG_KEYS: readonly string[] = [
 	"index.mode",
@@ -143,19 +164,6 @@ const PI_IGNORED_CONFIG_KEYS: readonly string[] = [
 	"context.fixedTokens",
 	"cleanup.trigger.completedTurns",
 	"cleanup.trigger.completedSteps",
-	"autoClear.enabled",
-	"autoClear.canary",
-	"autoClear.channel",
-	"autoClear.staleTurns",
-	"autoClear.staleSteps",
-	"autoClear.minAgeSteps",
-	"autoClear.maxAgeSteps",
-	"autoClear.minTokens",
-	"autoClear.minBlocks",
-	"autoClear.minSharePercent",
-	"autoClear.maxSuffixTokens",
-	"autoClear.minNetTokens",
-	"autoClear.stopPercent",
 	"autoClear.midTurnSuffixTokens",
 	"host.pluginRecordModule",
 ];
@@ -346,6 +354,7 @@ function statusText(ctx: ExtensionContext, snapshot: MirrorSnapshot | undefined)
 		`edit policy: shrink-only`,
 		`mirror limits: ${settings.maxBlockChars} chars/block, ${settings.maxMirrorChars} chars total`,
 		`persisted context edits on branch: ${edits}`,
+		autoClearStatusLine(ctx),
 	].join("\n");
 }
 
@@ -370,10 +379,10 @@ function mirrorReadToolCallIds(message: unknown, cwd: string, filePath: string):
 	return ids;
 }
 
-function mirrorReadContextEdits(event: TurnEndEvent, ctx: ExtensionContext, filePath: string): SessionBoundaryDraft[] {
+function mirrorReadContextEdits(event: TurnEndEvent, ctx: ExtensionContext, filePath: string): ContextEditEntryDraft[] {
 	const callIds = mirrorReadToolCallIds(event.message, ctx.cwd, filePath);
 	if (callIds.size === 0) return [];
-	const entries: SessionBoundaryDraft[] = [];
+	const entries: ContextEditEntryDraft[] = [];
 	for (let index = 0; index < event.toolResults.length; index += 1) {
 		const result = event.toolResults[index];
 		const targetId = event.toolResultEntryIds[index];
@@ -403,6 +412,8 @@ interface SessionState {
 	completedSteps: number;
 	/** Step in which a cleanup last applied; rendered as "last cleanup at step K". */
 	lastCleanupStep?: number;
+	/** Automatic clearing; created at `session_start` from that session's config. */
+	auto?: AutoClearState;
 }
 
 /** State is keyed by session id: interleaved sessions must not share a mirror snapshot or notice. */
@@ -728,6 +739,431 @@ function contextBudgetNudge(
 	return nudge;
 }
 
+/** Tool results a cleared target may come back within and still count as a miss. */
+const BREAKER_WINDOW_RESULTS = 3;
+/**
+ * Distinct targets a session must have had to refuse before the channel stops.
+ *
+ * A key is refused only after the model came back to it twice, and the first
+ * re-read is the one the placeholder ordered before an edit. So this counts
+ * targets the clear genuinely mis-priced, not clears the model followed the
+ * pointer on — the rate this divides is the one the instruction cannot inflate.
+ */
+const BREAKER_MIN_REFUSED = 3;
+
+/** What one settlement decided, as `/clm status` and the ledger report it. */
+interface AutoClearReport {
+	readonly candidates: number;
+	readonly tokens: number;
+	readonly outcome: string;
+}
+
+/** Per-session clearing state: the selector, the breaker and the ledger counters. */
+interface AutoClearState {
+	readonly tracker: SupersessionTracker;
+	readonly reread: RereadPolicy;
+	/** Call id → target key, so an error result can be attributed to a cleared key. */
+	readonly callKeys: Map<string, string>;
+	/** Blocks already written to the ledger, so a skipped pass cannot repeat them. */
+	readonly reported: Set<string>;
+	/** Keys of cleared targets still inside the breaker window. */
+	recent: { readonly key: string; readonly at: number }[];
+	clearedTotal: number;
+	clearedTokens: number;
+	passes: number;
+	rereads: number;
+	errors: number;
+	errorRereads: number;
+	turnRereads: number;
+	turnErrors: number;
+	turnErrorRereads: number;
+	qualityDirty: boolean;
+	/** Monotonic feed counter; the seq the ledger names for calls and results. */
+	seq: number;
+	/** Agent loops started in this session; the turn clock behind the stale rule. */
+	turn: number;
+	/** Set once this session stops clearing; latched until the plugin reloads. */
+	stop?: "breaker";
+	last?: AutoClearReport;
+}
+
+function freshAutoState(settings: Config): AutoClearState {
+	return {
+		tracker: new SupersessionTracker({
+			staleTurns: settings.autoClear.staleTurns,
+			staleSteps: settings.autoClear.staleSteps,
+			minAgeSteps: settings.autoClear.minAgeSteps,
+			maxAgeSteps: settings.autoClear.maxAgeSteps,
+		}),
+		reread: createRereadPolicy(),
+		callKeys: new Map(),
+		reported: new Set(),
+		recent: [],
+		clearedTotal: 0,
+		clearedTokens: 0,
+		passes: 0,
+		rereads: 0,
+		errors: 0,
+		errorRereads: 0,
+		turnRereads: 0,
+		turnErrors: 0,
+		turnErrorRereads: 0,
+		qualityDirty: false,
+		seq: 0,
+		turn: 0,
+	};
+}
+
+function autoState(state: SessionState, settings: Config): AutoClearState {
+	if (state.auto === undefined) state.auto = freshAutoState(settings);
+	return state.auto;
+}
+
+function isRefetchTool(name: string): boolean {
+	return (REFETCH_TOOL_NAMES as readonly string[]).includes(name);
+}
+
+/**
+ * Feed one boundary's tool traffic to the selector.
+ *
+ * Calls are noted before their results: a call ages by the results that had
+ * already landed when it happened, so one boundary's calls must not see the
+ * boundary's own results as older than they are.
+ */
+function feedAutoClear(ac: AutoClearState, event: TurnEndEvent): void {
+	const results = Array.isArray(event.toolResults) ? event.toolResults : [];
+	const resultEntryIds = Array.isArray(event.toolResultEntryIds) ? event.toolResultEntryIds : [];
+	const entryByCallId = new Map<string, string>();
+	for (let index = 0; index < results.length; index += 1) {
+		const result = results[index] as unknown;
+		const entryId = resultEntryIds[index];
+		if (!isRecord(result) || typeof result.toolCallId !== "string" || typeof entryId !== "string") continue;
+		entryByCallId.set(result.toolCallId, entryId);
+	}
+	const callSeqs = new Map<string, number>();
+	const message = event.message as unknown;
+	if (isRecord(message) && Array.isArray(message.content)) {
+		for (const part of message.content) {
+			if (!isRecord(part) || (part.type !== "toolCall" && part.type !== "tool-call")) continue;
+			if (typeof part.id !== "string" || typeof part.name !== "string") continue;
+			const entryId = entryByCallId.get(part.id);
+			if (entryId === undefined || !isRefetchTool(part.name)) continue;
+			const args = parseToolArguments(part.arguments);
+			const key = targetKeyOf(part.name, args);
+			if (key !== undefined) ac.callKeys.set(part.id, key);
+			noteRefetch(ac, part.name, args);
+			const seq = ++ac.seq;
+			callSeqs.set(part.id, seq);
+			ac.tracker.noteCall({ name: part.name, args, blockId: entryId, seq, blockAge: ac.tracker.resultsSeen });
+		}
+	}
+	for (let index = 0; index < results.length; index += 1) {
+		const result = results[index] as unknown;
+		const entryId = resultEntryIds[index];
+		if (!isRecord(result) || typeof entryId !== "string") continue;
+		ac.tracker.noteBlockLanding();
+		const tokens = estimateMessageTokens(result);
+		ac.tracker.noteBlockTokens(entryId, tokens, ++ac.seq, ac.turn);
+		const callSeq = typeof result.toolCallId === "string" ? callSeqs.get(result.toolCallId) : undefined;
+		if (callSeq !== undefined) ac.tracker.noteOutput(callSeq, tokens);
+		noteToolOutcome(ac, typeof result.toolCallId === "string" ? result.toolCallId : undefined, result.isError === true);
+	}
+}
+
+/** Drop breaker evidence older than its window so the list cannot grow with the session. */
+function pruneRecent(ac: AutoClearState): void {
+	const now = ac.tracker.resultsSeen;
+	ac.recent = ac.recent.filter((entry) => now - entry.at <= BREAKER_WINDOW_RESULTS);
+}
+
+/** Put one cleared target into the breaker window, keeping one entry per key. */
+function rememberClearedKey(ac: AutoClearState, key: string, at: number): void {
+	const index = ac.recent.findIndex((entry) => entry.key === key);
+	if (index < 0) {
+		ac.recent.push({ key, at });
+		return;
+	}
+	const existing = ac.recent[index];
+	if (existing !== undefined && existing.at < at) ac.recent[index] = { key, at };
+}
+
+/**
+ * Count a cleared target the model asked for again, and trip the breaker.
+ *
+ * A re-read is not by itself a mistake: the placeholder orders one before an
+ * edit, so a plain re-read only moves the ledger. What the breaker watches is
+ * refused targets — a key the model came back to a second time — and their rate
+ * against everything this session cleared.
+ */
+function noteRefetch(ac: AutoClearState, name: string, args: unknown): void {
+	if (ac.stop !== undefined) return;
+	pruneRecent(ac);
+	if (ac.recent.length === 0) return;
+	const key = targetKeyOf(name, args);
+	if (key === undefined) return;
+	for (const cleared of ac.recent) {
+		if (cleared.key !== key) continue;
+		ac.rereads += 1;
+		ac.turnRereads += 1;
+		ac.qualityDirty = true;
+		if (noteKeyReread(ac.reread, key)) {
+			ac.recent = ac.recent.filter((entry) => entry.key !== key);
+			const total = Math.max(ac.clearedTotal, 1);
+			const refused = ac.reread.refused.size;
+			if (refused < BREAKER_MIN_REFUSED || refused * 2 < total) return;
+			ac.stop = "breaker";
+			return;
+		}
+	}
+}
+
+/**
+ * Count one tool result's error outcome. An error on a target this session
+ * cleared means the pointer sent the model back to something that no longer
+ * works; a plain error count is the background rate that makes it readable.
+ */
+function noteToolOutcome(ac: AutoClearState, callId: string | undefined, isError: boolean): void {
+	const key = callId === undefined ? undefined : ac.callKeys.get(callId);
+	if (callId !== undefined) ac.callKeys.delete(callId);
+	if (!isError) return;
+	ac.errors += 1;
+	ac.turnErrors += 1;
+	if (key === undefined) return;
+	if (!ac.recent.some((entry) => entry.key === key)) return;
+	ac.errorRereads += 1;
+	ac.turnErrorRereads += 1;
+	ac.qualityDirty = true;
+}
+
+/** The part of a batch a settlement may still act on. */
+function liveBatchOf(ac: AutoClearState, batch: CanaryBatch, selfReadIds: ReadonlySet<string>): CanaryBatch {
+	const candidates = batch.candidates.filter((candidate) =>
+		!ac.tracker.isRetired(candidate.blockId)
+		&& !candidateRefused(ac.reread, candidate)
+		&& !selfReadIds.has(candidate.blockId),
+	);
+	if (candidates.length === batch.candidates.length) return batch;
+	return { candidates, tokens: candidates.reduce((total, candidate) => total + Math.max(0, candidate.tokens), 0) };
+}
+
+/**
+ * Candidates whose body the pointer would actually shrink, measured on the
+ * canonical text the draft replaces. The mirror preview is only the editing
+ * view: a truncated preview blocks a model edit, not a runtime-authored clear,
+ * because the canonical body stays in the session log either way.
+ */
+function usableCandidates(records: readonly MirrorRecord[], candidates: readonly ClearCandidate[]): ClearCandidate[] {
+	const byId = new Map(records.map((record) => [record.id, record] as const));
+	const usable: ClearCandidate[] = [];
+	for (const candidate of candidates) {
+		const record = byId.get(candidate.blockId);
+		if (record === undefined || record.protected || record.role !== "toolResult") continue;
+		if (clearPlaceholder(candidate.label, candidate.tokens).length >= record.text.length) continue;
+		usable.push(candidate);
+	}
+	return usable;
+}
+
+/**
+ * One-time re-prefill cost of a batch: the model-visible tokens behind its
+ * earliest cleared block, minus the bodies the same batch removes. Priced from
+ * the mirror records, which are the model-visible blocks in surface order.
+ */
+function mirrorSuffixTokens(records: readonly MirrorRecord[], candidates: readonly ClearCandidate[]): number | undefined {
+	const editable = records.filter((record) => !record.protected);
+	const positionOf = new Map(editable.map((record, index) => [record.id, index] as const));
+	const priced = candidates
+		.map((candidate) => ({ position: positionOf.get(candidate.blockId), tokens: Math.max(0, Math.round(candidate.tokens)) }))
+		.filter((entry): entry is { position: number; tokens: number } => entry.position !== undefined);
+	if (priced.length === 0) return undefined;
+	const earliest = Math.min(...priced.map((entry) => entry.position));
+	const tails = new Map<number, number>();
+	let after = 0;
+	for (let index = editable.length - 1; index >= 0; index -= 1) {
+		tails.set(index, after);
+		after += estimateMirrorTokens([editable[index] as MirrorRecord]);
+	}
+	const behind = tails.get(earliest) ?? 0;
+	const removedBehind = priced
+		.filter((entry) => entry.position > earliest)
+		.reduce((total, entry) => total + entry.tokens, 0);
+	return Math.max(0, behind - removedBehind);
+}
+
+/** The money channel's verdict on one priced batch; `rot` ignores both tests. */
+function moneyVerdict(settings: Config, batch: CanaryBatch, suffixTokens: number | undefined): boolean {
+	if (settings.autoClear.channel === "rot") return true;
+	if (suffixTokens === undefined) return true;
+	if (settings.autoClear.maxSuffixTokens > 0 && suffixTokens > settings.autoClear.maxSuffixTokens) return false;
+	if (settings.autoClear.minNetTokens < 0) return true;
+	const payback = settings.paybackSteps > 0 ? settings.paybackSteps : settings.paybackTurns;
+	const net = batchNetTokens(batch.tokens, suffixTokens, settings.cacheDiscount, payback);
+	return net >= settings.autoClear.minNetTokens;
+}
+
+/** One ledger line per boundary: the newly dead blocks plus what the last clear did. */
+function writeAutoCanaryLine(
+	ctx: ExtensionContext,
+	ac: AutoClearState,
+	settings: Config,
+	settlement: {
+		readonly batch: CanaryBatch;
+		readonly gate: boolean;
+		readonly outcome: string;
+		readonly usage: HostUsage | undefined;
+		readonly suffixTokens?: number;
+	},
+): void {
+	if (!settings.autoClear.canary) return;
+	const fresh = settlement.batch.candidates.filter((candidate) => !ac.reported.has(candidate.blockId));
+	// An empty batch is written even without a fresh candidate or a new outcome:
+	// the line is the only evidence that the selector ran and found nothing.
+	if (fresh.length === 0 && settlement.batch.candidates.length > 0 && !ac.qualityDirty) return;
+	const record: CanaryRecord = {
+		at: Date.now(),
+		turn: ac.turn,
+		tokens: fresh.reduce((total, candidate) => total + Math.max(0, Math.round(candidate.tokens)), 0),
+		...(settlement.suffixTokens === undefined ? {} : { suffixTokens: settlement.suffixTokens }),
+		candidates: fresh,
+		gate: settlement.gate,
+		outcome: settlement.outcome,
+		quality: {
+			contextTokens: Math.max(0, Math.round(settlement.usage?.tokens ?? 0)),
+			turn: {
+				rereads: ac.turnRereads,
+				errors: ac.turnErrors,
+				errorRereads: ac.turnErrorRereads,
+			},
+			session: {
+				results: ac.tracker.resultsSeen,
+				clearedBlocks: ac.clearedTotal,
+				clearedTokens: ac.clearedTokens,
+				passes: ac.passes,
+				rereads: ac.rereads,
+				errors: ac.errors,
+				errorRereads: ac.errorRereads,
+			},
+		},
+	};
+	try {
+		appendPrivateLine(sessionCanaryPath(sessionKey(ctx)), JSON.stringify(record));
+		for (const candidate of fresh) ac.reported.add(candidate.blockId);
+	} catch {
+		// A failed ledger write must never take the clear down with it.
+	}
+	ac.turnRereads = 0;
+	ac.turnErrors = 0;
+	ac.turnErrorRereads = 0;
+	ac.qualityDirty = false;
+}
+
+/**
+ * One turn-boundary settlement, and the drafts that commit it.
+ *
+ * The engine is the shared selector; the write is the draft list this adapter
+ * already returns at `turn_end`. A cleared block becomes one `context_edit`
+ * whose replacement is the shared placeholder: the session log keeps the
+ * original event, the active projection shows the pointer, and the host replays
+ * the edit deterministically on resume, fork and branch navigation. A draft the
+ * pointer would not shrink is never proposed, so every committed clear strictly
+ * shrinks the model-visible copy.
+ */
+function autoClearSettlement(
+	ctx: ExtensionContext,
+	state: SessionState,
+	event: TurnEndEvent,
+	snapshot: MirrorSnapshot,
+	selfReadEntries: readonly ContextEditEntryDraft[],
+): SessionBoundaryDraft[] {
+	const settings = config(ctx);
+	const auto = settings.autoClear;
+	if (!auto.enabled && !auto.canary) return [];
+	const ac = autoState(state, settings);
+	const selfReadIds = new Set(selfReadEntries.map((entry) => entry.targetId));
+	const stopBefore = ac.stop;
+	feedAutoClear(ac, event);
+	if (ac.stop !== undefined && stopBefore === undefined) {
+		notify(ctx, "oh-my-clm auto-clear stopped for this session: most cleared targets had to be refused after re-reads", "warning");
+	}
+	const usage = hostUsageOfContext(ctx);
+	const onDisk = readText(snapshot.filePath);
+	// A model edit or a cleanup call already changed the mirror this step, or the
+	// mirror is gone entirely; the pending diff owns this boundary, and piling a
+	// clear on top would make one boundary's outcome depend on the other's. The
+	// next boundary re-offers the candidates.
+	const mirrorBusy = onDisk === undefined || onDisk !== snapshot.rendered;
+	const batch = liveBatchOf(ac, ac.tracker.peekBatch(ac.turn), selfReadIds);
+	const usable = usableCandidates(snapshot.records, batch.candidates);
+	const usableBatch: CanaryBatch = {
+		candidates: usable,
+		tokens: usable.reduce((total, candidate) => total + Math.max(0, Math.round(candidate.tokens)), 0),
+	};
+	const gate: BatchGate = {
+		minTokens: auto.minTokens,
+		minBlocks: auto.minBlocks,
+		minShare: auto.minSharePercent / 100,
+		maxSuffixTokens: auto.maxSuffixTokens,
+		minNetTokens: auto.minNetTokens,
+	};
+	const volume = batchPassesGate(usableBatch, gate, usage?.tokens ?? 0);
+	const suffixTokens = mirrorSuffixTokens(snapshot.records, usable);
+	const money = moneyVerdict(settings, usableBatch, suffixTokens);
+	const gateOpen = auto.channel === "both" ? volume || money : volume && money;
+	let outcome: string;
+	if (usableBatch.candidates.length === 0) outcome = "no-candidate";
+	else if (mirrorBusy) outcome = "dirty-mirror";
+	else if (ac.stop !== undefined) outcome = ac.stop;
+	else if (auto.enabled && gateOpen) {
+		outcome = usage !== undefined && (usage.tokens / usage.contextWindow) * 100 >= auto.stopPercent
+			? "occupancy"
+			: "cleared";
+	} else {
+		outcome = gateOpen ? "canary" : "gate";
+	}
+	const cleared = outcome === "cleared" ? usable : [];
+	const drafts: SessionBoundaryDraft[] = cleared.map((candidate) => ({
+		type: "context_edit",
+		targetId: candidate.blockId,
+		replacement: { content: [{ type: "text", text: clearPlaceholder(candidate.label, candidate.tokens) }] },
+	}));
+	ac.last = { candidates: usableBatch.candidates.length, tokens: usableBatch.tokens, outcome };
+	if (cleared.length > 0) {
+		// The draft commits when the host appends this boundary's proposal, the
+		// same way the self-read replacement already does; retiring here keeps the
+		// selector from re-offering the block at the next boundary.
+		ac.tracker.retire(cleared.map((candidate) => candidate.blockId));
+		ac.passes += 1;
+		ac.clearedTotal += cleared.length;
+		ac.clearedTokens += usableBatch.tokens;
+		const now = ac.tracker.resultsSeen;
+		for (const candidate of cleared) {
+			for (const key of candidate.keys) rememberClearedKey(ac, key, now);
+		}
+		pruneRecent(ac);
+		notify(
+			ctx,
+			`oh-my-clm auto-clear: replaced ${cleared.length} tool result(s) with re-read pointers (~${usableBatch.tokens} tokens)`,
+			"info",
+		);
+	}
+	writeAutoCanaryLine(ctx, ac, settings, { batch: usableBatch, gate: gateOpen, outcome, usage, suffixTokens });
+	return drafts;
+}
+
+/** The `/clm status` line for the clearing channel. */
+function autoClearStatusLine(ctx: ExtensionContext): string {
+	const settings = config(ctx);
+	if (!settings.autoClear.enabled && !settings.autoClear.canary) return "auto-clear: off";
+	const ac = sessionState(ctx).auto;
+	const mode = [
+		settings.autoClear.enabled ? "enabled" : undefined,
+		settings.autoClear.canary ? "canary" : undefined,
+	].filter(Boolean).join("+");
+	const last = ac?.last === undefined ? "" : `; last: ${ac.last.outcome} (${ac.last.candidates} candidate(s))`;
+	const stopped = ac?.stop === undefined ? "" : `; stopped (${ac.stop})`;
+	return `auto-clear: ${mode}; ${ac?.passes ?? 0} pass(es), ${ac?.clearedTotal ?? 0} block(s) cleared${last}${stopped}`;
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", (event, ctx) => {
 		const current = event.systemPromptOptions.appendSystemPrompt ?? "";
@@ -737,7 +1173,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		states.set(sessionKey(ctx), freshState());
+		const state = freshState();
+		state.auto = freshAutoState(config(ctx));
+		states.set(sessionKey(ctx), state);
 		// A bad config key must not be silent: the plugin falls back to that key's
 		// default, and the user needs to know which line was ignored.
 		for (const warning of loadClmConfig(ctx.cwd).warnings) {
@@ -758,6 +1196,13 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_tree", async (_event, ctx) => {
 		states.set(sessionKey(ctx), freshState());
+	});
+
+	pi.on("agent_start", async (_event, ctx) => {
+		// One agent loop = one user request = one turn for the stale rule's clock.
+		// Sessions that never arm the channel keep no clearing state to age.
+		const state = states.get(sessionKey(ctx));
+		if (state?.auto !== undefined) state.auto.turn += 1;
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
@@ -801,11 +1246,14 @@ export default function (pi: ExtensionAPI) {
 		const snapshot = state.snapshot;
 		if (!snapshot) return;
 		const selfReadEntries = mirrorReadContextEdits(event, ctx, snapshot.filePath);
+		// The settlement runs before the manual diff so its drafts ride the same
+		// boundary proposal; the mirror itself is left to the next request's sync.
+		const autoDrafts = autoClearSettlement(ctx, state, event, snapshot, selfReadEntries);
 		const edited = readText(snapshot.filePath);
 		if (edited === undefined) return;
 		const parsed = parseMirror(edited);
 		const plan = planContextEdits(snapshot.records, parsed, editPlanOptions(ctx));
-		if (plan.status === "noop" && selfReadEntries.length === 0) return;
+		if (plan.status === "noop" && selfReadEntries.length === 0 && autoDrafts.length === 0) return;
 
 		const newEntries: SessionBoundaryDraft[] = [];
 		if (plan.status === "applied") {
@@ -828,6 +1276,7 @@ export default function (pi: ExtensionAPI) {
 			notify(ctx, "CLM edit rejected: " + (plan.reason ?? "invalid edit"), "warning");
 		}
 		if (selfReadEntries.length > 0) newEntries.push(...selfReadEntries);
+		if (autoDrafts.length > 0) newEntries.push(...autoDrafts);
 		if (plan.warnings.length > 0 && ctx.hasUI) ctx.ui.notify(plan.warnings.join("; "), "warning");
 		if (newEntries.length === 0) return;
 		return { entries: [...event.entries, ...newEntries] };

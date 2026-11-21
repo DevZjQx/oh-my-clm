@@ -1,8 +1,8 @@
 # 自动清理
 
-DSH 侧的可选通道：在 turn 边界把**可重取**的 tool result（`read` / `read_image` / `grep` / `glob` / `web_fetch`）换成一行重取指针。候选来自两条规则：同一目标被后续调用取代，或块正文全部可重取且年龄落在 `minAgeSteps`–`maxAgeSteps` 个 tool result（或超过 `staleTurns` 个 turn）的窗口内。记录是 log-only 的 `ignorable` plugin record，消息投影只改模型可见副本；会话日志、surface 与人类 transcript 保持原文。默认关闭。
+可选通道：在 turn 边界把**可重取**的 tool result（`read` / `read_image` / `grep` / `glob` / `web_fetch`）换成一行重取指针。候选来自两条规则：同一目标被后续调用取代，或块正文全部可重取且年龄落在 `minAgeSteps`–`maxAgeSteps` 个 tool result（或超过 `staleTurns` 个 turn）的窗口内。两个宿主都只改模型可见副本；会话日志、surface 与人类 transcript 保持原文。默认关闭。
 
-行为由 `src/features/live-context/auto-clear.ts`（选择器、闸门、账本类型）、`clear-projection.ts`（投影）、`plugin-record.ts`（宿主 seam）拥有；本文只写契约摘要与入口。配置文件的读取顺序见根 [README](../../README.md#配置)。
+行为由 `src/features/live-context/auto-clear.ts`（选择器、闸门、账本类型）与 `clear-projection.ts`（DSH 投影与占位符）拥有；写入分别落在 `dsh/index.ts`（ignorable plugin record + 消息投影）与 `extensions/clm.ts`（`turn_end` 的 branch-local `context_edit`）。本文只写契约摘要与入口。配置文件的读取顺序见根 [README](../../README.md#配置)。
 
 ## 开关
 
@@ -44,9 +44,22 @@ DSH 侧的可选通道：在 turn 边界把**可重取**的 tool result（`read`
 
 - `keys` 是选择器的目标身份，只供重放使用：投影不读它，占位符与不带 `keys` 的记录逐字节相同，版本号也不因此变化。
 - 记录 envelope 损坏（非对象、版本未知、空 `targets`、重复 `seq`）抛错；目标已被 compaction 移出、已被先前记录清过、或正文不比占位符长（替换会让模型读到更多字）则跳过；目标适用但畸形抛错。回放必须收敛。
-- 写入必须走宿主的 `appendPluginRecord`，不能退回 `Session.append()`：后者写不出 `ignorable`，重启后整份会话会被宿主拒绝。宿主没有该 seam 时会话锁存为 `stopped (unrecordable)`，canary 不受影响。
-- 结算发生在 `turn/end`（或 `step/end`）通知之后的一个 microtask：宿主在通知 `session/event` 时仍持有该 append，`appendPluginRecord` 会拒绝嵌套写入。批次、闸门与 turn 计数在边界处快照，延迟执行的只有判定与写入；见 `dsh/index.ts` 的 `scheduleSettlement`。
+- DSH 写入必须走宿主的 `appendPluginRecord`，不能退回 `Session.append()`：后者写不出 `ignorable`，重启后整份会话会被宿主拒绝。宿主没有该 seam 时会话锁存为 `stopped (unrecordable)`，canary 不受影响。Pi 的写入是 `turn_end` 提案里的 `context_edit` draft，不依赖任何记录 seam。
+- DSH 的结算发生在 `turn/end`（或 `step/end`）通知之后的一个 microtask：宿主在通知 `session/event` 时仍持有该 append，`appendPluginRecord` 会拒绝嵌套写入。批次、闸门与 turn 计数在边界处快照，延迟执行的只有判定与写入；见 `dsh/index.ts` 的 `scheduleSettlement`。Pi 的结算同步运行在 `turn_end` 处理器里，draft 随边界提案一起由宿主校验并追加。
 - 解析顺序、模块身份校验与 `host.pluginRecordModule` 的语义见 `plugin-record.ts`。
+
+## Pi 侧机制
+
+Pi 没有消息投影 seam，但有同等的写入通道：扩展在 `turn_end` 返回的 `context_edit` draft。它是 branch-local 的持久条目——宿主把它应用于 active projection，session JSONL 里的原始事件不动，resume、fork 与分支导航都按宿主的重放语义恢复（见 `test/adapters/session-integration.test.ts`）。因此 DSH 的 `appendPluginRecord` 要求在 Pi 上不存在，通道也没有 `unrecordable` 状态。
+
+- **结算点**：每个 `turn_end`（Pi 的一个 step）。该边界的 tool 流量（`event.message` 的 toolCall 与 `event.toolResults`）喂给共享选择器；turn 时钟按 agent loop（用户请求）计。
+- **写入**：每个被清块一条 `context_edit`，replacement 是与 DSH 相同的占位符文本；消息身份、tool 配对与 compaction 锚点由宿主的 context-edit 语义保留。模型可见的 mirror 在下一次请求的同步时显示指针。
+- **与手动编辑的先后**：mirror 在本 step 已被模型编辑或 `cleanup` 改过时，该边界跳过自动结算（outcome `dirty-mirror`），候选留到下一个边界；手动 diff 照常提交。镜像自读（`turn_end` 已有的自读替换）永远不会被自动清理重复处理。
+- **严格缩短**：占位符不比 canonical 正文短的候选不提名；`turn_end` 的 mirror diff 通道自身也是 shrink-only。
+- **canary**：同一个 `CANARY.jsonl`、同一个记录形状，写在与 mirror 相同的会话目录；模型输入逐字节不变。
+- **占用停手**：用宿主精确用量（`getContextUsage`）对照 `autoClear.stopPercent`。
+- **恢复**：tracker 属于活会话，恢复后从零开始——历史块不参与提名（保守侧），已清块不会被重清；上次运行的拒收账目不跨恢复保留。
+- **turn 内清理**：Pi 的 step 没有 turn 内结算点，`autoClear.midTurnSuffixTokens` 在 Pi 上不生效（仍由配置加载器解析）。
 
 ## 闸门
 
@@ -74,7 +87,7 @@ DSH 侧的可选通道：在 turn 边界把**可重取**的 tool result（`read`
 | --- | --- | --- |
 | 单目标重读 | 同一目标 key 被重读 2 次（第一次就是占位符要求的编辑前重读） | 只拒收该 key，永不再清它；显示 `N key(s) refused after re-reads` |
 | 拒收率 | 累计 ≥3 个不同目标被拒收，且占已清目标一半以上 | 本会话停止清理，显示 `stopped (breaker)` |
-| 记录缝缺失 | 宿主没有 `appendPluginRecord`，或解析不到同一份模块 | 锁存 `stopped (unrecordable)`，不退回 `append()` |
+| 记录缝缺失（DSH） | 宿主没有 `appendPluginRecord`，或解析不到同一份模块 | 锁存 `stopped (unrecordable)`，不退回 `append()`；Pi 无此状态 |
 | 投影缺失 | `sessions.registerMessageProjection` 尚未可用 | 跳过本轮，不锁存；候选留到下一个边界 |
 | 占用 | ≥ `autoClear.stopPercent` | 跳过本轮，不锁存；占用降下来后恢复 |
 | 写法失败 | writer 抛错 | 记 warn，本轮不算清理，不 retire 候选 |
@@ -102,4 +115,4 @@ DSH 侧的可选通道：在 turn 边界把**可重取**的 tool result（`read`
 - 宿主 compaction 在约 80% 占用时压缩，`tool-result-pruner` 在压缩后裁剪超长结果；插件不重复这两件事。
 - 插件在 `autoClear.stopPercent`（默认 60%）停手，避免两边改同一段前缀。
 - 模型始终可按指针重取；`cleanup` 保留为手动通道。
-- 不实现错误率回退熔断、Pi 侧对等实现或清理后自动预取。
+- 不实现错误率回退熔断或清理后自动预取。
