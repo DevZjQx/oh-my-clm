@@ -20,6 +20,7 @@ graph LR
   CAN --> CANLOG["CANARY.jsonl<br/>one line per boundary"]
   CAN -->|Pi settlement| CLE["context_edit<br/>branch-local edit"]
   PIX --> CLE
-  CAN -->|DSH settlement| REC["plugin-record<br/>ignorable clear record"]
-  REC --> PROJ["clear-projection<br/>message projection seam"]
+  CAN -->|DSH settlement| REC["plugin-record<br/>ignorable clear record<br/>no seam → no clearing"]
+  REC --> PROJ["clear-projection<br/>message projection"]
+  PROJ --> SESS["sessions service<br/>registerMessageProjection"]
   LIB --> MIRROR["/tmp/clm-{sessionId}/<br/>LIVE_CTX_MAIN.md"]
