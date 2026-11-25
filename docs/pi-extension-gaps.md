@@ -9,28 +9,29 @@ Pi 侧当前注册的接缝：
 | 接缝 | 作用 |
 | --- | --- |
 | `before_agent_start` | 把 `<pi-clm-live-context>` 协议追加到 system prompt |
-| `session_start` / `session_tree` / `session_shutdown` | 会话状态重建、加载器配置告警、mirror 重建 |
-| `context` | 每次请求前同步 mirror；追加一次性编辑回执 `<pi-clm-edit-notice>` 与 budget nudge `<pi-clm-budget-nudge>`（system 消息，不入历史） |
+| `session_start` / `session_tree` / `session_shutdown` | 会话状态重建、加载器与忽略键告警、mirror 重建 |
+| `agent_start` | 推进自动清理的 turn 时钟（一个 agent loop 记一个 turn） |
+| `context` | 每次请求前同步 mirror、标记自动清理的请求边界（已落地的 tool result 进入该请求）；追加一次性编辑回执 `<pi-clm-edit-notice>` 与 budget nudge `<pi-clm-budget-nudge>`（system 消息，不入历史） |
 | `turn_end` | 把模型对 mirror 的编辑提交为 branch-local `context_edit`；把 mirror 自读换成指针；结算自动清理（`autoClear.enabled` / `autoClear.canary`） |
 | `cleanup` 工具 | 按 1-based ID 批量删除 / offload / 只读 list；结果文案按 `cleanup.resultMode` 裁剪 |
-| `/clm status` | 只读状态：mirror 用量、预算状态、branch 上的 context edit 数 |
+| `/clm status` | 只读状态：mirror 路径 / 字节 / token 预览、protected 块数、宿主用量、预算状态、branch 上的 context edit 数、auto-clear 行 |
 
 生命周期与文件协议见 [Live context mirror](./features/live-context-mirror.md)；工具契约见 [Cleanup 与 block index](./features/cleanup-tool.md)。
 
 ## 与 DSH 侧的差距
 
-同一份配置文件和同一套共享模块服务两个宿主，但 DSH 侧的以下功能在 Pi 侧没有对应实现：
+同一份配置文件和同一套共享模块服务两个宿主，但 DSH 侧的以下功能在 Pi 侧没有对应实现，或只有部分实现：
 
 | 功能 | DSH | Pi | 出处 |
 | --- | --- | --- | --- |
 | turn 内清理（`autoClear.midTurnSuffixTokens`） | 有 | 无；Pi 的 step 没有 turn 内结算点，该 key 在 Pi 上被解析但不产生效果 | [auto-clear.md](./features/auto-clear.md) 的 Pi 侧机制 |
-| 恢复时重放历史 clear 记录、拒收证据跨恢复保留 | 有（`snapshotEvents` + 记录里的 `keys`） | 无；恢复后 tracker 从零开始，历史块不参与提名（保守侧） | [auto-clear.md](./features/auto-clear.md) 的 Pi 侧机制 |
+| 恢复后保留 tracker 与拒收证据 | 有（`snapshotEvents` + 记录里的 `keys`） | 无；`context_edit` 由宿主重放，已清块不会被重清，但 tracker 从零开始，历史块不参与提名（保守侧） | [auto-clear.md](./features/auto-clear.md) 的 Pi 侧机制 |
 | 运行时 block index（`<oh-my-clm-block-index>`、`index.*`、`/clm mode` 进程级覆盖） | 有 | 无；模型只能打开 mirror 文件，`cleanup.resultMode: full` 时在工具结果里附一次刷新后的索引 | [cleanup-tool.md](./features/cleanup-tool.md) |
 | `context.fixedTokens` 计入 shrink gate 与状态 | 有 | 无；Pi 用 system prompt 估算代替 | `dsh/index.ts` |
-| 触发阈值 `cleanup.trigger.completedTurns` / `completedSteps` | 有 | 无；Pi 的 nudge 不读这两个 turn/step 时钟 | `dsh/index.ts`、`context-trigger.ts` |
-| `/clm status` 的 auto-clear 行（armed/stopped 原因、passes、cleared、re-reads、refused keys） | 有 | 无 | `dsh/index.ts` |
+| 触发阈值 `cleanup.trigger.completedTurns` / `completedSteps` | 有 | 无；Pi 只把 step 时钟用于 `stepsSinceCleanup` 与年龄规则，不把这两个 key 当作触发阈值 | `dsh/index.ts`、`context-trigger.ts` |
+| `/clm status` 的 auto-clear 行细节（armed/stopped、mid-turn、passes、cleared tokens、re-reads、error re-reads、refused keys、last 的 turn/token） | 有 | 部分；已有 mode（enabled/canary）、stopped 原因、passes、cleared blocks 与 last outcome/candidates，缺 cleared tokens、re-reads、error re-reads、refused keys、mid-turn 状态与 last 的 turn/token | `dsh/index.ts`、`extensions/clm.ts` |
 | canary 离线重放（`npm run canary:replay`） | 读 DSH 会话日志（zstd） | 无 Pi 会话读取器 | `scripts/canary-replay.mjs` 头注 |
-| 已清块折进索引（`[cleared …]` 行） | 有 | 无（没有自动清理，也没有运行时索引） | [cleanup-tool.md](./features/cleanup-tool.md) |
+| 已清块折进索引（`[set aside …]` 行） | 有 | 无；没有运行时索引，已清块只在下一次 mirror 同步时显示为占位符 | [cleanup-tool.md](./features/cleanup-tool.md) |
 
 ### 配置表里 Pi 不读的 key
 
@@ -50,7 +51,7 @@ Pi 宿主提供、扩展尚未使用的接缝（见 pi-coding-agent 的 `docs/ex
 
 | 接缝 | 可以用来做什么 |
 | --- | --- |
-| `pi.appendEntry` | 会话内持久账本（canary / quality 数据）；现在扩展状态在内存 Map 里，重启即失——mirror 会重建，nudge / cleanup 计数不会 |
+| `pi.appendEntry` | 会话内持久账本（canary / quality 数据）；现在扩展状态在内存 Map 里，重启即失——mirror 会重建，nudge、cleanup 与 auto-clear 的计数不会 |
 | `session_before_compact` / `session_compact` | compaction 后失效或重置扩展状态；现在计数跨 compaction 保留，mirror 靠 signature 失配在下一次请求重建 |
 | `before_provider_request` / `cache_warming_decision` | 观测真实前缀缓存行为，校准 `cleanup.cacheDiscountPercent` |
 | `registerShortcut` | 快捷键触发 `/clm status` 等小件 |
@@ -59,6 +60,10 @@ Pi 宿主提供、扩展尚未使用的接缝（见 pi-coding-agent 的 `docs/ex
 ## 哪些可以补
 
 按改动量与风险分档；每项给出接缝与必须保住的约束。
+
+### 小件：auto-clear 状态行细节
+
+`autoClearStatusLine` 已有 mode、passes、cleared blocks、last outcome 与 stopped 原因；`AutoClearState` 还记着 `clearedTokens`、`rereads`、`errorRereads` 与 `reread.refused`。补齐只是把这些字段拼进同一行，不需要新接缝。必须保住的约束：状态行只读，不改变计数或清理决定。
 
 ### 中件：运行时 block index
 
@@ -70,7 +75,7 @@ Pi 宿主提供、扩展尚未使用的接缝（见 pi-coding-agent 的 `docs/ex
 
 ### 补齐顺序建议
 
-中件 → 大件。每项落地前先写失败测试（AGENTS.md 的代码规则表）。
+小件 → 中件 → 大件。每项落地前先写失败测试（AGENTS.md 的代码规则表）。
 
 ## 明确不补
 

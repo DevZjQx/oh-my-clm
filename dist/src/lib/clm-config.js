@@ -42,7 +42,10 @@ export const DEFAULT_CLM_CONFIG = {
         staleSteps: 0,
         minAgeSteps: 2,
         maxAgeSteps: 4,
+        minResultTokens: 1_000,
+        clearImages: false,
         minTokens: 1_200,
+        minTokensWindowPercent: 5,
         minBlocks: 2,
         minSharePercent: 5,
         maxSuffixTokens: 0,
@@ -231,7 +234,10 @@ export function parseClmConfig(document, base = DEFAULT_CLM_CONFIG, source = "<m
         config.autoClear.staleSteps = readNumber(autoClear, "staleSteps", config.autoClear.staleSteps, source, "autoClear.staleSteps", warnings, { min: 0, integer: true });
         config.autoClear.minAgeSteps = readNumber(autoClear, "minAgeSteps", config.autoClear.minAgeSteps, source, "autoClear.minAgeSteps", warnings, { min: 0, integer: true });
         config.autoClear.maxAgeSteps = readNumber(autoClear, "maxAgeSteps", config.autoClear.maxAgeSteps, source, "autoClear.maxAgeSteps", warnings, { min: 0, integer: true });
+        config.autoClear.minResultTokens = readNumber(autoClear, "minResultTokens", config.autoClear.minResultTokens, source, "autoClear.minResultTokens", warnings, { min: 0 });
+        config.autoClear.clearImages = readBoolean(autoClear, "clearImages", config.autoClear.clearImages, source, "autoClear.clearImages", warnings);
         config.autoClear.minTokens = readNumber(autoClear, "minTokens", config.autoClear.minTokens, source, "autoClear.minTokens", warnings, { min: 0 });
+        config.autoClear.minTokensWindowPercent = readNumber(autoClear, "minTokensWindowPercent", config.autoClear.minTokensWindowPercent, source, "autoClear.minTokensWindowPercent", warnings, { min: 0, max: 100 });
         config.autoClear.minBlocks = readNumber(autoClear, "minBlocks", config.autoClear.minBlocks, source, "autoClear.minBlocks", warnings, { min: 1, integer: true });
         config.autoClear.minSharePercent = readNumber(autoClear, "minSharePercent", config.autoClear.minSharePercent, source, "autoClear.minSharePercent", warnings, { min: 0, max: 100 });
         config.autoClear.maxSuffixTokens = readNumber(autoClear, "maxSuffixTokens", config.autoClear.maxSuffixTokens, source, "autoClear.maxSuffixTokens", warnings, { min: 0 });

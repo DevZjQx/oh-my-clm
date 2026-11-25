@@ -40,6 +40,12 @@ export const DEFAULT_STALE_STEPS = 0;
  */
 export const DEFAULT_MIN_AGE_STEPS = 2;
 export const DEFAULT_MAX_AGE_STEPS = 4;
+/**
+ * A block smaller than this is not worth a pointer: about a thousand tokens, the
+ * size of a page of source. The batch gate alone would clear a 200-byte result
+ * next to a big one and pay a prefix break for a few dozen tokens.
+ */
+export const DEFAULT_MIN_RESULT_TOKENS = 1_000;
 function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -186,6 +192,14 @@ export class SupersessionTracker {
      */
     retired = new Set();
     resultsLanded = 0;
+    /**
+     * `resultsLanded` at the last request; a block that landed after it has never
+     * been sent. The opening state sent nothing, and a block landing always
+     * increments the counter, so an unlanded block cannot look sent by accident.
+     */
+    sentAt = 0;
+    /** `resultsLanded` at the session's first user-authored message. */
+    firstUserAt;
     constructor(options = {}) {
         this.options = {
             deadShare: options.deadShare ?? DEFAULT_DEAD_SHARE,
@@ -193,11 +207,44 @@ export class SupersessionTracker {
             staleSteps: options.staleSteps ?? DEFAULT_STALE_STEPS,
             minAgeSteps: options.minAgeSteps ?? DEFAULT_MIN_AGE_STEPS,
             maxAgeSteps: options.maxAgeSteps ?? DEFAULT_MAX_AGE_STEPS,
+            minResultTokens: options.minResultTokens ?? DEFAULT_MIN_RESULT_TOKENS,
+            images: options.images ?? false,
         };
     }
     /** Register one `tool/result` landing; call ages are counted in results. */
     noteBlockLanding() {
         this.resultsLanded += 1;
+    }
+    /**
+     * Mark a request boundary: every result that has landed is now part of the
+     * prompt the host is about to send.
+     *
+     * Clearing a result the model has never seen buys nothing — it removes tokens
+     * the model is still waiting for, and the model re-issues the call it thinks
+     * failed. A host calls this immediately before each model request (DSH
+     * `step/start`, Pi's `context` hook).
+     */
+    noteRequestSent() {
+        this.sentAt = this.resultsLanded;
+    }
+    /**
+     * Note the session's first user-authored message.
+     *
+     * Blocks that landed before it are bootstrap reads (a `SOUL.md`/`AGENTS.md`
+     * fetch the agent made to start up), not tool noise: whatever the model's
+     * instructions rest on is never cleared.
+     */
+    noteUserMessage() {
+        this.firstUserAt ??= this.resultsLanded;
+    }
+    /** Whether the model has been sent this block's result at least once. */
+    isSeen(blockId) {
+        const block = this.blocks.get(blockId);
+        return block?.landedAt !== undefined && block.landedAt <= this.sentAt;
+    }
+    /** Whether this block landed before the session's first user message. */
+    isBootstrap(block) {
+        return this.firstUserAt !== undefined && block.landedAt !== undefined && block.landedAt <= this.firstUserAt;
     }
     /** Tool results seen so far; the age of a call is measured in these. */
     get resultsSeen() {
@@ -208,6 +255,10 @@ export class SupersessionTracker {
      * records dead and re-evaluates the blocks that hold them.
      */
     noteCall(call) {
+        // An untracked call contributes no re-fetchable tokens, so a block that
+        // holds only images can never satisfy `isRefetchOnly` either.
+        if (call.name === "read_image" && !this.options.images)
+            return;
         const key = targetKeyOf(call.name, call.args);
         if (key === undefined)
             return;
@@ -317,16 +368,36 @@ export class SupersessionTracker {
      * Read-only on purpose: a pass that the gate, the occupancy floor, or a
      * missing projection skips must leave its candidates for the next boundary
      * instead of consuming them. Only {@link retire} removes a block.
+     *
+     * Two position rules come before any age or deadness rule: a block that
+     * landed before the session's first user message is never a candidate, and a
+     * block the model has not been sent yet is counted in {@link CanaryBatch.unseen}
+     * and left for a later boundary.
      */
     peekBatch(turn) {
         const candidates = [];
+        let unseen = 0;
         for (const [blockId, block] of this.blocks) {
             if (this.retired.has(blockId) || !this.isRefetchOnly(blockId))
+                continue;
+            // A block the pointer would barely shrink is not dead weight, whatever
+            // the rest of the batch frees: the clear costs a prefix break and the
+            // evidence the model's earlier replies rest on.
+            if (block.tokens < this.options.minResultTokens)
                 continue;
             const superseded = this.isDead(blockId);
             const stale = !superseded && this.isStale(blockId, turn);
             if (!superseded && !stale)
                 continue;
+            // A bootstrap read and a result the model has not been sent are both
+            // excluded by position, not by the gate: they are not rot, and clearing
+            // either one removes evidence the model never got to use.
+            if (this.isBootstrap(block))
+                continue;
+            if (!this.isSeen(blockId)) {
+                unseen += 1;
+                continue;
+            }
             // A superseded block names the dead calls, so the breaker can tell which
             // targets the pointer sent the model back to. A stale block names every
             // re-fetchable call it replaces, because the pointer has to describe them.
@@ -346,7 +417,7 @@ export class SupersessionTracker {
                 ...(ageSteps !== undefined ? { ageSteps } : {}),
             });
         }
-        return { candidates, tokens: candidates.reduce((total, candidate) => total + candidate.tokens, 0) };
+        return { candidates, tokens: candidates.reduce((total, candidate) => total + candidate.tokens, 0), ...(unseen > 0 ? { unseen } : {}) };
     }
     /** Whether a committed pass has already cleared this block. */
     isRetired(blockId) {
@@ -419,11 +490,30 @@ export function candidateRefused(policy, candidate) {
  * `autoClear.minTokens` / `autoClear.minBlocks` / `autoClear.minSharePercent`
  * from the config file; keep those defaults in sync with this constant.
  */
-export const DEFAULT_BATCH_GATE = { minTokens: 1_200, minBlocks: 2, minShare: 0.05, maxSuffixTokens: 0, minNetTokens: 0 };
-export function batchPassesGate(batch, gate = DEFAULT_BATCH_GATE, contextTokens = 0) {
+export const DEFAULT_BATCH_GATE = { minTokens: 1_200, minBlocks: 2, minShare: 0.05, maxSuffixTokens: 0, minNetTokens: 0, windowShare: 0.05 };
+/**
+ * Whether one batch is worth a prefix break.
+ *
+ * Three openings, and a host-reported window changes the first and disables the
+ * second:
+ *
+ * - **volume**: the batch frees `max(minTokens, windowShare · window)`. The
+ *   window share keeps the floor meaningful on a large model, where a fixed
+ *   thousand tokens is nothing.
+ * - **block count**: with no window there is no scale to derive, so the count
+ *   floor stands alone. With a window it never opens the gate on its own —
+ *   otherwise two tiny blocks clear it every boundary and the volume floor
+ *   never applies.
+ * - **dead share**: the batch is a meaningful fraction of what the model reads,
+ *   which is the anti-rot question, not the pricing one.
+ */
+export function batchPassesGate(batch, gate = DEFAULT_BATCH_GATE, contextTokens = 0, windowTokens = 0) {
     if (batch.candidates.length === 0)
         return false;
-    if (batch.tokens >= gate.minTokens || batch.candidates.length >= gate.minBlocks)
+    const windowFloor = gate.windowShare > 0 && windowTokens > 0 ? windowTokens * gate.windowShare : 0;
+    if (batch.tokens >= Math.max(gate.minTokens, windowFloor))
+        return true;
+    if (windowTokens <= 0 && batch.candidates.length >= gate.minBlocks)
         return true;
     if (!(gate.minShare > 0) || !(contextTokens > 0))
         return false;

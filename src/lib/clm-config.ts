@@ -107,7 +107,29 @@ export interface ClmAutoClearConfig {
 	 * / `DEFAULT_MAX_AGE_STEPS` in `auto-clear.ts`.
 	 */
 	maxAgeSteps: number;
+	/**
+	 * Smallest block, in estimated tokens, a pass may replace. A pointer for a
+	 * small result frees little, breaks the prefix once, and removes what the
+	 * model's earlier answers were written from; the batch gate cannot see that
+	 * because several small blocks together clear its floor. `0` disables.
+	 * Keep the default in sync with `DEFAULT_MIN_RESULT_TOKENS`.
+	 */
+	minResultTokens: number;
+	/**
+	 * Whether a `read_image` result is a clearable block. Off by default: replacing
+	 * an image part with text changes the message's shape, and image history
+	 * belongs to compaction. Turning it on trades a real prefix break for a real
+	 * saving on screenshot-heavy sessions.
+	 */
+	clearImages: boolean;
 	minTokens: number;
+	/**
+	 * The same floor as a share of the model's window (%): the gate needs
+	 * `max(minTokens, this% of the window)`. A fixed floor is a rounding error in a
+	 * large window, so the count path would decide every boundary instead.
+	 * `0` disables the window term.
+	 */
+	minTokensWindowPercent: number;
 	minBlocks: number;
 	/**
 	 * Dead share of the live prompt (%) that opens the gate on its own.
@@ -221,7 +243,10 @@ export const DEFAULT_CLM_CONFIG: ClmConfig = {
 		staleSteps: 0,
 		minAgeSteps: 2,
 		maxAgeSteps: 4,
+		minResultTokens: 1_000,
+		clearImages: false,
 		minTokens: 1_200,
+		minTokensWindowPercent: 5,
 		minBlocks: 2,
 		minSharePercent: 5,
 		maxSuffixTokens: 0,
@@ -474,7 +499,10 @@ export function parseClmConfig(
 		config.autoClear.staleSteps = readNumber(autoClear, "staleSteps", config.autoClear.staleSteps, source, "autoClear.staleSteps", warnings, { min: 0, integer: true });
 		config.autoClear.minAgeSteps = readNumber(autoClear, "minAgeSteps", config.autoClear.minAgeSteps, source, "autoClear.minAgeSteps", warnings, { min: 0, integer: true });
 		config.autoClear.maxAgeSteps = readNumber(autoClear, "maxAgeSteps", config.autoClear.maxAgeSteps, source, "autoClear.maxAgeSteps", warnings, { min: 0, integer: true });
+		config.autoClear.minResultTokens = readNumber(autoClear, "minResultTokens", config.autoClear.minResultTokens, source, "autoClear.minResultTokens", warnings, { min: 0 });
+		config.autoClear.clearImages = readBoolean(autoClear, "clearImages", config.autoClear.clearImages, source, "autoClear.clearImages", warnings);
 		config.autoClear.minTokens = readNumber(autoClear, "minTokens", config.autoClear.minTokens, source, "autoClear.minTokens", warnings, { min: 0 });
+		config.autoClear.minTokensWindowPercent = readNumber(autoClear, "minTokensWindowPercent", config.autoClear.minTokensWindowPercent, source, "autoClear.minTokensWindowPercent", warnings, { min: 0, max: 100 });
 		config.autoClear.minBlocks = readNumber(autoClear, "minBlocks", config.autoClear.minBlocks, source, "autoClear.minBlocks", warnings, { min: 1, integer: true });
 		config.autoClear.minSharePercent = readNumber(autoClear, "minSharePercent", config.autoClear.minSharePercent, source, "autoClear.minSharePercent", warnings, { min: 0, max: 100 });
 		config.autoClear.maxSuffixTokens = readNumber(autoClear, "maxSuffixTokens", config.autoClear.maxSuffixTokens, source, "autoClear.maxSuffixTokens", warnings, { min: 0 });

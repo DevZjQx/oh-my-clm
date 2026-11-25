@@ -2,9 +2,13 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
 	CLEAR_EVENT_TYPE,
+	CLEAR_LABEL_MAX_CHARS,
+	CLEAR_PLACEHOLDER_MAX_CHARS,
 	CLEAR_PLACEHOLDER_PREFIX,
+	CLEAR_PLACEHOLDER_V1_PREFIX,
 	CLEAR_VERSION,
 	clearPlaceholder,
+	clearPlaceholderV1,
 	clearProjection,
 	compactTokens,
 } from "../../../src/features/live-context/clear-projection.ts";
@@ -44,11 +48,24 @@ function context(overrides: { nodes?: number[]; events?: Record<number, unknown>
 	};
 }
 
-const event = { seq: 12, type: CLEAR_EVENT_TYPE, data: { v: CLEAR_VERSION, targets: [{ seq: 7, label: "read /a.ts:1-3", tokens: 3_400 }] } };
+/** The pointer a writer stores with the decision; the projection prefers it. */
+const pointer = clearPlaceholder("read /a.ts:1-3", 3_400);
 
-test("placeholder is one line, names the pointer, and starts with the marker", () => {
+const event = {
+	seq: 12,
+	type: CLEAR_EVENT_TYPE,
+	data: { v: CLEAR_VERSION, targets: [{ seq: 7, label: "read /a.ts:1-3", tokens: 3_400, text: pointer }] },
+};
+
+/** A record written before the pointer carried its text. */
+const legacyEvent = { seq: 12, type: CLEAR_EVENT_TYPE, data: { v: CLEAR_VERSION, targets: [{ seq: 7, label: "read /a.ts:1-3", tokens: 3_400 }] } };
+
+test("placeholder is one line, names the tool and the size, and starts with the marker", () => {
 	const text = clearPlaceholder("read /a.ts:1-3", 3_400);
-	assert.equal(text, "[cleared 3.4k tok · read /a.ts:1-3 · re-read before editing]");
+	assert.equal(
+		text,
+		"[set aside to save space · read /a.ts:1-3 · you read its 3.4k tok in full at the time and wrote your later replies from it · re-read before editing]",
+	);
 	assert.equal(text.includes("\n"), false);
 	assert.equal(text.startsWith(CLEAR_PLACEHOLDER_PREFIX), true);
 });
@@ -67,6 +84,56 @@ test("the placeholder carries the clearing receipt, not just an invitation", () 
 	assert.doesNotMatch(text, /re-read if needed/);
 	assert.doesNotMatch(text, /the user still sees/, "a per-turn fact is not repeated per block");
 	assert.equal(text.includes("\n"), false);
+});
+
+/**
+ * A pointer a model reads as "this call returned nothing" makes it disown the
+ * answers it built on the result — a larger loss than the tokens the clear
+ * saved. The line therefore says the result was there, that it was read, and
+ * that it was set aside; it never says the output was cleared.
+ */
+test("the pointer says the result was read and set aside, not that it came back empty", () => {
+	const text = clearPlaceholder("read /a.ts:1-3", 3_400);
+	assert.match(text, /set aside to save space/);
+	assert.match(text, /you read its 3\.4k tok in full at the time/);
+	assert.match(text, /wrote your later replies from it/);
+	assert.doesNotMatch(text, /\bcleared\b/, "a model takes 'cleared' to mean the call returned nothing");
+	assert.doesNotMatch(text, /no longer available/);
+	assert.doesNotMatch(text, /returned nothing/);
+});
+
+/**
+ * A record that stores its text must replay to exactly those bytes, whatever the
+ * running build's renderer says; a record that carries none is the v1 format and
+ * replays through the frozen v1 renderer. Either way the model-visible copy of a
+ * decided block cannot move when this file's wording changes.
+ */
+test("a stored pointer replays verbatim and a v1 record keeps the frozen wording", () => {
+	const pinned = "[set aside to save space · read /a.ts:1-3 · an earlier build's sentence]";
+	const stored = {
+		...event,
+		data: { v: CLEAR_VERSION, targets: [{ seq: 7, label: "read /a.ts:1-3", tokens: 3_400, text: pinned }] },
+	};
+	const storedMessage = clearProjection.project(stored, context()).get(7) as Record<string, unknown>;
+	assert.deepEqual(storedMessage.content, [{ type: "text", text: pinned }]);
+
+	const legacyMessage = clearProjection.project(legacyEvent, context()).get(7) as Record<string, unknown>;
+	assert.deepEqual(legacyMessage.content, [{ type: "text", text: clearPlaceholderV1("read /a.ts:1-3", 3_400) }]);
+	assert.equal(clearPlaceholderV1("read /a.ts:1-3", 3_400), "[cleared 3.4k tok · read /a.ts:1-3 · re-read before editing]");
+	assert.equal(clearPlaceholderV1("read /a.ts:1-3", 3_400).startsWith(CLEAR_PLACEHOLDER_V1_PREFIX), true);
+});
+
+/**
+ * The longest label the projection accepts is the worst case a writer can reach,
+ * and the record bound has to leave room for it: a pointer past the bound makes
+ * the record throw on replay, which takes the whole session log with it.
+ */
+test("the longest accepted label still yields a pointer inside the record bound", () => {
+	const longest = clearPlaceholder("x".repeat(CLEAR_LABEL_MAX_CHARS), 1_000);
+	assert.ok(
+		longest.length <= CLEAR_PLACEHOLDER_MAX_CHARS,
+		`a ${longest.length}-character pointer exceeds the ${CLEAR_PLACEHOLDER_MAX_CHARS}-character record bound`,
+	);
 });
 
 /**
@@ -108,14 +175,14 @@ test("a valid decision replaces the body and preserves message identity", () => 
 	assert.equal(message.toolCallId, "call_7");
 	assert.equal(message.isError, false);
 	assert.deepEqual(message.source, { kind: "tool", callId: "call_7" });
-	assert.deepEqual(message.content, [{ type: "text", text: clearPlaceholder("read /a.ts:1-3", 3_400) }]);
+	assert.deepEqual(message.content, [{ type: "text", text: pointer }]);
 });
 
 test("the projection rewrites the current message, not the original event body", () => {
 	const previouslyProjected = { ...originalMessage, content: [{ type: "text", text: `already shortened by another projection\n${bodyText}` }] };
 	const updates = clearProjection.project(event, context({ messages: new Map([[7, previouslyProjected]]) }));
 	const message = updates.get(7) as Record<string, unknown>;
-	assert.deepEqual(message.content, [{ type: "text", text: clearPlaceholder("read /a.ts:1-3", 3_400) }]);
+	assert.deepEqual(message.content, [{ type: "text", text: pointer }]);
 });
 
 test("every malformed decision throws instead of being skipped", () => {
@@ -128,6 +195,10 @@ test("every malformed decision throws instead of being skipped", () => {
 		{ name: "empty label", data: { v: CLEAR_VERSION, targets: [{ seq: 7, label: "", tokens: 1 }] } },
 		{ name: "oversized label", data: { v: CLEAR_VERSION, targets: [{ seq: 7, label: "x".repeat(201), tokens: 1 }] } },
 		{ name: "negative tokens", data: { v: CLEAR_VERSION, targets: [{ seq: 7, label: "x", tokens: -1 }] } },
+		{ name: "text is not a string", data: { v: CLEAR_VERSION, targets: [{ seq: 7, label: "x", tokens: 1, text: 7 }] } },
+		{ name: "empty text", data: { v: CLEAR_VERSION, targets: [{ seq: 7, label: "x", tokens: 1, text: "" }] } },
+		{ name: "text with a newline", data: { v: CLEAR_VERSION, targets: [{ seq: 7, label: "x", tokens: 1, text: "[set aside\nmore]" }] } },
+		{ name: "oversized text", data: { v: CLEAR_VERSION, targets: [{ seq: 7, label: "x", tokens: 1, text: "x".repeat(CLEAR_PLACEHOLDER_MAX_CHARS + 1) }] } },
 		{ name: "duplicate seq", data: { v: CLEAR_VERSION, targets: [{ seq: 7, label: "x", tokens: 1 }, { seq: 7, label: "y", tokens: 1 }] } },
 		{ name: "not a tool result", data: { v: CLEAR_VERSION, targets: [{ seq: 3, label: "x", tokens: 1 }] } },
 		{
@@ -162,7 +233,7 @@ test("a stale target does not stop its live siblings from being cleared", () => 
 			v: CLEAR_VERSION,
 			targets: [
 				{ seq: 8, label: "read /gone.ts", tokens: 900 },
-				{ seq: 7, label: "read /a.ts:1-3", tokens: 3_400 },
+				{ seq: 7, label: "read /a.ts:1-3", tokens: 3_400, text: pointer },
 			],
 		},
 	};
@@ -195,7 +266,7 @@ test("target keys are replay metadata and never reach the model", () => {
 		...event,
 		data: {
 			v: CLEAR_VERSION,
-			targets: [{ seq: 7, label: "read /a.ts:1-3", tokens: 3_400, keys: ["read\u0000/a.ts"] }],
+			targets: [{ seq: 7, label: "read /a.ts:1-3", tokens: 3_400, text: pointer, keys: ["read\u0000/a.ts"] }],
 		},
 	};
 	const plain = clearProjection.project(event, context());

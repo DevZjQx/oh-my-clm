@@ -232,6 +232,35 @@ test("the rot rule clears inside an age window", () => {
 });
 
 /**
+ * Two new floors and one opt-in: the per-block floor keeps a small result out of
+ * a batch that cleared the volume gate, the window share scales that gate, and an
+ * image is history until a config says otherwise. Each ships with a default the
+ * selector also names, so a typo warns instead of silently clearing differently.
+ */
+test("the per-block floor, the window share, and the image switch are their own keys", () => {
+	assert.equal(DEFAULT_CLM_CONFIG.autoClear.minResultTokens, 1_000);
+	assert.equal(DEFAULT_CLM_CONFIG.autoClear.clearImages, false);
+	assert.equal(DEFAULT_CLM_CONFIG.autoClear.minTokensWindowPercent, 5);
+
+	const parsed = parseClmConfig({
+		autoClear: { minResultTokens: 0, clearImages: true, minTokensWindowPercent: 12 },
+	}, DEFAULT_CLM_CONFIG, "floors.json");
+	assert.deepEqual(parsed.warnings, []);
+	assert.equal(parsed.config.autoClear.minResultTokens, 0, "0 is the documented way to turn the floor off");
+	assert.equal(parsed.config.autoClear.clearImages, true);
+	assert.equal(parsed.config.autoClear.minTokensWindowPercent, 12);
+
+	const bad = parseClmConfig({
+		autoClear: { minResultTokens: -1, clearImages: "yes", minTokensWindowPercent: 150 },
+	}, DEFAULT_CLM_CONFIG, "bad-floors.json");
+	assert.equal(bad.config.autoClear.minResultTokens, 1_000);
+	assert.equal(bad.config.autoClear.clearImages, false);
+	assert.equal(bad.config.autoClear.minTokensWindowPercent, 100, "a share of the window is clamped to the window, like minSharePercent");
+	assert.ok(bad.warnings.some((warning) => warning.includes("autoClear.minResultTokens")));
+	assert.ok(bad.warnings.some((warning) => warning.includes("autoClear.clearImages")));
+});
+
+/**
  * The money channel is opt-in: the rot channel's decisions must not change
  * until a config names it, and a typo in the channel falls back to `rot`
  * instead of silently pricing every batch.

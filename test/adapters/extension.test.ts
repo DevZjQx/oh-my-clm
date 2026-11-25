@@ -1894,6 +1894,11 @@ function autoClearHarness(cwd: string, sessionId: string, entries: AutoReadEntry
 	return { handlers, ctx, entries, notifications };
 }
 
+/** The host sends a request between two boundaries: that is what makes a landed result seen. */
+async function nextRequest(h: AutoClearHarness): Promise<void> {
+	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+}
+
 /** The step whose assistant message re-read the target and carried its result. */
 function reReadEvent(entries: AutoReadEntry[], assistantId: string, resultEntryId: string): Record<string, unknown> {
 	const assistant = entries.find((entry) => entry.sourceEntry.id === assistantId);
@@ -1919,6 +1924,7 @@ test("autoClear.enabled replaces a superseded read result with a re-read pointer
 	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
 
 	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	await nextRequest(h);
 	const event = reReadEvent(entries, "assistant-2", "tool-2");
 	const result = await h.handlers.get("turn_end")?.(event, h.ctx) as { entries: Array<Record<string, unknown>> } | undefined;
 	assert.ok(result, "the boundary returns entries");
@@ -1927,9 +1933,81 @@ test("autoClear.enabled replaces a superseded read result with a re-read pointer
 	const edit = edits[0];
 	assert.equal(edit.targetId, "tool-1");
 	const pointer = (edit.replacement as { content: Array<{ text: string }> }).content[0]?.text ?? "";
-	assert.match(pointer, /^\[cleared \d[\d.]*k? tok · read src\/big\.ts · re-read before editing\]$/);
+	assert.match(pointer, /^\[set aside to save space · read src\/big\.ts · you read its \d[\d.]*k? tok in full at the time and wrote your later replies from it · re-read before editing\]$/);
 	assert.ok(pointer.length < body1.length, "the pointer is shorter than the body it replaces");
 	assert.equal(result.entries.some((entry) => entry.targetId === "tool-2"), false, "the live read result stays");
+});
+
+/**
+ * The boundary that lands a result has not sent it yet: the next request does.
+ * Clearing there removes what the model is still waiting for, so the guard holds
+ * the batch back and says so, instead of clearing and being re-read.
+ */
+test("a result landing at a boundary is not cleared at that same boundary", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-autoclear-unseen-"));
+	writeConfig(cwd, { autoClear: { enabled: true, canary: true } });
+	const entries = supersededReadEntries(heavyToolBody("x"), heavyToolBody("y"));
+	const h = autoClearHarness(cwd, path.basename(cwd), entries);
+	await h.handlers.get("session_start")?.({}, h.ctx);
+	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+
+	// A parallel double read of one target in a single step: the second call
+	// covers the first, and neither result has been in a request yet.
+	const landed = await h.handlers.get("turn_end")?.(
+		{
+			entries: [],
+			turnIndex: 0,
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "src/big.ts" } },
+					{ type: "toolCall", id: "call-2", name: "read", arguments: { path: "src/big.ts" } },
+				],
+			},
+			toolResults: entries.filter((entry) => entry.sourceEntry.id.startsWith("tool-")).map((entry) => entry.messages[0]),
+			messageEntryId: "assistant-2",
+			toolResultEntryIds: ["tool-1", "tool-2"],
+		},
+		h.ctx,
+	) as { entries: Array<Record<string, unknown>> } | undefined;
+	assert.equal((landed?.entries ?? []).filter((entry) => entry.type === "context_edit").length, 0, "an unseen result is not cleared");
+	const lines = fs.readFileSync(sessionCanaryPath(path.basename(cwd)), "utf8").trim().split("\n");
+	const record = JSON.parse(lines[lines.length - 1]);
+	assert.equal(record.outcome, "no-candidate");
+	assert.equal(record.unseen, 1, "the ledger separates a held-back block from a quiet boundary");
+
+	// The next request carries both results; the following boundary may clear.
+	await nextRequest(h);
+	const later = await h.handlers.get("turn_end")?.({ entries: [] }, h.ctx) as { entries: Array<Record<string, unknown>> } | undefined;
+	assert.ok(
+		(later?.entries ?? []).some((entry) => entry.type === "context_edit" && entry.targetId === "tool-1"),
+		"once the model has been sent the result, the dead block is cleared",
+	);
+});
+
+/**
+ * The batch gate prices a batch; a pointer is worth it per block. A 200-byte
+ * result next to a large dead one must not be replaced: the clear would break
+ * the prefix and remove what the model's answer was written from.
+ */
+test("a result below the per-block floor stays, whatever the batch frees", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-autoclear-floor-"));
+	writeConfig(cwd, { autoClear: { enabled: true } });
+	const smallBody = `const data = "${"x".repeat(600)}";`;
+	const entries = supersededReadEntries(smallBody, heavyToolBody("y"));
+	const h = autoClearHarness(cwd, path.basename(cwd), entries);
+	await h.handlers.get("session_start")?.({}, h.ctx);
+	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	await nextRequest(h);
+	const cleared = await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-2", "tool-2"), h.ctx) as
+		| { entries: Array<Record<string, unknown>> }
+		| undefined;
+	assert.equal(
+		(cleared?.entries ?? []).some((entry) => entry.type === "context_edit" && entry.targetId === "tool-1"),
+		false,
+		"a small result is kept even though the boundary is otherwise willing to clear",
+	);
 });
 
 test("autoClear.canary records the decision without changing model input", async () => {
@@ -1943,6 +2021,7 @@ test("autoClear.canary records the decision without changing model input", async
 	const before = fs.readFileSync(mirrorPath, "utf8");
 
 	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	await nextRequest(h);
 	const event = reReadEvent(entries, "assistant-2", "tool-2");
 	const result = await h.handlers.get("turn_end")?.(event, h.ctx);
 	assert.equal(result, undefined, "canary mode emits no boundary entries");
@@ -1969,6 +2048,7 @@ test("a replayed boundary does not clear an already-cleared block again", async 
 	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
 
 	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	await nextRequest(h);
 	const event = reReadEvent(entries, "assistant-2", "tool-2");
 	const first = await h.handlers.get("turn_end")?.(event, h.ctx) as { entries: Array<Record<string, unknown>> };
 	const edit = first.entries.find((entry) => entry.type === "context_edit" && entry.targetId === "tool-1");
@@ -1979,13 +2059,13 @@ test("a replayed boundary does not clear an already-cleared block again", async 
 	// mirror from it. Replaying the same boundary must then be a no-op.
 	(entries[2].messages[0].content as unknown[]) = [{ type: "text", text: pointer }];
 	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
-	assert.match(fs.readFileSync(sessionMirrorPath(path.basename(cwd)), "utf8"), /\[cleared /);
+	assert.match(fs.readFileSync(sessionMirrorPath(path.basename(cwd)), "utf8"), /\[set aside to save space/);
 
 	// The next boundary carries no new traffic: the retired block must stay
 	// retired and the pointer must stay in the mirror.
 	const second = await h.handlers.get("turn_end")?.({ entries: [] }, h.ctx) as { entries: Array<Record<string, unknown>> } | undefined;
 	assert.equal((second?.entries ?? []).length, 0, "the second boundary must not clear the block again");
-	assert.match(fs.readFileSync(sessionMirrorPath(path.basename(cwd)), "utf8"), /\[cleared /);
+	assert.match(fs.readFileSync(sessionMirrorPath(path.basename(cwd)), "utf8"), /\[set aside to save space/);
 });
 
 test("an uncommitted mirror edit defers auto-clear to the next boundary", async () => {
@@ -1995,11 +2075,14 @@ test("an uncommitted mirror edit defers auto-clear to the next boundary", async 
 	const h = autoClearHarness(cwd, path.basename(cwd), entries);
 	await h.handlers.get("session_start")?.({}, h.ctx);
 	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	await nextRequest(h);
+	// The model edits the mirror by hand after the request that sent tool-1, so the
+	// next boundary has both an uncommitted edit and a clearable block.
 	const mirrorPath = sessionMirrorPath(path.basename(cwd));
 	const mirror = fs.readFileSync(mirrorPath, "utf8");
 	fs.writeFileSync(mirrorPath, mirror.replace("Anchor body.", "Anchor."));
 
-	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
 	const event = reReadEvent(entries, "assistant-2", "tool-2");
 	const result = await h.handlers.get("turn_end")?.(event, h.ctx) as { entries: Array<Record<string, unknown>> };
 	assert.ok(result.entries.some((entry) => entry.type === "context_edit" && entry.targetId === "anchor"), "the manual edit still commits");
@@ -2008,7 +2091,31 @@ test("an uncommitted mirror edit defers auto-clear to the next boundary", async 
 		false,
 		"a boundary with an uncommitted manual edit does not clear anything",
 	);
-	assert.doesNotMatch(fs.readFileSync(mirrorPath, "utf8"), /\[cleared /);
+	assert.doesNotMatch(fs.readFileSync(mirrorPath, "utf8"), /\[set aside to save space/);
+});
+
+/**
+ * The window is what the volume floor scales on: with one reported, two blocks
+ * are not an opening by themselves, and the pass records a closed gate instead
+ * of breaking the prefix for a few hundred tokens.
+ */
+test("on a reported window, block count alone does not open the gate", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "oh-my-clm-autoclear-window-"));
+	writeConfig(cwd, {
+		autoClear: { enabled: true, canary: true, minTokens: 0, minBlocks: 1, minSharePercent: 0, minTokensWindowPercent: 5 },
+	});
+	const entries = supersededReadEntries(heavyToolBody("x"), heavyToolBody("y"));
+	const h = autoClearHarness(cwd, path.basename(cwd), entries, { tokens: 4_000, contextWindow: 100_000, percent: 4 });
+	await h.handlers.get("session_start")?.({}, h.ctx);
+	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
+	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	await nextRequest(h);
+	const cleared = await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-2", "tool-2"), h.ctx) as
+		| { entries: Array<Record<string, unknown>> }
+		| undefined;
+	assert.equal((cleared?.entries ?? []).length, 0, "1.7k tokens is under 5% of a 100k window");
+	const lines = fs.readFileSync(sessionCanaryPath(path.basename(cwd)), "utf8").trim().split("\n");
+	assert.equal(JSON.parse(lines[lines.length - 1]).outcome, "gate");
 });
 
 test("autoClear.enabled clears an old all-refetchable block without a superseder", async () => {
@@ -2034,6 +2141,7 @@ test("autoClear.enabled clears an old all-refetchable block without a superseder
 	await h.handlers.get("agent_start")?.({}, h.ctx);
 	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
 	const landed = await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	await nextRequest(h);
 	assert.equal(landed, undefined, "a fresh block is not rot yet");
 
 	await h.handlers.get("agent_start")?.({}, h.ctx);
@@ -2045,7 +2153,7 @@ test("autoClear.enabled clears an old all-refetchable block without a superseder
 	assert.equal(edits.length, 1, "the old all-refetchable block is cleared without a superseder");
 	assert.equal(edits[0].targetId, "tool-1");
 	const pointer = (edits[0].replacement as { content: Array<{ text: string }> }).content[0]?.text ?? "";
-	assert.match(pointer, /^\[cleared .* · read src\/old\.ts · re-read before editing\]$/);
+	assert.match(pointer, /^\[set aside to save space · read src\/old\.ts · .*re-read before editing\]$/);
 });
 
 test("autoClear stops at the occupancy line and leaves the batch for compaction", async () => {
@@ -2057,6 +2165,7 @@ test("autoClear stops at the occupancy line and leaves the batch for compaction"
 	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
 
 	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	await nextRequest(h);
 	const event = reReadEvent(entries, "assistant-2", "tool-2");
 	const result = await h.handlers.get("turn_end")?.(event, h.ctx);
 	assert.equal(result, undefined, "an occupied session does not clear");
@@ -2074,7 +2183,9 @@ test("a re-read of a cleared target is counted in the canary ledger", async () =
 	await h.handlers.get("session_start")?.({}, h.ctx);
 	await h.handlers.get("context")?.({ messages: [] }, h.ctx);
 	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-1", "tool-1"), h.ctx);
+	await nextRequest(h);
 	await h.handlers.get("turn_end")?.(reReadEvent(entries, "assistant-2", "tool-2"), h.ctx);
+	await nextRequest(h);
 
 	// The model comes back to the cleared target: one more read of the same path,
 	// whose result supersedes the second read's block.

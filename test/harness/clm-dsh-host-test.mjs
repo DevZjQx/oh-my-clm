@@ -56,6 +56,9 @@ function setHarnessAutoClear(patch) {
 	harnessConfig = { ...harnessConfig, autoClear: { ...(harnessConfig.autoClear ?? {}), ...patch } };
 	writeHarnessConfig();
 }
+// Sections below isolate one rule at a time, so the per-block floor starts off;
+// a section that exercises it sets a real value.
+setHarnessAutoClear({ minResultTokens: 0 });
 function setHarnessHost(patch) {
 	harnessConfig = { ...harnessConfig, host: { ...(harnessConfig.host ?? {}), ...patch } };
 	writeHarnessConfig();
@@ -664,6 +667,12 @@ section("11. clearing canary");
 	const { host } = await boot(plugin, { sessionId: session.id, session });
 	const before = session.events.length;
 	const feed = async (type, data) => {
+		// The step whose results just landed has not been sent yet; DSH opens the
+		// next step with `step/start`, which is the request that carries them.
+		if (type === "turn/end") {
+			const opened = session.append("step/start", { turn: data.turn, step: 0 });
+			await host.emit("session/event", session, { type: "step/start", seq: opened.seq, data: opened.data });
+		}
 		const appended = session.append(type, data);
 		await host.emit("session/event", session, { type, seq: appended.seq, data: appended.data });
 	};
@@ -692,7 +701,7 @@ section("11. clearing canary");
 			&& record.quality.turn?.rereads === 0,
 		JSON.stringify(record.quality ?? null),
 	);
-	check("canary writes no session event", session.events.length === before + 5, String(session.events.length - before));
+	check("canary writes no session event", session.events.length === before + 6, String(session.events.length - before));
 	check("canary leaves the surface untouched", session.surfaceSeq.length === session.events.filter((event) => SURFACE_EVENT_TYPES.has(event.type)).length);
 	host.disposeAll();
 	cleanup(session.id);
@@ -703,6 +712,12 @@ section("11. clearing canary");
 	const clearSession = sessionWithHistory("t-auto-clear");
 	const clearBoot = await boot(plugin, { sessionId: clearSession.id, session: clearSession });
 	const clearFeed = async (type, data) => {
+		// The step whose results just landed has not been sent yet; DSH opens the
+		// next step with `step/start`, which is the request that carries them.
+		if (type === "turn/end") {
+			const opened = clearSession.append("step/start", { turn: data.turn, step: 0 });
+			await clearBoot.host.emit("session/event", clearSession, { type: "step/start", seq: opened.seq, data: opened.data });
+		}
 		const appended = clearSession.append(type, data);
 		await clearBoot.host.emit("session/event", clearSession, { type, seq: appended.seq, data: appended.data });
 		return appended;
@@ -733,6 +748,11 @@ section("11. clearing canary");
 	const clearTargets = clearRecords[0]?.data?.targets ?? [];
 	check("the record targets the superseded tool result", clearTargets[0]?.seq === firstResult.seq, JSON.stringify(clearTargets));
 	check("the record carries a pointer label", typeof clearTargets[0]?.label === "string" && clearTargets[0].label.startsWith("grep "), String(clearTargets[0]?.label));
+	check(
+		"the record stores the text the model is shown, so a replay cannot reword it",
+		typeof clearTargets[0]?.text === "string" && clearTargets[0].text.startsWith("[set aside to save space"),
+		String(clearTargets[0]?.text),
+	);
 	check("the record adds no surface node", clearSession.surfaceSeq.includes(clearRecords[0]?.seq) === false);
 	const registered = clearBoot.host.projections.find((definition) => definition.type === "plugin:oh-my-clm/clear");
 	check("the plugin registered the clearing projection", registered !== undefined);
@@ -750,9 +770,10 @@ section("11. clearing canary");
 	}
 	const rewritten = projected?.get(firstResult.seq);
 	const rewrittenText = Array.isArray(rewritten?.content) ? rewritten.content.map((block) => block.text ?? "").join("") : "";
-	check("the projection replaces the body with a re-read pointer", rewrittenText.startsWith("[cleared"), rewrittenText.slice(0, 60));
+	check("the projection replaces the body with a re-read pointer", rewrittenText.startsWith("[set aside to save space"), rewrittenText.slice(0, 60));
 	check("the projection keeps the message identity", rewritten?.id === `tcall_auto_1` && rewritten?.toolCallId === "call_auto_1", JSON.stringify({ id: rewritten?.id }));
 	check("the durable event keeps the original body", firstResult.data.message.content[0].text.length === bigOutput.length);
+	check("the projection shows exactly the recorded text", rewrittenText === clearTargets[0]?.text, `${rewrittenText.slice(0, 40)} vs ${String(clearTargets[0]?.text).slice(0, 40)}`);
 
 	// The ledger records the outcome side of a clear as well: blocks retired and
 	// the prompt size the decision was made against.
@@ -822,6 +843,12 @@ section("11. clearing canary");
 	const lateSession = sessionWithHistory("t-auto-clear-late");
 	const lateBoot = await boot(plugin, { sessionId: lateSession.id, session: lateSession, deferInject: true });
 	const lateFeed = async (type, data) => {
+		// The step whose results just landed has not been sent yet; DSH opens the
+		// next step with `step/start`, which is the request that carries them.
+		if (type === "turn/end") {
+			const opened = lateSession.append("step/start", { turn: data.turn, step: 0 });
+			await lateBoot.host.emit("session/event", lateSession, { type: "step/start", seq: opened.seq, data: opened.data });
+		}
 		const appended = lateSession.append(type, data);
 		await lateBoot.host.emit("session/event", lateSession, { type, seq: appended.seq, data: appended.data });
 		return appended;
@@ -854,6 +881,7 @@ section("11. clearing canary");
 	resumed.append("tool/result", { turn: 1, step: 1, message: toolResultMessage("call_resume_1", "hit ".repeat(800)) });
 	resumed.append("tool/call", { turn: 1, step: 2, callId: "call_resume_2", name: "grep", arguments: JSON.stringify({ pattern: "resume" }) });
 	resumed.append("tool/result", { turn: 1, step: 2, message: toolResultMessage("call_resume_2", "hit ".repeat(800)) });
+	resumed.append("step/start", { turn: 2, step: 1 });
 	const resumedBoot = await boot(plugin, { sessionId: resumed.id, session: resumed });
 	const endEvent = resumed.append("turn/end", { turn: 2 });
 	await resumedBoot.host.emit("session/event", resumed, { type: "turn/end", seq: endEvent.seq, data: endEvent.data });
@@ -873,6 +901,7 @@ section("11. clearing canary");
 	closed.append("tool/result", { turn: 1, step: 1, message: toolResultMessage("call_closed_1", "hit ".repeat(800)) });
 	closed.append("tool/call", { turn: 1, step: 2, callId: "call_closed_2", name: "grep", arguments: JSON.stringify({ pattern: "closed" }) });
 	closed.append("tool/result", { turn: 1, step: 2, message: toolResultMessage("call_closed_2", "hit ".repeat(800)) });
+	closed.append("step/start", { turn: 2, step: 1 });
 	closed.append("turn/end", { turn: 1 });
 	const closedBoot = await boot(plugin, { sessionId: closed.id, session: closed });
 	const closedEnd = closed.append("turn/end", { turn: 2 });
@@ -893,6 +922,12 @@ section("12. clearing both sides of a skipped pass");
 	const session = sessionWithHistory("t-auto-clear-accumulate");
 	const { host } = await boot(plugin, { sessionId: session.id, session });
 	const feed = async (type, data) => {
+		// The step whose results just landed has not been sent yet; DSH opens the
+		// next step with `step/start`, which is the request that carries them.
+		if (type === "turn/end") {
+			const opened = session.append("step/start", { turn: data.turn, step: 0 });
+			await host.emit("session/event", session, { type: "step/start", seq: opened.seq, data: opened.data });
+		}
 		const appended = session.append(type, data);
 		await host.emit("session/event", session, { type, seq: appended.seq, data: appended.data });
 		return appended;
@@ -946,6 +981,12 @@ section("13. mid-turn clearing is rationed and cost-gated");
 	const session = sessionWithHistory("t-auto-clear-midturn");
 	const { host } = await boot(plugin, { sessionId: session.id, session });
 	const feed = async (type, data) => {
+		// The step whose results just landed has not been sent yet; DSH opens the
+		// next step with `step/start`, which is the request that carries them.
+		if (type === "turn/end") {
+			const opened = session.append("step/start", { turn: data.turn, step: 0 });
+			await host.emit("session/event", session, { type: "step/start", seq: opened.seq, data: opened.data });
+		}
 		const appended = session.append(type, data);
 		await host.emit("session/event", session, { type, seq: appended.seq, data: appended.data });
 		return appended;
@@ -957,6 +998,8 @@ section("13. mid-turn clearing is rationed and cost-gated");
 	// end of step 4, while the turn still has steps to run.
 	await feed("tool/call", { turn: 1, step: 3, callId: "call_mid_1", name: "grep", arguments: JSON.stringify({ pattern: "mid" }) });
 	await feed("tool/result", { turn: 1, step: 3, message: toolResultMessage("call_mid_1", big) });
+	// The next request carries the step-3 result; from here it may be cleared.
+	await feed("step/start", { turn: 1, step: 4 });
 	await feed("tool/call", { turn: 1, step: 4, callId: "call_mid_2", name: "grep", arguments: JSON.stringify({ pattern: "mid" }) });
 	const replacement = await feed("tool/result", { turn: 1, step: 4, message: toolResultMessage("call_mid_2", small) });
 	check("nothing is cleared while the block is still live", records().length === 0, String(records().length));
@@ -981,6 +1024,7 @@ section("13. mid-turn clearing is rationed and cost-gated");
 	// turn is the whole point of rationing the exception.
 	await feed("tool/call", { turn: 1, step: 5, callId: "call_mid_3", name: "grep", arguments: JSON.stringify({ pattern: "other" }) });
 	await feed("tool/result", { turn: 1, step: 5, message: toolResultMessage("call_mid_3", big) });
+	await feed("step/start", { turn: 1, step: 6 });
 	await feed("tool/call", { turn: 1, step: 6, callId: "call_mid_4", name: "grep", arguments: JSON.stringify({ pattern: "other" }) });
 	await feed("tool/result", { turn: 1, step: 6, message: toolResultMessage("call_mid_4", small) });
 	await feed("step/end", { turn: 1, step: 6 });
@@ -1005,6 +1049,12 @@ section("14. a host without the ignorable-record seam");
 	const session = sessionWithHistory("t-auto-clear-no-seam");
 	const { host, agent } = await boot(seamless, { sessionId: session.id, session });
 	const feed = async (type, data) => {
+		// The step whose results just landed has not been sent yet; DSH opens the
+		// next step with `step/start`, which is the request that carries them.
+		if (type === "turn/end") {
+			const opened = session.append("step/start", { turn: data.turn, step: 0 });
+			await host.emit("session/event", session, { type: "step/start", seq: opened.seq, data: opened.data });
+		}
 		const appended = session.append(type, data);
 		await host.emit("session/event", session, { type, seq: appended.seq, data: appended.data });
 	};
@@ -1034,6 +1084,12 @@ section("15. clearing stays effective without a cumulative cap");
 	const session = sessionWithHistory("t-auto-clear-no-cap");
 	const { host, agent } = await boot(plugin, { sessionId: session.id, session });
 	const feed = async (type, data) => {
+		// The step whose results just landed has not been sent yet; DSH opens the
+		// next step with `step/start`, which is the request that carries them.
+		if (type === "turn/end") {
+			const opened = session.append("step/start", { turn: data.turn, step: 0 });
+			await host.emit("session/event", session, { type: "step/start", seq: opened.seq, data: opened.data });
+		}
 		const appended = session.append(type, data);
 		await host.emit("session/event", session, { type, seq: appended.seq, data: appended.data });
 	};
@@ -1070,6 +1126,12 @@ section("16. aged clearing, the empty boundary, and the breaker's sample floor")
 	const session = sessionWithHistory("t-auto-clear-stale");
 	const { host, agent } = await boot(plugin, { sessionId: session.id, session });
 	const feed = async (type, data) => {
+		// The step whose results just landed has not been sent yet; DSH opens the
+		// next step with `step/start`, which is the request that carries them.
+		if (type === "turn/end") {
+			const opened = session.append("step/start", { turn: data.turn, step: 0 });
+			await host.emit("session/event", session, { type: "step/start", seq: opened.seq, data: opened.data });
+		}
 		const appended = session.append(type, data);
 		await host.emit("session/event", session, { type, seq: appended.seq, data: appended.data });
 		return appended;
@@ -1141,6 +1203,8 @@ section("17. a settlement settles after the append that announced it");
 	session.append("tool/result", { turn: 1, step: 3, message: toolResultMessage("call_reenter_1", big) });
 	session.append("tool/call", { turn: 1, step: 4, callId: "call_reenter_2", name: "grep", arguments: JSON.stringify({ pattern: "needle" }) });
 	session.append("tool/result", { turn: 1, step: 4, message: toolResultMessage("call_reenter_2", big) });
+	// The next request carries the step's results; only then may they be cleared.
+	session.append("step/start", { turn: 1, step: 0 });
 	session.append("turn/end", { turn: 1 });
 	await new Promise((resolve) => setImmediate(resolve));
 	const records = session.events.filter((event) => event.type === "plugin:oh-my-clm/clear");
@@ -1183,6 +1247,7 @@ section("18. two boundaries announced in one tick settle once");
 	const small = "match ".repeat(4);
 	session.append("tool/call", { turn: 1, step: 3, callId: "call_tick_1", name: "grep", arguments: JSON.stringify({ pattern: "tick" }) });
 	session.append("tool/result", { turn: 1, step: 3, message: toolResultMessage("call_tick_1", big) });
+	session.append("step/start", { turn: 1, step: 4 });
 	session.append("tool/call", { turn: 1, step: 4, callId: "call_tick_2", name: "grep", arguments: JSON.stringify({ pattern: "tick" }) });
 	session.append("tool/result", { turn: 1, step: 4, message: toolResultMessage("call_tick_2", small) });
 	await new Promise((resolve) => setImmediate(resolve));

@@ -1,7 +1,9 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
+import { DEFAULT_CLM_CONFIG } from "../../../src/lib/clm-config.ts";
 import {
 	DEFAULT_BATCH_GATE,
+	DEFAULT_MIN_RESULT_TOKENS,
 	SupersessionTracker,
 	batchPassesGate,
 	batchNetTokens,
@@ -153,27 +155,56 @@ test("a stale block still has to be re-fetchable in full", () => {
 	assert.deepEqual(tracker.peekBatch(9).candidates, []);
 });
 
-test("an image or a URL is a re-fetchable target too", () => {
+test("a URL is a re-fetchable target too", () => {
 	const tracker = new SupersessionTracker();
-	tracker.noteCall(call("read_image", { file_path: "/a.png" }, "img1", 1));
-	tracker.noteOutput(1, 1_500);
-	tracker.noteBlockTokens("img1", 1_500);
-	tracker.noteCall(call("read_image", { file_path: "/a.png" }, "img2", 2));
-	assert.equal(tracker.peekBatch().candidates[0]?.label, "read image /a.png");
-
 	tracker.noteCall(call("web_fetch", { url: "https://example.com/a" }, "web1", 3));
-	tracker.noteOutput(3, 900);
-	tracker.noteBlockTokens("web1", 900);
+	tracker.noteOutput(3, 2_000);
+	tracker.noteBlockTokens("web1", 2_000);
+	tracker.noteRequestSent();
 	tracker.noteCall(call("web_fetch", { url: "https://example.com/a" }, "web2", 4));
-	assert.equal(tracker.peekBatch().candidates.at(-1)?.label, "web_fetch https://example.com/a");
+	assert.equal(tracker.peekBatch().candidates[0]?.label, "web_fetch https://example.com/a");
 	assert.notEqual(
 		targetKeyOf("web_fetch", { url: "https://example.com/a" }),
 		targetKeyOf("web_fetch", { url: "https://example.com/b" }),
 	);
 });
 
-test("a peek consumes nothing: a skipped pass re-offers its candidates", () => {
+/**
+ * An image result is not cleared by default: replacing an image part with text
+ * changes the message's shape, and image history is compaction's to remove. The
+ * selector still knows the target, so a config that opts in gets the same
+ * pointer rule as a text read.
+ */
+test("an image result is cleared only when the config opts in", () => {
+	const build = (images: boolean) => {
+		const tracker = new SupersessionTracker({ images });
+		tracker.noteCall(call("read_image", { file_path: "/a.png" }, "img1", 1));
+		tracker.noteOutput(1, 3_000);
+		tracker.noteBlockLanding();
+		tracker.noteBlockTokens("img1", 3_000);
+		tracker.noteRequestSent();
+		tracker.noteCall(call("read_image", { file_path: "/a.png" }, "img2", 2));
+		return tracker.peekBatch();
+	};
+	assert.deepEqual(build(false).candidates, [], "an image is history, not rot");
+	assert.equal(build(true).candidates[0]?.label, "read image /a.png");
+});
+
+/** A block holding an image and a text read is not re-fetchable in full. */
+test("a block with an untracked image is not all re-fetchable", () => {
 	const tracker = new SupersessionTracker();
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "both", 1));
+	tracker.noteOutput(1, 700);
+	tracker.noteBlockTokens("both", 3_000);
+	tracker.noteRequestSent();
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "again", 2));
+	assert.deepEqual(tracker.peekBatch().candidates, []);
+});
+
+test("a peek consumes nothing: a skipped pass re-offers its candidates", () => {
+	// Deliberately below the per-block floor: this test is about a skipped pass,
+	// and the gate it exercises is configured by the calls below.
+	const tracker = new SupersessionTracker({ minResultTokens: 0 });
 	tracker.noteCall(call("glob", { pattern: "**/*.ts" }, "g1", 1));
 	tracker.noteOutput(1, 300);
 	tracker.noteBlockTokens("g1", 300);
@@ -252,10 +283,46 @@ test("the gate needs enough tokens, enough blocks, or enough rot to matter", () 
 	};
 	assert.equal(batchPassesGate(one), false);
 	assert.equal(batchPassesGate(two), true);
-	assert.equal(batchPassesGate(one, { minTokens: 200, minBlocks: 5, minShare: 0, maxSuffixTokens: 0, minNetTokens: 0 }), true);
+	assert.equal(batchPassesGate(one, { minTokens: 200, minBlocks: 5, minShare: 0, maxSuffixTokens: 0, minNetTokens: 0, windowShare: 0 }), true);
 	assert.equal(batchPassesGate({ candidates: [], tokens: 0 }), false);
 	assert.equal(DEFAULT_BATCH_GATE.minTokens, 1_200);
 	assert.equal(DEFAULT_BATCH_GATE.minShare, 0.05);
+});
+
+/**
+ * A fixed floor cannot scale. In a 200k window 1,200 tokens opens nothing, so the
+ * count path would decide every boundary and break the prefix once per turn;
+ * the floor therefore follows the window, and the count path stands only where
+ * the host reports no window to scale it with.
+ */
+test("the volume floor follows the window, and count alone stops opening it", () => {
+	const small = {
+		candidates: [
+			{ blockId: "a", seq: 7, tokens: 1_000, calls: [], keys: [], label: "read /a.ts", ageBlocks: 2, reason: "superseded" as const },
+			{ blockId: "b", seq: 8, tokens: 1_000, calls: [], keys: [], label: "read /b.ts", ageBlocks: 3, reason: "superseded" as const },
+		],
+		tokens: 2_000,
+	};
+	const gate = { minTokens: 1_200, minBlocks: 2, minShare: 0, maxSuffixTokens: 0, minNetTokens: 0, windowShare: 0.05 };
+	assert.equal(batchPassesGate(small, gate), true, "no window: the fixed floor and the count path decide");
+	assert.equal(batchPassesGate(small, gate, 0, 32_000), true, "5% of 32k is 1.6k, under the batch");
+	assert.equal(batchPassesGate(small, gate, 0, 200_000), false, "5% of 200k is 10k: two 1k blocks are not a rot signal");
+	assert.equal(batchPassesGate(small, { ...gate, windowShare: 0 }, 0, 200_000), true, "0 disables the window term");
+	assert.equal(
+		batchPassesGate({ ...small, tokens: 10_000 }, gate, 0, 200_000),
+		true,
+		"the freed tokens still open the gate once they reach the scaled floor",
+	);
+});
+
+/**
+ * The config file and the selector name the same two numbers, and neither may
+ * drift alone: a floor the parser defaults to but the selector ignores is a
+ * setting that reads as if it works.
+ */
+test("the config defaults are the selector's own constants", () => {
+	assert.equal(DEFAULT_CLM_CONFIG.autoClear.minResultTokens, DEFAULT_MIN_RESULT_TOKENS);
+	assert.equal(DEFAULT_CLM_CONFIG.autoClear.minTokensWindowPercent / 100, DEFAULT_BATCH_GATE.windowShare);
 });
 
 test("dead share of the live prompt opens the gate without crossing the volume floor", () => {
@@ -266,7 +333,7 @@ test("dead share of the live prompt opens the gate without crossing the volume f
 		tokens: 800,
 	};
 	const gate = { minTokens: 1_200, minBlocks: 5, minShare: 0.05 };
-	const rotGate = { ...gate, maxSuffixTokens: 0, minNetTokens: 0 };
+	const rotGate = { ...gate, maxSuffixTokens: 0, minNetTokens: 0, windowShare: 0 };
 	assert.equal(batchPassesGate(batch, rotGate, 16_000), true);
 	assert.equal(batchPassesGate(batch, rotGate, 100_000), false);
 	// Unknown prompt size disables the share path instead of guessing.
@@ -339,6 +406,95 @@ test("pointer labels name the target and stay one line", () => {
 
 
 /**
+ * The batch gate cannot price one small block: two of them clear its floor
+ * together, and each pointer then breaks the prefix and removes what the model
+ * wrote its answer from. The per-block floor is absolute, not a share of the
+ * batch, so a small result stays even inside a large clear.
+ */
+test("a block smaller than the floor is never a candidate", () => {
+	const tracker = new SupersessionTracker({ staleTurns: 0 });
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "small", 1));
+	tracker.noteOutput(1, 240);
+	tracker.noteBlockLanding();
+	tracker.noteBlockTokens("small", 240);
+	tracker.noteRequestSent();
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "again", 2));
+	assert.deepEqual(tracker.peekBatch().candidates, []);
+
+	// The same block, once the floor is turned off, is a candidate again.
+	const off = new SupersessionTracker({ staleTurns: 0, minResultTokens: 0 });
+	off.noteCall(call("read", { file_path: "/a.ts" }, "small", 1));
+	off.noteOutput(1, 240);
+	off.noteBlockLanding();
+	off.noteBlockTokens("small", 240);
+	off.noteRequestSent();
+	off.noteCall(call("read", { file_path: "/a.ts" }, "again", 2));
+	assert.equal(off.peekBatch().candidates[0]?.blockId, "small");
+});
+
+/** The floor is the block's visible size, so a big block next to a small dead one still clears. */
+test("the floor does not veto a batch whose blocks are each large enough", () => {
+	const tracker = new SupersessionTracker({ staleTurns: 0 });
+	for (const [id, size] of [["a", 240], ["b", 3_000]] as const) {
+		tracker.noteCall(call("read", { file_path: `/${id}.ts` }, id, size === 240 ? 1 : 3));
+		tracker.noteOutput(size === 240 ? 1 : 3, size);
+		tracker.noteBlockLanding();
+		tracker.noteBlockTokens(id, size);
+		tracker.noteCall(call("read", { file_path: `/${id}.ts` }, `${id}-again`, size === 240 ? 2 : 4));
+	}
+	tracker.noteRequestSent();
+	assert.deepEqual(tracker.peekBatch().candidates.map((candidate) => candidate.blockId), ["b"]);
+});
+
+/**
+ * Clearing a result the model has never been sent removes tokens it is still
+ * waiting for, and the model re-issues the call it thinks failed. A host marks
+ * each request boundary; a block that landed after the last one is not a
+ * candidate, and the batch reports how many it held back.
+ */
+test("a result the model has not been sent is never a candidate", () => {
+	const tracker = new SupersessionTracker();
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "b1", 1));
+	tracker.noteOutput(1, 2_000);
+	tracker.noteBlockLanding();
+	tracker.noteBlockTokens("b1", 2_000);
+	tracker.noteCall(call("read", { file_path: "/a.ts" }, "b2", 2));
+	const blocked = tracker.peekBatch();
+	assert.deepEqual(blocked.candidates, []);
+	assert.equal(blocked.unseen, 1, "the ledger says the boundary was blocked, not empty");
+	// The next request carries b1's result; from then on it is fair game.
+	tracker.noteRequestSent();
+	const batch = tracker.peekBatch();
+	assert.equal(batch.candidates[0]?.blockId, "b1");
+	assert.equal(batch.unseen, undefined);
+});
+
+/**
+ * Bootstrap reads are the tool traffic an agent produces to start up. Whatever
+ * its instructions rest on must not become a re-read pointer, so everything
+ * that landed before the session's first user message is out of reach.
+ */
+test("a block that landed before the first user message is never cleared", () => {
+	const tracker = new SupersessionTracker();
+	tracker.noteCall(call("read", { file_path: "/soul.md" }, "boot", 1));
+	tracker.noteOutput(1, 4_000);
+	tracker.noteBlockLanding();
+	tracker.noteBlockTokens("boot", 4_000);
+	tracker.noteUserMessage();
+	tracker.noteRequestSent();
+	tracker.noteCall(call("read", { file_path: "/soul.md" }, "again", 2));
+	assert.deepEqual(tracker.peekBatch(9).candidates, []);
+	// A block that lands after the first user message is ordinary tool noise.
+	tracker.noteCall(call("read", { file_path: "/src/a.ts" }, "work", 3));
+	tracker.noteOutput(3, 3_000);
+	tracker.noteBlockLanding();
+	tracker.noteBlockTokens("work", 3_000);
+	tracker.noteCall(call("read", { file_path: "/src/a.ts" }, "work2", 4));
+	tracker.noteRequestSent();
+	assert.equal(tracker.peekBatch(9).candidates[0]?.blockId, "work");
+});
+
+/**
  * The stale rule's second clock. A turn is 11–39 steps wide, so a turn count
  * cannot age anything inside one long turn; tool results land once per step, so
  * counting them bounds the age the way the turn count never can.
@@ -349,6 +505,7 @@ test("a block also ages by tool results, not only by turn boundaries", () => {
 	tracker.noteOutput(1, 2_000);
 	tracker.noteBlockLanding();
 	tracker.noteBlockTokens("old", 2_000, 42, 2);
+	tracker.noteRequestSent();
 	// Two results later it is still inside the step budget, and no turn boundary
 	// exists to age it.
 	assert.deepEqual(tracker.peekBatch().candidates, []);
@@ -370,6 +527,7 @@ test("the step clock is off by default and can be disabled on its own", () => {
 	tracker.noteOutput(1, 2_000);
 	tracker.noteBlockLanding();
 	tracker.noteBlockTokens("old", 2_000, 42, 1);
+	tracker.noteRequestSent();
 	for (let index = 0; index < 50; index += 1) tracker.noteBlockLanding();
 	assert.deepEqual(tracker.peekBatch(1).candidates, []);
 
@@ -378,6 +536,7 @@ test("the step clock is off by default and can be disabled on its own", () => {
 	turnOnly.noteOutput(1, 2_000);
 	turnOnly.noteBlockLanding();
 	turnOnly.noteBlockTokens("old", 2_000, 42, 1);
+	turnOnly.noteRequestSent();
 	for (let index = 0; index < 50; index += 1) turnOnly.noteBlockLanding();
 	assert.deepEqual(turnOnly.peekBatch(1).candidates, [], "steps alone must not age it");
 	assert.equal(turnOnly.peekBatch(2).candidates[0]?.reason, "stale");
@@ -394,6 +553,7 @@ test("the step clock clears inside an age window, not past it", () => {
 	tracker.noteOutput(1, 2_000);
 	tracker.noteBlockLanding();
 	tracker.noteBlockTokens("old", 2_000, 42, 1);
+	tracker.noteRequestSent();
 	// One result later it is still in the hot set, even though the old floor of 2
 	// would not have fired yet either; the window's floor is the same floor.
 	tracker.noteBlockLanding();
@@ -410,6 +570,7 @@ test("the step clock clears inside an age window, not past it", () => {
 	unbounded.noteOutput(1, 2_000);
 	unbounded.noteBlockLanding();
 	unbounded.noteBlockTokens("old", 2_000, 42, 1);
+	unbounded.noteRequestSent();
 	for (let index = 0; index < 8; index += 1) unbounded.noteBlockLanding();
 	assert.equal(unbounded.peekBatch(1).candidates[0]?.reason, "stale");
 });
@@ -422,6 +583,7 @@ test("the hot-set margin holds even when the step clock is set below it", () => 
 	tracker.noteOutput(1, 2_000);
 	tracker.noteBlockLanding();
 	tracker.noteBlockTokens("old", 2_000, 42, 1);
+	tracker.noteRequestSent();
 	tracker.noteBlockLanding();
 	assert.deepEqual(tracker.peekBatch(1).candidates, []);
 	tracker.noteBlockLanding();

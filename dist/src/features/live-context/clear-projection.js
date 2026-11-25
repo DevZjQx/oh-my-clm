@@ -21,15 +21,22 @@
 export const CLEAR_EVENT_TYPE = "plugin:oh-my-clm/clear";
 export const CLEAR_VERSION = 1;
 /**
- * Prefix of every derived placeholder. The projection treats a body that already
- * starts with it as cleared and leaves it alone: replaying a log that holds two
- * decisions for one node must converge, not throw. (The selector needs no such
- * check — it never reads model-visible text; it retires a block once a pass
- * commits it.)
+ * Prefix of every pointer this build writes. The projection treats a body that
+ * already starts with it (or with {@link CLEAR_PLACEHOLDER_V1_PREFIX}) as cleared
+ * and leaves it alone: replaying a log that holds two decisions for one node must
+ * converge, not throw. (The selector needs no such check — it never reads
+ * model-visible text; it retires a block once a pass commits it.)
  */
-export const CLEAR_PLACEHOLDER_PREFIX = "[cleared";
+export const CLEAR_PLACEHOLDER_PREFIX = "[set aside to save space";
+/** Prefix the v1 pointer used; still recognised on replay. */
+export const CLEAR_PLACEHOLDER_V1_PREFIX = "[cleared";
 /** Longest pointer text kept in a record; anything longer is a selector bug. */
 export const CLEAR_LABEL_MAX_CHARS = 200;
+/**
+ * Longest literal placeholder a record may carry. The pointer is one line built
+ * from a bounded label, so anything past this is a writer bug, not a big block.
+ */
+export const CLEAR_PLACEHOLDER_MAX_CHARS = 512;
 function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -49,20 +56,55 @@ export function compactTokens(tokens) {
 /**
  * The exact text the model sees in place of a cleared body.
  *
- * A clearing receipt, not an invitation: its read of the target is gone from the
- * model's copy, so it must re-read before editing — editing from a forgotten
- * read wastes a round trip or writes against stale content. What the clear left
- * behind (the session log, and the transcript the user reads) is one fact for
- * every cleared block, so the per-turn index header carries it once instead of
- * repeating it under each block the model has to skim.
+ * A clearing receipt, not an invitation, and it has two readers to keep apart.
+ * The pointer must send the model back to the target before it edits: its read is
+ * gone from the model's copy, so editing from a forgotten read wastes a round
+ * trip or writes against stale content. It must also not read as "this call
+ * returned nothing": a model that takes it that way disowns the answers it built
+ * on that result, which is worse than the tokens the clear saved. So the line
+ * states that the result was there, that the model read it, and that it was set
+ * aside to save space, and it names only the tool and the size.
+ *
+ * What the clear left behind (the session log, and the transcript the user
+ * reads) is one fact for every cleared block, so the per-turn index header
+ * carries it once instead of repeating it under each block the model has to skim.
  */
 export function clearPlaceholder(label, tokens) {
-    return `${CLEAR_PLACEHOLDER_PREFIX} ${compactTokens(tokens)} · ${label} · re-read before editing]`;
+    return `${CLEAR_PLACEHOLDER_PREFIX} · ${label} · you read its ${compactTokens(tokens)} in full at the time and wrote your later replies from it · re-read before editing]`;
+}
+/**
+ * The pointer v1 wrote when a record carries no literal text.
+ *
+ * Frozen on purpose. Records written before the wording change have no `text`
+ * field, and their model-visible bytes must not move with a new build: a replay
+ * that re-rendered them through today's {@link clearPlaceholder} would send the
+ * model a prompt no earlier request ever contained. This function is not a
+ * fallback for new records — it is the v1 format, and it must not change.
+ */
+export function clearPlaceholderV1(label, tokens) {
+    return `[cleared ${compactTokens(tokens)} · ${label} · re-read before editing]`;
 }
 function messageText(content) {
     if (!Array.isArray(content))
         return "";
     return content.map((block) => (isRecord(block) && typeof block.text === "string" ? block.text : "")).join("");
+}
+/**
+ * The literal pointer a record carries, when it carries one.
+ *
+ * Only the envelope decides whether a malformed field throws: a record that says
+ * it stored the model-visible text but cannot reproduce it is a writer bug, and
+ * silently re-rendering the block under a new build is exactly the drift the
+ * field exists to rule out.
+ */
+function literalPlaceholderOf(target) {
+    const text = target.text;
+    if (text === undefined)
+        return undefined;
+    if (typeof text !== "string" || text.length === 0 || text.includes("\n")) {
+        throw new Error(`${CLEAR_EVENT_TYPE}: target text must be one non-empty line`);
+    }
+    return text;
 }
 /**
  * Validate one decision and derive the messages it changes.
@@ -119,6 +161,10 @@ export const clearProjection = {
             }
             if (!isIndex(tokens))
                 throw new Error(`${CLEAR_EVENT_TYPE}: target tokens must be a non-negative integer`);
+            const literal = literalPlaceholderOf(target);
+            if (literal !== undefined && literal.length > CLEAR_PLACEHOLDER_MAX_CHARS) {
+                throw new Error(`${CLEAR_EVENT_TYPE}: target text must be at most ${CLEAR_PLACEHOLDER_MAX_CHARS} characters`);
+            }
             const source = context.events[seq - context.baseSeq];
             if (!isRecord(source) || source.type !== "tool/result") {
                 throw new Error(`${CLEAR_EVENT_TYPE}: target seq ${seq} must be a tool/result`);
@@ -133,13 +179,13 @@ export const clearProjection = {
             const currentText = messageText(current.content);
             if (currentText.length === 0)
                 throw new Error(`${CLEAR_EVENT_TYPE}: target seq ${seq} has an empty body`);
-            if (currentText.startsWith(CLEAR_PLACEHOLDER_PREFIX))
+            if (currentText.startsWith(CLEAR_PLACEHOLDER_PREFIX) || currentText.startsWith(CLEAR_PLACEHOLDER_V1_PREFIX))
                 continue;
             // A clear must strictly shrink what the model reads. A body no longer than
             // the pointer that would replace it is not dead weight: rewriting it would
             // grow every later request. Checked here because a replayed record carries
             // the decision, not the body it was written against.
-            const placeholder = clearPlaceholder(label, tokens);
+            const placeholder = literal ?? clearPlaceholderV1(label, tokens);
             if (placeholder.length >= currentText.length)
                 continue;
             updates.set(seq, {

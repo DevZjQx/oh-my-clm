@@ -3,7 +3,7 @@ import { CLM_MIRROR_FILENAME, CLM_TEMP_ROOT, sessionCanaryPath, sessionMirrorPat
 import { loadClmConfig } from "../src/lib/clm-config.js";
 import { appendPrivateLine, writePrivateText } from "../src/lib/clm-files.js";
 import { BREAKER_KEY_REREADS, REFETCH_TOOL_NAMES, SupersessionTracker, batchPassesGate, batchNetTokens, candidateRefused, createRereadPolicy, noteKeyReread, parseToolArguments, targetKeyOf, } from "../src/features/live-context/auto-clear.js";
-import { CLEAR_EVENT_TYPE, CLEAR_VERSION, CLEAR_LABEL_MAX_CHARS, clearProjection, } from "../src/features/live-context/clear-projection.js";
+import { CLEAR_EVENT_TYPE, CLEAR_VERSION, CLEAR_LABEL_MAX_CHARS, CLEAR_PLACEHOLDER_MAX_CHARS, clearPlaceholder, clearProjection, } from "../src/features/live-context/clear-projection.js";
 import { dshPromptText } from "../src/features/live-context/context-prompt.js";
 import { resolvePluginRecordWriter, } from "../src/features/live-context/plugin-record.js";
 import { batchSuffixTokens, buildDshMirrorRecords, dshBatchSuffixTokens, dshBlockIndexText, dshOpenTurnStep, dshSurfaceTokensAfterEach, dshTriggerView, executeDshCleanup, reconcileDshMirror, } from "../src/features/live-context/dsh-bridge.js";
@@ -65,6 +65,7 @@ function canaryGate(config) {
         minShare: config.autoClear.minSharePercent / 100,
         maxSuffixTokens: config.autoClear.maxSuffixTokens,
         minNetTokens: config.autoClear.minNetTokens,
+        windowShare: config.autoClear.minTokensWindowPercent / 100,
     };
 }
 /**
@@ -137,6 +138,15 @@ function feedCanary(ctx, session, event, state, allowPass = true) {
     if (typeof seq !== "number")
         return;
     const data = event.data;
+    if (event.type === "step/start") {
+        // The host is about to send a request: everything that has landed is in it.
+        state.tracker.noteRequestSent();
+        return;
+    }
+    if (event.type === "user/message") {
+        state.tracker.noteUserMessage();
+        return;
+    }
     if (event.type === "tool/call") {
         const callId = canaryString(data, "callId");
         const name = canaryString(data, "name");
@@ -215,7 +225,7 @@ function feedCanary(ctx, session, event, state, allowPass = true) {
     // The channel decides together with the volume gate: `rot` is today's shape,
     // `money` additionally refuses a batch whose suffix cannot amortize, and
     // `both` falls back to rot for exactly those batches.
-    const volume = batchPassesGate(batch, state.gate, usage?.tokens ?? 0);
+    const volume = batchPassesGate(batch, state.gate, usage?.tokens ?? 0, usage?.contextWindow ?? 0);
     const money = moneyVerdict(state.config, batch, suffixTokens);
     const gate = state.config.autoClear.channel === "both"
         ? volume || money
@@ -279,9 +289,9 @@ function maybeMidTurnPass(ctx, session, state, turn, step) {
     // over many blocks, and this break is already free (or priced above).
     const usage = hostUsageFor(session, state.config);
     const suffix = batchSuffixTokens(cheap, tails);
-    if (!moneyVerdict(state.config, { candidates: cheap, tokens: freed }, suffix))
+    if (!moneyVerdict(state.config, { ...batch, candidates: cheap, tokens: freed }, suffix))
         return;
-    const settlement = settlementOf(state, { turn: turnNumber, step: stepNumber }, { candidates: cheap, tokens: freed }, true, usage, suffix);
+    const settlement = settlementOf(state, { turn: turnNumber, step: stepNumber }, { ...batch, candidates: cheap, tokens: freed }, true, usage, suffix);
     // The ration is spent only by a pass that actually wrote its record: a skip for
     // a transient reason (occupancy, projection not registered) must get another
     // chance inside this same turn. Reserve it now — a second `step/end` in the
@@ -400,7 +410,9 @@ function liveBatchOf(state, batch) {
     const candidates = batch.candidates.filter((candidate) => !state.tracker.isRetired(candidate.blockId) && !candidateRefused(state.auto.reread, candidate));
     if (candidates.length === batch.candidates.length)
         return batch;
-    return { candidates, tokens: candidates.reduce((total, candidate) => total + Math.max(0, candidate.tokens), 0) };
+    // Keep the withheld count: the ledger line must still say how many blocks the
+    // selector held back as unseen, not just how many survived this filter.
+    return { ...batch, candidates, tokens: candidates.reduce((total, candidate) => total + Math.max(0, candidate.tokens), 0) };
 }
 /**
  * One ledger line per boundary: the newly dead blocks plus what the previous
@@ -429,6 +441,7 @@ function writeCanaryRecord(ctx, session, state, settlement) {
         tokens: fresh.reduce((total, candidate) => total + candidate.tokens, 0),
         ...(settlement.suffixTokens === undefined ? {} : { suffixTokens: settlement.suffixTokens }),
         candidates: fresh,
+        ...(settlement.batch.unseen === undefined ? {} : { unseen: settlement.batch.unseen }),
         gate: settlement.gate,
         ...(state.auto.last !== undefined ? { outcome: state.auto.last.outcome } : {}),
         // The session totals are read here, after the apply this line reports; only
@@ -557,10 +570,19 @@ function applyClear(ctx, session, state, batch) {
         if (candidate.label.length === 0 || candidate.label.length > CLEAR_LABEL_MAX_CHARS)
             continue;
         const size = Math.max(0, Math.round(candidate.tokens));
+        // The model-visible text is written with the decision, not derived when the
+        // log is read: a replay must reproduce the bytes the model was shown even
+        // after this build's wording changes. A pointer past the record bound would
+        // throw on replay and take the whole log with it, so an over-long one leaves
+        // the block alone instead of writing a record nothing can read back.
+        const text = clearPlaceholder(candidate.label, size);
+        if (text.length > CLEAR_PLACEHOLDER_MAX_CHARS)
+            continue;
         targets.push({
             seq: candidate.seq,
             label: candidate.label,
             tokens: size,
+            text,
             // Replay metadata: the projection ignores it, and a resumed session uses
             // it to keep the breaker's re-read evidence.
             ...(candidate.keys.length > 0 ? { keys: candidate.keys } : {}),
@@ -708,6 +730,8 @@ function seedCanary(ctx, session, projection, config) {
             staleSteps: config.autoClear.staleSteps,
             minAgeSteps: config.autoClear.minAgeSteps,
             maxAgeSteps: config.autoClear.maxAgeSteps,
+            minResultTokens: config.autoClear.minResultTokens,
+            images: config.autoClear.clearImages,
         }),
         callSeqs: new Map(),
         callKeys: new Map(),

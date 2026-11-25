@@ -794,6 +794,8 @@ function freshAutoState(settings: Config): AutoClearState {
 			staleSteps: settings.autoClear.staleSteps,
 			minAgeSteps: settings.autoClear.minAgeSteps,
 			maxAgeSteps: settings.autoClear.maxAgeSteps,
+			minResultTokens: settings.autoClear.minResultTokens,
+			images: settings.autoClear.clearImages,
 		}),
 		reread: createRereadPolicy(),
 		callKeys: new Map(),
@@ -943,7 +945,7 @@ function liveBatchOf(ac: AutoClearState, batch: CanaryBatch, selfReadIds: Readon
 		&& !selfReadIds.has(candidate.blockId),
 	);
 	if (candidates.length === batch.candidates.length) return batch;
-	return { candidates, tokens: candidates.reduce((total, candidate) => total + Math.max(0, candidate.tokens), 0) };
+	return { ...batch, candidates, tokens: candidates.reduce((total, candidate) => total + Math.max(0, candidate.tokens), 0) };
 }
 
 /**
@@ -1025,6 +1027,7 @@ function writeAutoCanaryLine(
 		tokens: fresh.reduce((total, candidate) => total + Math.max(0, Math.round(candidate.tokens)), 0),
 		...(settlement.suffixTokens === undefined ? {} : { suffixTokens: settlement.suffixTokens }),
 		candidates: fresh,
+		...(settlement.batch.unseen === undefined ? {} : { unseen: settlement.batch.unseen }),
 		gate: settlement.gate,
 		outcome: settlement.outcome,
 		quality: {
@@ -1095,6 +1098,7 @@ function autoClearSettlement(
 	const batch = liveBatchOf(ac, ac.tracker.peekBatch(ac.turn), selfReadIds);
 	const usable = usableCandidates(snapshot.records, batch.candidates);
 	const usableBatch: CanaryBatch = {
+		...batch,
 		candidates: usable,
 		tokens: usable.reduce((total, candidate) => total + Math.max(0, Math.round(candidate.tokens)), 0),
 	};
@@ -1104,8 +1108,9 @@ function autoClearSettlement(
 		minShare: auto.minSharePercent / 100,
 		maxSuffixTokens: auto.maxSuffixTokens,
 		minNetTokens: auto.minNetTokens,
+		windowShare: auto.minTokensWindowPercent / 100,
 	};
-	const volume = batchPassesGate(usableBatch, gate, usage?.tokens ?? 0);
+	const volume = batchPassesGate(usableBatch, gate, usage?.tokens ?? 0, usage?.contextWindow ?? 0);
 	const suffixTokens = mirrorSuffixTokens(snapshot.records, usable);
 	const money = moneyVerdict(settings, usableBatch, suffixTokens);
 	const gateOpen = auto.channel === "both" ? volume || money : volume && money;
@@ -1166,6 +1171,9 @@ function autoClearStatusLine(ctx: ExtensionContext): string {
 
 export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", (event, ctx) => {
+		// One agent loop starts from the user's message: a block that landed before
+		// it is a bootstrap read, not tool noise the clear may take away.
+		states.get(sessionKey(ctx))?.auto?.tracker.noteUserMessage();
 		const current = event.systemPromptOptions.appendSystemPrompt ?? "";
 		if (!current.includes(PROMPT_MARKER)) {
 			event.systemPromptOptions.appendSystemPrompt = `${current}${current ? "\n\n" : ""}${promptAppendix(ctx)}`;
@@ -1211,6 +1219,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("context", async (event: ContextEvent, ctx): Promise<ContextEventResult | void> => {
 		const state = sessionState(ctx);
+		// This hook runs immediately before the provider request: every tool result
+		// that has landed is part of it, so the selector may only clear from here on.
+		state.auto?.tracker.noteRequestSent();
 		const snapshot = syncMirror(ctx);
 		// Runtime notices are system-role messages, not synthetic human turns.
 		// Pi supports mid-conversation system messages and restores the leading

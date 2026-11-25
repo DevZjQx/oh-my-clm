@@ -1519,6 +1519,7 @@ async function startAutoClearHost(
 			enabled: true,
 			canary: true,
 			staleTurns: 0,
+			minResultTokens: 0,
 			minTokens: 0,
 			minBlocks: 1,
 			minSharePercent: 0,
@@ -1594,6 +1595,7 @@ test("the canary ledger records what one pass must re-prefill", async () => {
 		// second read's output behind the cleared block as a real tail.
 		appendRead(host.session, "call-a", "First read of the file, a long output that will be superseded.");
 		appendRead(host.session, "call-b", "Second read of the same file, which the model already has.");
+		host.session.record("step/start", { turn: 1, step: 1 });
 		host.session.record("turn/end", { turn: 1 });
 		await settle();
 
@@ -1612,6 +1614,32 @@ test("the canary ledger records what one pass must re-prefill", async () => {
 });
 
 /**
+ * A boundary that lands a result has not sent it yet; DSH's `step/start` is the
+ * request that carries it. Clearing before that removes tokens the model is
+ * still waiting for, so the pass holds the block and the ledger says so.
+ */
+test("DSH never clears a result the model has not been sent", async () => {
+	const host = await startAutoClearHost("dsh-unseen-guard");
+	try {
+		appendRead(host.session, "call-a", "First read of the file, a long output that will be superseded.");
+		appendRead(host.session, "call-b", "Second read of the same file, which the model already has.");
+		host.session.record("turn/end", { turn: 1 });
+		await settle();
+		assert.equal(host.clearRecords().length, 0, "no request has carried either result yet");
+		const held = host.canaryLines().at(-1) as { unseen?: number; outcome?: string } | undefined;
+		assert.equal(held?.outcome, "no-candidate");
+		assert.equal(held?.unseen, 1, "the held-back block is on the ledger");
+
+		host.session.record("step/start", { turn: 2, step: 1 });
+		host.session.record("turn/end", { turn: 2 });
+		await settle();
+		assert.equal(host.clearRecords().length, 1, "the request that carried the results unblocks the clear");
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(host.session.id))), { recursive: true, force: true });
+	}
+});
+
+/**
  * One target the model keeps asking for is a mispriced target, not a broken
  * selector. Refusing that key has to leave the channel open for every other
  * dead block, otherwise a single hot file silently disables clearing.
@@ -1621,6 +1649,7 @@ test("a key that keeps coming back is refused without closing the channel", asyn
 	try {
 		appendRead(host.session, "call-a", "First read of the file, a long output that will be superseded.");
 		appendRead(host.session, "call-b", "Second read of the same file, which the model already has.");
+		host.session.record("step/start", { turn: 1, step: 1 });
 		host.session.record("turn/end", { turn: 1 });
 		await settle();
 		assert.equal(host.clearRecords().length, 1, "the first pass must clear");
@@ -1637,6 +1666,7 @@ test("a key that keeps coming back is refused without closing the channel", asyn
 		// A different dead target, so the next boundary has something to clear.
 		appendRead(host.session, "call-c", "First read of another file, superseded below.", "src/b.ts");
 		appendRead(host.session, "call-d", "Second read of that other file.", "src/b.ts");
+		host.session.record("step/start", { turn: 2, step: 1 });
 		host.session.record("turn/end", { turn: 2 });
 		await settle();
 
@@ -1662,6 +1692,7 @@ test("the re-read the pointer ordered does not close the channel", async () => {
 	try {
 		for (const file of files) appendRead(host.session, `call-${file}-1`, `First read of ${file}, superseded below by a fresh read of the same file.`, file);
 		for (const file of files) appendRead(host.session, `call-${file}-2`, `Second read of ${file}, the live copy the model still has in front of it.`, file);
+		host.session.record("step/start", { turn: 1, step: 1 });
 		host.session.record("turn/end", { turn: 1 });
 		await settle();
 
@@ -1698,6 +1729,7 @@ test("the session stops when most cleared targets had to be refused", async () =
 	try {
 		for (const file of files) appendRead(host.session, `call-${file}-1`, `First read of ${file}, superseded below by a fresh read of the same file.`, file);
 		for (const file of files) appendRead(host.session, `call-${file}-2`, `Second read of ${file}, the live copy the model still has in front of it.`, file);
+		host.session.record("step/start", { turn: 1, step: 1 });
 		host.session.record("turn/end", { turn: 1 });
 		await settle();
 		assert.equal(host.clearRecords().length, 1, "the first pass must clear");
@@ -1735,6 +1767,7 @@ test("one re-fetch of a target cleared twice counts as one re-read", async () =>
 		appendRead(host.session, "call-a3", "Third read of a.ts, the live copy.");
 		appendRead(host.session, "call-b1", "First read of b.ts, superseded below.", "src/b.ts");
 		appendRead(host.session, "call-b2", "Second read of b.ts, the live copy.", "src/b.ts");
+		host.session.record("step/start", { turn: 1, step: 1 });
 		host.session.record("turn/end", { turn: 1 });
 		await settle();
 
@@ -1784,6 +1817,7 @@ test("the request estimate deducts the bodies the model no longer reads", async 
 		const requestBefore = tokensIn(before, /estimated request: ~(\d+) tokens/);
 		assert.equal(requestBefore, editableBefore, "with nothing cleared the estimate is the mirror");
 
+		host.session.record("step/start", { turn: 1, step: 1 });
 		host.session.record("turn/end", { turn: 1 });
 		await settle();
 		const cleared = (host.clearRecords()[0]?.targets as Array<{ tokens: number }>)
@@ -1819,6 +1853,7 @@ test("the money channel skips a batch its suffix cannot pay for, and both clears
 			enabled: true,
 			canary: true,
 			staleTurns: 0,
+			minResultTokens: 0,
 			minTokens: 0,
 			minBlocks: 1,
 			minSharePercent: 0,
@@ -1832,6 +1867,7 @@ test("the money channel skips a batch its suffix cannot pay for, and both clears
 	try {
 		appendRead(money.session, "call-a", "First read of the file, a long output that will be superseded.");
 		appendRead(money.session, "call-b", "Second read of the same file, a long tail behind the cleared block.");
+		money.session.record("step/start", { turn: 1, step: 1 });
 		money.session.record("turn/end", { turn: 1 });
 		await settle();
 		assert.equal(money.clearRecords().length, 0, "the money channel refuses an unamortizable batch");
@@ -1847,6 +1883,7 @@ test("the money channel skips a batch its suffix cannot pay for, and both clears
 			enabled: true,
 			canary: true,
 			staleTurns: 0,
+			minResultTokens: 0,
 			minTokens: 0,
 			minBlocks: 1,
 			minSharePercent: 0,
@@ -1860,6 +1897,7 @@ test("the money channel skips a batch its suffix cannot pay for, and both clears
 	try {
 		appendRead(both.session, "call-a", "First read of the file, a long output that will be superseded.");
 		appendRead(both.session, "call-b", "Second read of the same file, a long tail behind the cleared block.");
+		both.session.record("step/start", { turn: 1, step: 1 });
 		both.session.record("turn/end", { turn: 1 });
 		await settle();
 		assert.equal(both.clearRecords().length, 1, "the rot channel still clears what the money test rejected");

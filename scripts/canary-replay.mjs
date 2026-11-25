@@ -10,8 +10,8 @@
  *
  * Usage: node scripts/canary-replay.mjs <session.v4.jsonl.zstd> [...more]
  *        node scripts/canary-replay.mjs --all [--limit N] [--sessions-root DIR]
- *        [--stale-turns N] [--stale-steps N] [--max-age-steps N] [--discount R]
- *        [--payback N]
+ *        [--stale-turns N] [--stale-steps N] [--max-age-steps N]
+ *        [--min-result-tokens N] [--clear-images] [--discount R] [--payback N]
  *
  * Requires a completed `npm run build:dsh`, because it imports the compiled
  * selector rather than re-implementing it. Stored logs are zstd-compressed, so
@@ -43,6 +43,7 @@ if (!existsSync(selectorPath)) {
 const {
 	DEFAULT_BATCH_GATE,
 	DEFAULT_MAX_AGE_STEPS,
+	DEFAULT_MIN_RESULT_TOKENS,
 	DEFAULT_STALE_STEPS,
 	DEFAULT_STALE_TURNS,
 	SupersessionTracker,
@@ -162,7 +163,7 @@ function batchSuffix(surface, batch) {
 
 /** Feed one session's events through the selector exactly as the host bridge does. */
 function replay(file) {
-	const tracker = new SupersessionTracker({ staleTurns, staleSteps, maxAgeSteps });
+	const tracker = new SupersessionTracker({ staleTurns, staleSteps, maxAgeSteps, minResultTokens, images: clearImages });
 	const callSeqs = new Map();
 	const batches = [];
 	const events = readEvents(file);
@@ -172,7 +173,15 @@ function replay(file) {
 		const data = event.data ?? {};
 		if (typeof seq !== "number") continue;
 		surface.note(event);
-		if (event.type === "tool/call" && REFETCH.includes(data.name)) {
+		// The same two position rules the host bridge feeds: a request boundary
+		// marks what the model has been sent, and a user message marks the end of
+		// the bootstrap region. Without them a replay clears results the live pass
+		// never could.
+		if (event.type === "step/start") {
+			tracker.noteRequestSent();
+		} else if (event.type === "user/message") {
+			tracker.noteUserMessage();
+		} else if (event.type === "tool/call" && REFETCH.includes(data.name)) {
 			callSeqs.set(data.callId, seq);
 			tracker.noteCall({
 				name: data.name,
@@ -243,6 +252,13 @@ if (!Number.isSafeInteger(maxAgeSteps) || maxAgeSteps < 0) {
 	console.error("--max-age-steps needs a non-negative integer (0 = unbounded)");
 	process.exit(2);
 }
+const clearImages = args.includes("--clear-images");
+const minResultIndex = args.indexOf("--min-result-tokens");
+const minResultTokens = minResultIndex >= 0 ? Number(args[minResultIndex + 1]) : DEFAULT_MIN_RESULT_TOKENS;
+if (!Number.isFinite(minResultTokens) || minResultTokens < 0) {
+	console.error("--min-result-tokens needs a non-negative number (0 = off)");
+	process.exit(2);
+}
 const discountIndex = args.indexOf("--discount");
 const discount = discountIndex >= 0 ? Number(args[discountIndex + 1]) : 0.02;
 if (!Number.isFinite(discount) || discount < 0 || discount > 1) {
@@ -259,7 +275,7 @@ if (!sessionsRoot) {
 	console.error("--sessions-root needs a directory");
 	process.exit(2);
 }
-const valueOptions = new Set(["--limit", "--sessions-root", "--stale-turns", "--stale-steps", "--max-age-steps", "--discount", "--payback"]);
+const valueOptions = new Set(["--limit", "--sessions-root", "--stale-turns", "--stale-steps", "--max-age-steps", "--min-result-tokens", "--discount", "--payback"]);
 const positional = args.filter((arg, index) =>
 	!arg.startsWith("--") && !valueOptions.has(args[index - 1] ?? ""),
 );

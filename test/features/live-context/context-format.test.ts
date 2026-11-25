@@ -1050,9 +1050,9 @@ test("P1-1 follow-up: truncated and self-referential previews are still rejected
 test("a cleared block is marked in the index and its body is not shown", () => {
 	const cleared = new Map([["tool-1", { label: "read /src/x.ts:120-260", tokens: 3_400 }]]);
 	const index = renderBlockIndex(records, { cleared, autoClear: true });
-	assert.match(index, /\[cleared 3\.4k tok · read \/src\/x\.ts:120-260\]/);
+	assert.match(index, /\[set aside 3\.4k tok · read \/src\/x\.ts:120-260\]/);
 	assert.doesNotMatch(index, /A very large command output/);
-	assert.match(index, /\[cleared\] blocks hold a re-read pointer/);
+	assert.match(index, /\[set aside\] blocks hold a re-read pointer/);
 	assert.match(index, /re-read before editing/);
 	assert.match(index, /the user still sees the original/);
 });
@@ -1070,7 +1070,7 @@ test("a cleared block is subtracted from the digest's turn cost", () => {
 	});
 	assert.match(full, /turn ×2 \(/);
 	assert.match(cleared, /1 cleared/);
-	assert.match(cleared, /\[cleared\] blocks hold a re-read pointer/);
+	assert.match(cleared, /\[set aside\] blocks hold a re-read pointer/);
 	assert.match(cleared, /re-read before editing/);
 	assert.match(cleared, /the user still sees the original/);
 	assert.notEqual(cleared, full);

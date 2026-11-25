@@ -619,7 +619,7 @@ export function renderBlockIndex(
 		const blockId = displayIds.get(record.id) ?? record.id;
 		const cleared = options.cleared?.get(record.id);
 		if (cleared) {
-			return `${blockId}. ${record.role}: [cleared ${compactTokens(Math.max(0, cleared.tokens))} · ${blockPreview(cleared.label, maxPreviewChars)}]`;
+			return `${blockId}. ${record.role}: [set aside ${compactTokens(Math.max(0, cleared.tokens))} · ${blockPreview(cleared.label, maxPreviewChars)}]`;
 		}
 		return `${blockId}. ${record.role}: ${blockPreview(record.text, maxPreviewChars)}`;
 	};
@@ -642,7 +642,7 @@ export function renderBlockIndex(
 		appendOmittedRun(headEnd + 1, editable.length);
 	}
 	const header = options.autoClear
-		? "Editable blocks by cleanup ID; [cleared] blocks hold a re-read pointer, not the body: re-read before editing, and the user still sees the original. Ranges are inclusive; cleanup remains for manual removal."
+		? "Editable blocks by cleanup ID; [set aside] blocks hold a re-read pointer, not the body: re-read before editing, and the user still sees the original. Ranges are inclusive; cleanup remains for manual removal."
 		: "Editable blocks by cleanup ID; call cleanup({ blockIds: [...] }) to omit them, cleanup({ list: \"A-B\" }) to read a range's rows.";
 	return blockIndexDocument(header, lines);
 }
@@ -911,7 +911,7 @@ export function renderBlockDigest(
 	}
 
 	const header = options.autoClear
-		? "Editable blocks by cleanup ID; one line per turn. [cleared] blocks hold a re-read pointer, not the body: re-read before editing, and the user still sees the original; cleanup remains for manual removal."
+		? "Editable blocks by cleanup ID; one line per turn. [set aside] blocks hold a re-read pointer, not the body: re-read before editing, and the user still sees the original; cleanup remains for manual removal."
 		: "Editable blocks by cleanup ID; ranges are inclusive. One line per turn; call cleanup({ ranges: [\"A-B\"] }) to omit a turn, cleanup({ list: \"A-B\" }) to read its rows.";
 	return blockIndexDocument(header, lines);
 }

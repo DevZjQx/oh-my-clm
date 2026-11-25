@@ -116,7 +116,7 @@ test("Pi auto-clear replaces a superseded read in the projection and keeps the l
 	assert.ok(result, "the boundary returns entries");
 	const edit = result.entries.find((entry) => entry.type === "context_edit" && entry.targetId === firstResultId);
 	assert.ok(edit, "the superseded read result is cleared");
-	assert.match((edit.replacement as { content: Array<{ text: string }> }).content[0]?.text ?? "", /^\[cleared /);
+	assert.match((edit.replacement as { content: Array<{ text: string }> }).content[0]?.text ?? "", /^\[set aside to save space/);
 
 	session.appendContextEdit(firstResultId, edit.replacement as any);
 	const stored = (session.getEntry(firstResultId) as any).message;
@@ -124,7 +124,7 @@ test("Pi auto-clear replaces a superseded read in the projection and keeps the l
 		"the session log keeps the original tool result");
 	const projected = session.buildSessionProjection();
 	const projectedMessage = projected.entries.find((entry: any) => entry.sourceEntry.id === firstResultId)?.messages[0] as any;
-	assert.match((projectedMessage.content as Array<{ text: string }>)[0]?.text ?? "", /^\[cleared .* re-read before editing\]$/);
+	assert.match((projectedMessage.content as Array<{ text: string }>)[0]?.text ?? "", /^\[set aside to save space · .* re-read before editing\]$/);
 	assert.ok(projected.entries.some((entry: any) => entry.sourceEntry.id === taskId), "the task entry survives the clear");
 
 	// Replaying the boundary without new traffic must not clear the block again.
