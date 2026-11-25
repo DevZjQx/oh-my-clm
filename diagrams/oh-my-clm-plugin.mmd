@@ -1,21 +1,25 @@
 graph LR
-  PI["Pi runtime"] --> PIX["extensions/clm.ts<br/>Pi extension"]
-  DSH["DSH / Cordis runtime"] --> DSHX["dsh/index.ts<br/>host entry"]
+  PI["Pi runtime"] --> PIX["extensions/clm.ts<br/>mirror · cleanup · turn_end"]
+  DSH["DSH / Cordis runtime"] --> DSHX["dsh/index.ts<br/>host entry · system prompt"]
 
   PIX --> FMT["context-format<br/>mirror · block index · tokens"]
+  PIX --> CLN["context-cleanup<br/>cleanup / offload"]
+  PIX --> TRG["context-trigger<br/>usage line + candidates"]
+  PIX --> CAN["auto-clear<br/>superseded · stale<br/>gates + breaker"]
   DSHX --> FMT
-  PIX --> CLN["context-cleanup<br/>cleanup / offload tool"]
+  DSHX --> CLN
+  DSHX --> TRG
+  DSHX --> CAN
+  DSHX --> BRG["dsh-bridge<br/>surface replacement"]
+
   CLN --> FMT
-  TRG["context-trigger<br/>usage line + candidates"] --> FMT
-  FMT --> LIB["src/lib<br/>clm-paths · clm-files"]
-  DSHX --> BRG["dsh-bridge<br/>Session.append replacement"]
+  TRG --> FMT
+  FMT --> LIB["src/lib<br/>paths · files · config"]
   BRG --> LIB
 
-  DSHX --> CAN["auto-clear<br/>peek / retire selector"]
   CAN --> CANLOG["CANARY.jsonl<br/>one line per boundary"]
-  CAN --> PROJ["clear-projection<br/>pure message projection"]
-  PROJ --> SEAM["sessions service<br/>registerMessage<br/>Projection"]
-  DSHX --> REC["plugin-record<br/>ignorable writer"]
-  REC --> PRE["plugin:oh-my-clm/clear<br/>no seam → no clearing"]
-
-  LIB --> MIRROR["/tmp/clm-session/<br/>LIVE_CTX_MAIN.md"]
+  CAN -->|Pi settlement| CLE["context_edit<br/>branch-local edit"]
+  PIX --> CLE
+  CAN -->|DSH settlement| REC["plugin-record<br/>ignorable clear record"]
+  REC --> PROJ["clear-projection<br/>message projection seam"]
+  LIB --> MIRROR["/tmp/clm-{sessionId}/<br/>LIVE_CTX_MAIN.md"]
