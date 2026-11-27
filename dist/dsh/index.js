@@ -357,6 +357,9 @@ function scheduleSettlement(ctx, session, state, settlement, onSettled) {
  */
 function runPass(ctx, session, state, settlement) {
     const { where, gate } = settlement;
+    // The file can change after the boundary queued this pass. Recheck the
+    // switches before any durable write, even when no new request has started.
+    const liveConfig = sessionConfig(session);
     // Two boundaries announced in one tick (a step that ends its turn) both capture
     // the same live blocks, and the settlement queued first retires them. Trim to
     // what is still live, or the same target is written twice and the pass, the
@@ -366,14 +369,14 @@ function runPass(ctx, session, state, settlement) {
         // The honest report: this boundary saw only what a pass ahead of it already
         // cleared.
         state.auto.last = { turn: where.turn, candidates: 0, tokens: 0, outcome: "no-candidate" };
-        if (canaryEnabled(state.config))
+        if (canaryEnabled(liveConfig))
             writeCanaryRecord(ctx, session, state, { ...settlement, batch });
         return false;
     }
     // Execute first, then log: the ledger's quality block reports what this pass
     // actually did (blocks retired, tokens freed), so writing it before the write
     // would report the previous pass's totals one boundary late.
-    const enabled = autoClearEnabled(state.config);
+    const enabled = autoClearEnabled(state.config) && autoClearEnabled(liveConfig);
     const blocked = enabled ? admitClear(state, gate, settlement.usage) : undefined;
     const applied = enabled && blocked === undefined ? applyClear(ctx, session, state, batch) : false;
     // A settlement that cleared nothing still has to say which check stopped it;
@@ -384,7 +387,7 @@ function runPass(ctx, session, state, settlement) {
         tokens: batch.tokens,
         outcome: passOutcome(applied, blocked, enabled, gate),
     };
-    if (canaryEnabled(state.config))
+    if (canaryEnabled(liveConfig))
         writeCanaryRecord(ctx, session, state, { ...settlement, batch });
     return applied;
 }
@@ -1232,7 +1235,8 @@ function autoClearStatusText(state) {
         : `last: ${last.outcome} (turn ${String(last.turn ?? "?")}, ${last.candidates} candidate(s), ~${last.tokens} tok)`;
     if (!state.config.autoClear.enabled) {
         const stop = state.auto.stop === undefined ? "open" : `stopped (${state.auto.stop})`;
-        return `auto-clear: canary only · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s)${refused} · ${lastText}`;
+        const mode = canaryEnabled(state.config) ? "canary only" : "off";
+        return `auto-clear: ${mode} · ${midTurn} · ${state.auto.passes} pass(es) · ~${state.auto.clearedTokens} tokens cleared · ${stop} · ${state.auto.rereads} re-read(s) · ${state.auto.errorRereads} error re-read(s)${refused} · ${lastText}`;
     }
     const armed = state.writer.state === "missing"
         ? "off: this host exposes no ignorable plugin-record seam"
@@ -1346,6 +1350,45 @@ export function apply(ctx) {
     const canaries = new Map();
     const projection = { ready: false };
     installClearProjection(ctx, projection);
+    // A selector captures config when it is seeded. Rebuild it on a config
+    // change, retaining the live accounting, breaker and per-turn allowance.
+    // Keep a disabled runtime tracking traffic so re-enabling cannot erase the
+    // evidence that a cleared target was needed again while clearing was off.
+    const refreshCanary = async (session, config) => {
+        const key = String(session.id);
+        const previous = canaries.get(key);
+        if (previous && JSON.stringify(previous.config) === JSON.stringify(config))
+            return;
+        if (!previous && !canaryEnabled(config) && !autoClearEnabled(config))
+            return;
+        const seeded = seedCanary(ctx, session, projection, config);
+        const canary = previous ? {
+            ...seeded,
+            auto: previous.auto,
+            reported: previous.reported,
+            midTurnTurn: previous.midTurnTurn,
+            writer: previous.config.host.pluginRecordModule === config.host.pluginRecordModule
+                ? previous.writer
+                : { state: "pending" },
+        } : seeded;
+        if (previous)
+            previous.disposed = true;
+        canaries.set(key, canary);
+        if (!autoClearEnabled(config) || canary.writer.state !== "pending")
+            return;
+        const seam = await resolvePluginRecordWriter(config.host.pluginRecordModule);
+        if (canary.disposed || canaries.get(key) !== canary)
+            return;
+        canary.writer = seam ? { state: "ready", seam } : { state: "missing" };
+        if (!seam) {
+            if (canary.auto.stop !== "breaker")
+                canary.auto.stop = "unrecordable";
+            ctx.logger?.warn?.(`oh-my-clm: autoClear.enabled is set but ${config.host.pluginRecordModule} exposes no appendPluginRecord seam; clearing stays off for session ${key}`);
+        }
+        else if (canary.auto.stop === "unrecordable") {
+            delete canary.auto.stop;
+        }
+    };
     ctx.effect?.(() => () => {
         states.clear();
         for (const canary of canaries.values())
@@ -1408,27 +1451,14 @@ export function apply(ctx) {
         // here would surface as an unhandled rejection instead of a broken session.
         // Failing to arm clearing only costs the optimisation, never the transcript.
         try {
-            if (canaryEnabled(config) || autoClearEnabled(config)) {
-                const canary = seedCanary(ctx, session, projection, config);
-                canaries.set(key, canary);
-                if (autoClearEnabled(config)) {
-                    // Resolving the seam is async because the plugin cannot depend on the
-                    // host package. A boundary that arrives meanwhile skips (not latches);
-                    // a host without the seam latches `unrecordable` and says why once.
-                    const seam = await resolvePluginRecordWriter(config.host.pluginRecordModule);
-                    canary.writer = seam ? { state: "ready", seam } : { state: "missing" };
-                    if (!seam) {
-                        canary.auto.stop = "unrecordable";
-                        ctx.logger?.warn?.(`oh-my-clm: autoClear.enabled is set but ${config.host.pluginRecordModule} exposes no appendPluginRecord seam; clearing stays off for session ${key}`);
-                    }
-                }
-            }
+            await refreshCanary(session, config);
         }
         catch (error) {
             ctx.logger?.warn?.(`oh-my-clm: live-context clearing could not be armed for session ${key}: ${error instanceof Error ? error.message : String(error)}`);
         }
         const agentContext = agent.ctx ?? ctx;
         const disposePreStep = agentContext.on("agent/pre-step", async (_payload, next) => {
+            await refreshCanary(session, sessionConfig(session));
             // agent/pre-step runs before step/start, so DSH is not accepting a
             // step-scoped developer/message replacement yet. A mutation there
             // would fail validation or, worse, commit an event whose turn/step
