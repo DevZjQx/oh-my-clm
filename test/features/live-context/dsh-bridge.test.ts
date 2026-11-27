@@ -1497,6 +1497,7 @@ test("a batch's re-prefill cost starts after its earliest cleared block", () => 
 interface AutoClearHost {
 	readonly session: TestSession;
 	readonly emit: (name: string, ...args: unknown[]) => Promise<unknown>;
+	readonly preStep: () => Promise<unknown>;
 	readonly status: () => Promise<string>;
 	readonly canaryLines: () => Array<Record<string, unknown>>;
 	readonly clearRecords: () => Array<Record<string, unknown>>;
@@ -1553,6 +1554,7 @@ async function startAutoClearHost(
 	return {
 		session,
 		emit: (name: string, ...args: unknown[]) => root.emit(name, ...args),
+		preStep: () => agentContext.emit("agent/pre-step", { agent }, async () => ({ kind: "enter" })),
 		async status() {
 			const result = await command.handler({ agent, rawInput: "status" });
 			return String(result.text ?? "");
@@ -1587,6 +1589,102 @@ function appendRead(session: TestSession, callId: string, text: string, file = "
 async function settle(): Promise<void> {
 	for (let index = 0; index < 4; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
 }
+
+function setAutoClearEnabled(session: TestSession, enabled: boolean): void {
+	const cwd = String(session.header?.cwd);
+	const config = JSON.parse(fs.readFileSync(path.join(cwd, ".oh-my-clm.json"), "utf8"));
+	config.autoClear.enabled = enabled;
+	writeConfig(cwd, config);
+}
+
+test("DSH stops automatic clearing after enabled changes from true to false", async () => {
+	const host = await startAutoClearHost("dsh-disable-auto-clear");
+	try {
+		appendRead(host.session, "call-a", "Old file contents that a newer read supersedes.");
+		appendRead(host.session, "call-b", "Current file contents that remain available.");
+		setAutoClearEnabled(host.session, false);
+		await host.preStep();
+		host.session.record("step/start", { turn: 1, step: 1 });
+		host.session.record("turn/end", { turn: 1 });
+		await settle();
+		assert.equal(host.clearRecords().length, 0, "the disabled channel must not write another clearing record");
+		assert.match(await host.status(), /canary only/, "recording decisions may continue without changing model input");
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(host.session.id))), { recursive: true, force: true });
+	}
+});
+
+test("DSH starts automatic clearing after enabled changes from false to true", async () => {
+	const host = await startAutoClearHost("dsh-enable-auto-clear", {
+		autoClear: {
+			enabled: false,
+			canary: false,
+			staleTurns: 0,
+			minResultTokens: 0,
+			minTokens: 0,
+			minBlocks: 1,
+			minSharePercent: 0,
+			stopPercent: 90,
+		},
+	});
+	try {
+		appendRead(host.session, "call-a", "Old file contents that a newer read supersedes.");
+		appendRead(host.session, "call-b", "Current file contents that remain available.");
+		setAutoClearEnabled(host.session, true);
+		await host.preStep();
+		host.session.record("step/start", { turn: 1, step: 1 });
+		host.session.record("turn/end", { turn: 1 });
+		await settle();
+		assert.equal(host.clearRecords().length, 1, "enabling the channel must arm a writer in the existing session");
+		assert.match(await host.status(), /1 pass\(es\)/);
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(host.session.id))), { recursive: true, force: true });
+	}
+});
+
+test("DSH cancels a queued clearing pass when enabled changes to false", async () => {
+	const host = await startAutoClearHost("dsh-disable-queued-auto-clear");
+	try {
+		appendRead(host.session, "call-a", "Old file contents that a newer read supersedes.");
+		appendRead(host.session, "call-b", "Current file contents that remain available.");
+		host.session.record("step/start", { turn: 1, step: 1 });
+		host.session.record("turn/end", { turn: 1 });
+		setAutoClearEnabled(host.session, false);
+		await settle();
+		assert.equal(host.clearRecords().length, 0, "a queued pass must respect the switch before writing");
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(host.session.id))), { recursive: true, force: true });
+	}
+});
+
+test("DSH preserves clearing history across disable and re-enable", async () => {
+	const host = await startAutoClearHost("dsh-toggle-auto-clear-history");
+	try {
+		appendRead(host.session, "call-a", "Old contents of the first target.");
+		appendRead(host.session, "call-b", "New contents of the first target.");
+		host.session.record("step/start", { turn: 1, step: 1 });
+		host.session.record("turn/end", { turn: 1 });
+		await settle();
+		assert.equal(host.clearRecords().length, 1);
+		setAutoClearEnabled(host.session, false);
+		await host.preStep();
+		appendRead(host.session, "call-c", "Old contents of another target.", "src/b.ts");
+		appendRead(host.session, "call-d", "New contents of another target.", "src/b.ts");
+		host.session.record("step/start", { turn: 2, step: 1 });
+		host.session.record("turn/end", { turn: 2 });
+		await settle();
+		assert.equal(host.clearRecords().length, 1, "traffic while disabled must not clear another block");
+		setAutoClearEnabled(host.session, true);
+		await host.preStep();
+		host.session.record("step/start", { turn: 3, step: 1 });
+		host.session.record("turn/end", { turn: 3 });
+		await settle();
+		assert.equal(host.clearRecords().length, 2, "re-enabling must clear the new target without repeating the old clear");
+		assert.match(await host.status(), /2 pass\(es\)/, "config reloads must retain the live pass count");
+	} finally {
+		fs.rmSync(path.dirname(sessionMirrorPath(String(host.session.id))), { recursive: true, force: true });
+	}
+});
 
 test("the canary ledger records what one pass must re-prefill", async () => {
 	const host = await startAutoClearHost("dsh-cost-ledger");
